@@ -1,0 +1,29 @@
+name: Bug report
+description: Something fails, crashes, gives wrong text, or is much slower than it should be
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: what you did, what you expected, what you got
+    validations:
+      required: true
+  - type: input
+    id: setup
+    attributes:
+      label: GPU, OS and release
+      description: e.g. Arc B580, Windows 11 26200, driver 32.0.101.xxxx, inferzero 2026.11.18.05
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model file and how it was started
+      description: the GGUF, and the launcher / web UI / Pi / serverz or runz command with its options
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: the server's or runz's output from the start. In the launcher, "Copy for an issue" copies it with user names taken out.
+      render: text

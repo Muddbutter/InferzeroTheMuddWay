@@ -1,0 +1,6 @@
+id	pc	models	os	needs	settings	why	evidence	confidence
+ptl-35b	igpu-ptl	35b	any	-	Opt=moe_big_chunk	larger prompt chunks where they cost nothing: a B390's 35B 16K prompt +21-47 %	kludged #74 (Linux, .22.12: 1,362-1,411 -> 1,692 tok/s); cjm801 #75 (Windows, .22.08: 1,166 -> 1,714); the logits the same at each chunk	several machines
+mtl-npu	igpu-xe-lpg	27b;g12	windows	-	Npu=on	the NPU next to the GPU: the 27B's prompt +15 %, Gemma 4 12B's +10 %	docs/before-after.md (a Core Ultra 5 125H, KL 0.003)	one machine
+alchemist-res	alchemist	4b;9b	linux	-	Opt=p140_res	decoded weights kept for short prompts: the 4B's 128-token prompt 1,161 -> 2,030 tok/s	skipzx-lab PR #61 (an A770, Linux)	one machine
+bseries-tp	b-series;multi-gpu	27b;9b;4b;35b;flash	any	gpus2same	Gpus=all	one model over every card: the 27B 24.1 -> 54.1 tok/s on four B60s	manoreken2 #4 (4 x B60: the 27B 24.1 -> 54.1, Flash Next 19.3 -> 43.4 on three); Daleang #73 (2 x B70: 33.8 -> 47.4)	several machines
+notfit-nomtp	-	*	any	notfit	NoMtp	no drafting where the model does not fit the card: MTP was 30-42 % slower there	d-dorok #37 (a B580 12 GB, the 27B: 12.05 tok/s plain against 6.9-8.4 with MTP at 2-7 drafts)	one machine

@@ -1,0 +1,42 @@
+# The website (site/) on GitHub Pages: https://rizagp.github.io/inferzero/
+# Runs when site/ or this file changes on main, or by hand (Actions > Pages > Run workflow).
+# Two jobs, as GitHub's own Pages workflow: the deploy step looks the artifact up through the API, and from the job
+# that had just uploaded it, it found none three times in a row on 2026-11-21 (the artifact was there).
+name: Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

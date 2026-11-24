@@ -1,0 +1,407 @@
+// inferzero: the Qwen3-VL vision encoder (once a copy of the OpenCL engine's src/vision_qwen3vl.h, removed 2026-10-20), built on zero/engine.h (Level Zero).
+// Qwen3-VL vision encoder (mmproj projector type qwen3vl_merger: Qwen3.5 / 3.6 / 3.8 with vision) on the GPU.
+// A ViT over 16x16 patches (two temporal patch kernels summed, as for a still image), learned position embeddings
+// resized bilinearly (align corners) to the patch grid, 2-D rotary positions in every attention layer, then a
+// LayerNorm and a 2x2 merger MLP into the language model's embedding space: one token per 32x32 pixels.
+// Matches llama.cpp tools/mtmd (models/qwen3vl.cpp, bicubic dyn-size preprocessing); no deepstack layers.
+//
+// The CPU only decodes, resizes and lays out the image (milliseconds). The matrix products: dense models on the
+// engine's int8 GEMM in two passes (Q8_0 weights, activations plus their rounding residual; see i8_), the 35B and
+// Flash Next in floating point (the mmproj's f16 weights, f32 activations and accumulation: zero/kernels/ops.cl
+// vit_gemm_f16). One int8 pass is not enough: the encoder's output drifted 10-23 % from the f32 reference on photos,
+// in f16 0.6-1.8 %. Attention f16 q / K / V with f32 math, norms and activations f32.
+// Weights are uploaded on the first image, buffers grow with the largest image seen.
+#pragma once
+#include "engine.h"
+#include "../src/gguf.h"
+#include "../src/image.h"
+#include "../src/quants.h"
+#include <chrono>
+#include <cmath>
+#include <string>
+#include <vector>
+
+class VisionQwen3VL {
+ public:
+  int n_embd = 0, n_ff = 0, n_layer = 0, n_head = 0, patch = 16, merge = 2, n_out = 0, side = 0, hd_ = 64;
+  // merged tokens per image (32x32 pixels each): smaller images are scaled up to min_tokens (the 4B misread short
+  // text at ~240 tokens with some questions), larger ones down to max_tokens; llama.cpp allows 8..4096
+  int min_tokens = 256, max_tokens = 2048;  // 2048: small text in large images (a 6750-px logo misread at 1024)
+  float eps = 1e-6f;
+  double encode_ms = 0;  // last image, GPU part
+
+  VisionQwen3VL(const std::string& path, Engine& eng) : f_(path), e_(eng) {
+    if (f_.get_str("clip.projector_type") != "qwen3vl_merger")
+      throw std::runtime_error("mmproj: not a Qwen3-VL vision projector (qwen3vl_merger)");
+    n_embd = (int)f_.get_int("clip.vision.embedding_length", 0);
+    n_ff = (int)f_.get_int("clip.vision.feed_forward_length", 0);
+    n_layer = (int)f_.get_int("clip.vision.block_count", 0);
+    n_head = (int)f_.get_int("clip.vision.attention.head_count", 16);
+    patch = (int)f_.get_int("clip.vision.patch_size", 16);
+    merge = (int)f_.get_int("clip.vision.spatial_merge_size", 2);
+    n_out = (int)f_.get_int("clip.vision.projection_dim", 0);
+    eps = (float)f_.get_float("clip.vision.attention.layer_norm_epsilon", 1e-6);
+    if (const auto* ds = f_.get_ints("clip.vision.is_deepstack_layers"))
+      for (int64_t d : *ds)
+        if (d) throw std::runtime_error("mmproj: Qwen3-VL deepstack layers are not supported");
+    if (const auto* m = f_.get_floats("clip.vision.image_mean"))
+      for (int c = 0; c < 3 && c < (int)m->size(); ++c) mean_[c] = (float)(*m)[c];
+    if (const auto* s = f_.get_floats("clip.vision.image_std"))
+      for (int c = 0; c < 3 && c < (int)s->size(); ++c) std_[c] = (float)(*s)[c];
+    // the GPU kernels want 16-multiples, heads of 64 (4B) or 72 dims (9B: 8 SIMD lanes of 9)
+    hd_ = n_head > 0 ? n_embd / n_head : 0;
+    if (n_head <= 0 || n_embd % 16 || n_ff % 16 || n_embd % n_head || (hd_ != 64 && hd_ != 72) || merge != 2 || 3 * patch * patch % 16)
+      throw std::runtime_error("mmproj: this Qwen3-VL vision shape is not supported on the GPU yet (embedding " +
+                               std::to_string(n_embd) + ", heads " + std::to_string(n_head) + ")");
+    const GgufTensor& pe = f_.get("v.position_embd.weight");
+    // (a square table n_embd wide: a count that rounds up (2400 -> 49) read past pos_table_, audit 2026-11-18; the
+    //  rank checked before dims[1] is read, self audit 2026-11-19)
+    side = pe.dims.size() < 2 ? 0 : (int)std::lround(std::sqrt((double)pe.dims[1]));
+    if (pe.dims.size() < 2 || (int)pe.dims[0] != n_embd || (int64_t)side * side != (int64_t)pe.dims[1])
+      throw std::runtime_error("mmproj: the Qwen3-VL position table is not a square of " + std::to_string(n_embd) + "-wide rows");
+  }
+
+  // Whether this mmproj is a Qwen3-VL projector these kernels run (the shape checks of the constructor).
+  static bool usable(const GgufFile& g) {
+    if (g.get_str("clip.projector_type") != "qwen3vl_merger") return false;
+    const int64_t e = g.get_int("clip.vision.embedding_length", 0), h = g.get_int("clip.vision.attention.head_count", 16);
+    if (const auto* ds = g.get_ints("clip.vision.is_deepstack_layers"))
+      for (int64_t d : *ds)
+        if (d) return false;
+    return e > 0 && e % 16 == 0 && h > 0 && e % h == 0 && (e / h == 64 || e / h == 72) &&
+           g.get_int("clip.vision.spatial_merge_size", 2) == 2;
+  }
+
+  // GPU memory the encoder takes for images of up to max_tokens (weights + the buffers of reserve()).
+  static size_t gpu_bytes(const GgufFile& g, int max_tokens) {
+    const size_t E = g.get_int("clip.vision.embedding_length", 0), F = g.get_int("clip.vision.feed_forward_length", 0);
+    const size_t P = g.get_int("clip.vision.patch_size", 16), nh = g.get_int("clip.vision.attention.head_count", 16);
+    const size_t out = g.get_int("clip.vision.projection_dim", 0), mm0 = 4 * E, K0 = 3 * P * P;
+    const size_t Mp = ((size_t)max_tokens * 4 + 127) / 128 * 128;
+    const size_t per = K0 * 4 + E * 4 + 8 + E * 4 + E * 4 + std::max(std::max(3 * E, F), mm0) * 4 +
+                       std::max(E, out) * 4 + 3 * E * 2 + 3 * nh * 4;
+    // (the patch kernel's two temporal halves are summed into one; the position table stays on the host)
+    return enc_weight_bytes(g, {"v.", "mm."}, {"v.patch_embd.weight.1", "v.position_embd.weight"}) + Mp * per;
+  }
+
+  // Merged tokens an image of this size becomes, and the resized size (multiples of 32 pixels).
+  int plan(int w, int h, int& W, int& H) const {
+    const int unit = patch * merge;
+    img::fit_size(w, h, unit, (int64_t)min_tokens * unit * unit, (int64_t)max_tokens * unit * unit, W, H);
+    return (W / unit) * (H / unit);
+  }
+
+  // Image -> n_tok x n_out embeddings (row-major), merged tokens in row-major order over a gw x gh grid.
+  std::vector<float> encode(const ImageRGB& im, int& n_tok, int& gw, int& gh) {
+    load();
+    int W, H;
+    n_tok = plan(im.w, im.h, W, H);
+    const ImageRGB r = img::resize_bicubic(im, W, H);
+    const int px = W / patch, py = H / patch, N = px * py, E = n_embd, K0 = 3 * patch * patch;
+    gw = px / 2;
+    gh = py / 2;
+    const int Mp = (N + 127) / 128 * 128;
+    reserve(Mp);
+    // patches in the merger's order (2x2 groups contiguous), each as (channel, row, column) normalized pixels; the
+    // patch bias plus the position embedding (bilinear, align corners) per patch; the rotary (row, column)
+    std::vector<float> P((size_t)Mp * K0, 0.0f), A((size_t)N * E);
+    std::vector<int> pos((size_t)Mp * 2, 0);
+    const std::vector<float>& pb = patch_b_host_;
+#pragma omp parallel for
+    for (int g = 0; g < N / 4; ++g) {
+      const int by = g / gw, bx = g % gw;
+      for (int d = 0; d < 4; ++d) {
+        const int p = g * 4 + d, y = 2 * by + d / 2, x = 2 * bx + d % 2;
+        float* a = &P[(size_t)p * K0];
+        for (int c = 0; c < 3; ++c)
+          for (int ky = 0; ky < patch; ++ky)
+            for (int kx = 0; kx < patch; ++kx)
+              a[(c * patch + ky) * patch + kx] =
+                  (r.px[((size_t)(y * patch + ky) * W + x * patch + kx) * 3 + c] / 255.0f - mean_[c]) / std_[c];
+        const float sy = py > 1 ? (float)y * (side - 1) / (py - 1) : 0.0f, sx = px > 1 ? (float)x * (side - 1) / (px - 1) : 0.0f;
+        const int y0 = (int)sy, x0 = (int)sx, y1 = std::min(y0 + 1, side - 1), x1 = std::min(x0 + 1, side - 1);
+        const float fy = sy - y0, fx = sx - x0;
+        const float* t00 = &pos_table_[((size_t)y0 * side + x0) * E];
+        const float* t01 = &pos_table_[((size_t)y0 * side + x1) * E];
+        const float* t10 = &pos_table_[((size_t)y1 * side + x0) * E];
+        const float* t11 = &pos_table_[((size_t)y1 * side + x1) * E];
+        float* o = &A[(size_t)p * E];
+        for (int i = 0; i < E; ++i)
+          o[i] = pb[i] + (1 - fy) * ((1 - fx) * t00[i] + fx * t01[i]) + fy * ((1 - fx) * t10[i] + fx * t11[i]);
+        pos[2 * p] = y;
+        pos[2 * p + 1] = x;
+      }
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    auto& q = e_.cl_.queue;
+    CL_CHECK(clEnqueueWriteBuffer(q, bin_, CL_FALSE, 0, P.size() * 4, P.data(), 0, nullptr, nullptr));
+    CL_CHECK(clEnqueueWriteBuffer(q, badd_, CL_FALSE, 0, A.size() * 4, A.data(), 0, nullptr, nullptr));
+    CL_CHECK(clEnqueueWriteBuffer(q, bpos_, CL_FALSE, 0, pos.size() * 4, pos.data(), 0, nullptr, nullptr));
+
+    gemm(bin_, K0, patch_w_, x_, E, 0, false, Mp, N);
+    add(x_, E, badd_, true, N);
+    const float log2_base = (float)std::log2(10000.0);
+    for (const Layer& l : L_) {
+      ln(x_, l.ln1w, l.ln1b, Mp, N, hn_);
+      gemm(hn_, E, l.qkv, h_, 3 * E, 0, false, Mp, N);
+      // bias, 2-D rotary, f16 q / K / V; f32 attention (an int8 attention was 7-9 % off on photos, f32 0.2-0.5 %)
+      cl_kernel k = kern("vit_qkv_rope", "-DQD=" + std::to_string(hd_));
+      int nh = n_head, mp = Mp;
+      set_args(k, 0, h_, l.qkv_b, bpos_, nh, log2_base, mp, q_, k_, v_);
+      size_t g[2] = {(size_t)n_head * hd_ / 2, (size_t)N};
+      e_.run("vit_qkv_rope", k, 2, g, nullptr);
+      int n = N;
+      {
+        // (head 72 (Qwen3.5 9B, Qwen3.8 27B): tiles of 8 keys, attention -3 to -7 %, KL against tiles of 4 <= 0.0006, 31-32 / 32
+        //  tokens; not with Flash Next (hc), whose model turns the same rounding difference into KL 0.015; head 64 (4B) no faster)
+        const std::string ft = hd_ == 72 && !e_.hp.hc ? " -DFT=8" : "";
+        cl_kernel k2 = kern("vit_attn_rows", "-cl-intel-256-GRF-per-thread -DHD=" + std::to_string(hd_) + ft + " " + ardefs_);
+        set_args(k2, 0, q_, k_, v_, n, mp, nh, o_);
+        const size_t rows = (size_t)8 * arsg_;
+        size_t g2[2] = {((size_t)N + rows - 1) / rows * rows, (size_t)n_head}, lw2[2] = {rows, 1};
+        e_.run("vit_attn", k2, 2, g2, lw2);
+      }
+      gemm(o_, E, l.out, x_, E, 0, true, Mp, N);
+      add(x_, E, l.out_b, false, N);
+      ln(x_, l.ln2w, l.ln2b, Mp, N, hn_);
+      gemm(hn_, E, l.up, h_, n_ff, 0, false, Mp, N);
+      bias_act(h_, n_ff, l.up_b, true, N);
+      gemm(h_, n_ff, l.down, x_, E, 0, true, Mp, N);
+      add(x_, E, l.down_b, false, N);
+    }
+    // post-norm per patch, then 4 patches side by side (the same memory) through the merger
+    ln(x_, post_w_, post_b_, Mp, N, o_);
+    const int Mq = Mp / 4, nq = N / 4, E4 = 4 * E;
+    gemm(o_, E4, mm0_, h_, mm0_.N, 0, false, Mq, nq);
+    bias_act(h_, mm0_.N, mm0_b_, true, nq);
+    gemm(h_, mm0_.N, mm2_, o_, n_out, 0, false, Mq, nq);
+    bias_act(o_, n_out, mm2_b_, false, nq);
+    std::vector<float> out((size_t)nq * n_out);
+    CL_CHECK(clEnqueueReadBuffer(q, o_, CL_TRUE, 0, out.size() * 4, out.data(), 0, nullptr, nullptr));
+    encode_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    e_.collect_profile();
+    return out;
+  }
+
+ private:
+  GgufFile f_;
+  Engine& e_;
+  float mean_[3] = {0.5f, 0.5f, 0.5f}, std_[3] = {0.5f, 0.5f, 0.5f};
+  struct FW {  // an f16 weight [N][K] on the GPU, or (i8_) Q8_0 rows with K padded to whole superblocks
+    cl_mem w = nullptr;
+    int N = 0, K = 0;
+    GpuWeight q8;
+  };
+  // (the matrix products on the engine's int8 GEMM in two passes, as the Gemma 4 encoder's: Q8_0 weights, the
+  //  activations quantized per 32 values plus their rounding residual quantized the same way, in this encoder's own
+  //  buffers (the Qwen engines run one pass). Dense models (4B, 9B, 27B): the encoder 22-30 % faster, the model's KL
+  //  against the f16 encoder 0.0004-0.0024 on 5 images (32 tokens, 31-32 / 32 the same; 2026-10-27). Not the 35B
+  //  or Flash Next: those models turn any rounding difference on small text into KL ~0.01 (the 35B 0.003-0.011,
+  //  int8 on a single matrix kind as much as on all). ARC_VIT_Q2=0 / 1: off / on for any model)
+  bool i8_ = false;
+  cl_mem vaq_ = nullptr, vasc_ = nullptr, vab_ = nullptr;
+  int q2_rows_ = 0, q2_kp_ = 0;
+  std::string q2defs_;
+  size_t q2_off_[3] = {0, 0, 0};  // the residual pass's offsets (bytes) in vaq_ / vasc_ / vab_
+  struct Layer {
+    cl_mem ln1w, ln1b, ln2w, ln2b, qkv_b, out_b, up_b, down_b;
+    FW qkv, out, up, down;
+  };
+  bool loaded_ = false;
+  std::vector<Layer> L_;
+  FW patch_w_, mm0_, mm2_;
+  cl_mem post_w_ = nullptr, post_b_ = nullptr, mm0_b_ = nullptr, mm2_b_ = nullptr;
+  std::vector<float> pos_table_, patch_b_host_;
+  int cap_ = 0;  // rows the buffers hold
+  cl_mem bin_ = nullptr, badd_ = nullptr, bpos_ = nullptr, x_ = nullptr, hn_ = nullptr, h_ = nullptr, o_ = nullptr,
+         q_ = nullptr, k_ = nullptr, v_ = nullptr, dummy_ = nullptr;
+  const int vcg_ = getenv("ARC_VCG") ? atoi(getenv("ARC_VCG")) : 1, vwgy_ = getenv("ARC_VWGY") ? atoi(getenv("ARC_VWGY")) : 8;
+  const std::string vgdefs_ = getenv("ARC_VGDEFS") ? getenv("ARC_VGDEFS") : "";
+  const int arsg_ = getenv("ARC_ARSG") ? atoi(getenv("ARC_ARSG")) : 4;  // sub-groups (of 8 query rows) per work-group
+  const std::string ardefs_ = getenv("ARC_ARDEFS") ? getenv("ARC_ARDEFS") : "";
+
+  std::vector<float> host(const std::string& name) const {
+    const GgufTensor& t = f_.get(name);
+    std::vector<float> v(t.nelements());
+    dequant_row(t.type, t.data, (int)v.size(), v.data());
+    return v;
+  }
+  cl_mem f32(const std::string& name) {
+    const std::vector<float> v = host(name);
+    return e_.buf(v.size() * 4, v.data());
+  }
+  FW f16(const std::vector<float>& v, int N, int K) {
+    if (i8_) {
+      const int Kp = (K + 255) / 256 * 256;
+      std::vector<float> p((size_t)N * Kp, 0.0f);
+      for (int n = 0; n < N; ++n) memcpy(&p[(size_t)n * Kp], &v[(size_t)n * K], (size_t)K * 4);
+      const auto q = quantize_rows_q8_0(p.data(), N, Kp);
+      FW w;
+      w.q8 = e_.make_weight(GGML_Q8_0, q.data(), q.size(), N, Kp);
+      w.N = N;
+      w.K = K;
+      q2_kp_ = std::max(q2_kp_, Kp);
+      return w;
+    }
+    std::vector<uint16_t> h(v.size());
+    for (size_t i = 0; i < v.size(); ++i) h[i] = f32_to_fp16(v[i]);
+    FW w;
+    w.w = e_.buf(h.size() * 2, h.data());
+    w.N = N;
+    w.K = K;
+    return w;
+  }
+  FW f16(const std::string& name) {
+    const GgufTensor& t = f_.get(name);
+    return f16(host(name), (int)t.dims[1], (int)t.dims[0]);
+  }
+  void load() {
+    if (loaded_) return;
+    i8_ = getenv("ARC_VIT_Q2") ? atoi(getenv("ARC_VIT_Q2")) != 0 : !e_.hp.moe && !e_.hp.hc;
+    // (not where the engine runs two int8 passes of its own (q2mm_): its -DQ2_AQ comes after this encoder's in every
+    //  ops build, so vit_quant_pad wrote the residual at the engine's offset, past vaq_, and the GEMM ran a third
+    //  pass; audio_qwen3a.h takes the engine's layout instead. Audit 2026-11-18: Flash Next --precise with
+    //  ARC_VIT_Q2=1, and every model with hp.qwen3 (the qwen3 and qwen3vl architectures, so every dense Qwen3-VL
+    //  model) unless ARC_Q3_Q2=0; not the Qwen3.5 / 3.6 / 3.8 models)
+    if (e_.q2mm_) i8_ = false;
+    // the two temporal patch kernels see the same frame: their sum is the 2-D patch embedding
+    {
+      std::vector<float> w = host("v.patch_embd.weight"), w1 = host("v.patch_embd.weight.1");
+      // (both n_embd x 3*patch*patch, as f16() and the sum read them; self audit 2026-11-19)
+      if (w.size() != (size_t)n_embd * 3 * patch * patch || w1.size() != w.size())
+        throw std::runtime_error("mmproj: the Qwen3-VL patch embedding is not " + std::to_string(n_embd) + " x 3x" +
+                                 std::to_string(patch) + "x" + std::to_string(patch));
+      for (size_t i = 0; i < w.size(); ++i) w[i] += w1[i];
+      patch_w_ = f16(w, n_embd, 3 * patch * patch);
+    }
+    patch_b_host_ = host("v.patch_embd.bias");
+    pos_table_ = host("v.position_embd.weight");
+    for (int il = 0; il < n_layer; ++il) {
+      const std::string p = "v.blk." + std::to_string(il) + ".";
+      Layer l;
+      l.ln1w = f32(p + "ln1.weight");
+      l.ln1b = f32(p + "ln1.bias");
+      l.ln2w = f32(p + "ln2.weight");
+      l.ln2b = f32(p + "ln2.bias");
+      l.qkv = f16(p + "attn_qkv.weight");
+      l.qkv_b = f32(p + "attn_qkv.bias");
+      l.out = f16(p + "attn_out.weight");
+      l.out_b = f32(p + "attn_out.bias");
+      l.up = f16(p + "ffn_up.weight");
+      l.up_b = f32(p + "ffn_up.bias");
+      l.down = f16(p + "ffn_down.weight");
+      l.down_b = f32(p + "ffn_down.bias");
+      L_.push_back(l);
+    }
+    post_w_ = f32("v.post_ln.weight");
+    post_b_ = f32("v.post_ln.bias");
+    mm0_ = f16("mm.0.weight");
+    mm0_b_ = f32("mm.0.bias");
+    mm2_ = f16("mm.2.weight");
+    mm2_b_ = f32("mm.2.bias");
+    if (mm0_.K != 4 * n_embd || mm2_.N != n_out || mm0_.N % 16 || n_out % 16)
+      throw std::runtime_error("mmproj: unexpected Qwen3-VL merger shapes");
+    if (i8_) {  // the two passes' activations for chunks of the engine's chunk size: [pass][rows][K], per-32 scales
+      e_.ensure_stage();  // (MoE models decode Q8_0 rows just in time: staging for these sizes)
+      q2_rows_ = (e_.max_chunk + 127) / 128 * 128;
+      const size_t aq = (size_t)q2_rows_ * q2_kp_, sc = (size_t)q2_rows_ * (q2_kp_ / 32), ab = (size_t)q2_rows_ * (q2_kp_ / 16);
+      vaq_ = e_.buf(2 * aq);
+      vasc_ = e_.buf(2 * sc * 4);
+      vab_ = e_.buf(2 * ab * 2);
+      q2defs_ = "-DQ2_AQ=" + std::to_string(aq) + " -DQ2_SC=" + std::to_string(sc) + " -DQ2_AB=" + std::to_string(ab);
+      q2_off_[0] = aq;
+      q2_off_[1] = sc * 4;
+      q2_off_[2] = ab * 2;
+    }
+    loaded_ = true;
+  }
+  // buffers for Mp patch rows (grown as needed: the smaller set released first)
+  void reserve(int Mp) {
+    if (Mp <= cap_) return;
+    const size_t E = n_embd, F = std::max<size_t>(std::max<size_t>(3 * E, n_ff), mm0_.N), K0 = 3 * patch * patch;
+    for (cl_mem* m : {&bin_, &badd_, &bpos_, &x_, &hn_, &h_, &o_, &q_, &k_, &v_}) e_.free_buf(*m);
+    bin_ = e_.buf((size_t)Mp * K0 * 4);
+    badd_ = e_.buf((size_t)Mp * E * 4);
+    bpos_ = e_.buf((size_t)Mp * 8);
+    x_ = e_.buf((size_t)Mp * E * 4);
+    hn_ = e_.buf((size_t)Mp * E * 4);
+    h_ = e_.buf((size_t)Mp * F * 4);
+    o_ = e_.buf((size_t)Mp * std::max<size_t>(E, n_out) * 4);
+    q_ = e_.buf((size_t)Mp * E * 2);
+    k_ = e_.buf((size_t)Mp * E * 2 + 64);  // (+64: the 16-lane vit_attn_rows reads a block past the last row)
+    v_ = e_.buf((size_t)Mp * E * 2 + 64);
+    if (!dummy_) dummy_ = e_.buf(64);
+    cap_ = Mp;
+  }
+  cl_kernel kern(const char* name, const std::string& defs) { return e_.kernel("ops", "-DVIT " + defs, name); }
+  // C[:, c_off : c_off + w.N] (+)= A[rows][K] * W^T for M (padded, a multiple of 16) rows, n of them stored
+  bool path_said_ = false;  // (E0: the GEMM path's log line written)
+  void gemm(cl_mem A, int lda, const FW& w, cl_mem C, int ldc, int c_off, bool acc, int M, int n) {
+    if (!path_said_) {  // (E0, 2026-11-21: what this encoder's GEMMs run on, said once)
+      path_said_ = true;
+      zlog::eprintf("inferzero: the vision encoder (Qwen3-VL): %s\n", w.q8.raw ? (std::string("int8 GEMMs, two passes, on the prompt GEMM (") + e_.gemm_path_name(w.q8.gemm_qtype) + ")").c_str() : "f16 GEMMs (vit_gemm_f16, no XMX)");
+    }
+    if (w.q8.raw) {  // two int8 passes on the engine's GEMM, rows in equal chunks of at most q2_rows_
+      const int nch = (n + q2_rows_ - 1) / q2_rows_, rows = ((n + nch - 1) / nch + 127) / 128 * 128;
+      cl_kernel kq = kern("vit_quant_pad", q2defs_);
+      const int saved = e_.cur_T_;
+      const cl_mem a0 = e_.aq_, s0 = e_.asc_, b0 = e_.absum_;
+      struct Restore { Engine& e; cl_mem a, s, b; int t; ~Restore() { e.aq_ = a; e.asc_ = s; e.absum_ = b; e.cur_T_ = t; } } rst{e_, a0, s0, b0, saved};
+      for (int r0 = 0; r0 < n; r0 += rows) {
+        const int nv = std::min(rows, n - r0), Mp = std::min(rows, M - r0);
+        int ld = lda, kv = w.K, kp = w.q8.K, mm = Mp, mv = nv;
+        set_args(kq, 0, e_.from(A, (size_t)r0 * lda * 4), ld, kv, kp, mm, mv, vaq_, vasc_, vab_);
+        size_t g[2] = {256, (size_t)Mp}, lw[2] = {256, 1};
+        e_.run("vit_gemm", kq, 2, g, lw);
+        e_.cur_T_ = nv;
+        const cl_mem out = e_.from(C, (size_t)r0 * ldc * 4);
+        e_.aq_ = vaq_;
+        e_.asc_ = vasc_;
+        e_.absum_ = vab_;
+        e_.matmul("vit_gemm", w.q8, Mp, out, ldc, c_off, acc ? 1 : 0, true);
+        e_.aq_ = e_.from(vaq_, q2_off_[0]);  // (the residual's pass, added)
+        e_.asc_ = e_.from(vasc_, q2_off_[1]);
+        e_.absum_ = e_.from(vab_, q2_off_[2]);
+        e_.matmul("vit_gemm", w.q8, Mp, out, ldc, c_off, 1, true);
+        e_.aq_ = a0;
+        e_.asc_ = s0;
+        e_.absum_ = b0;
+      }
+      return;
+    }
+    cl_kernel k = kern("vit_gemm_f16", "-cl-intel-256-GRF-per-thread " + vgdefs_);  // (128 registers spill: 2.2x slower)
+    int ld = lda, K = w.K, lc = ldc, co = c_off, ac = acc ? 1 : 0, mv = n;
+    set_args(k, 0, A, ld, w.w, K, C, lc, co, ac, mv);
+    const int vtm = vgdefs_.find("-DVTM=") != std::string::npos ? atoi(vgdefs_.c_str() + vgdefs_.find("-DVTM=") + 6) : 16;
+    const int tiles = M / vtm;
+    int wgy = vwgy_, cg = vcg_;
+    while (tiles % wgy) wgy /= 2;
+    while ((w.N / 16) % cg) cg /= 2;
+    size_t g[2] = {(size_t)w.N, (size_t)tiles}, lw[2] = {(size_t)16 * cg, (size_t)wgy};
+    e_.run("vit_gemm", k, 2, g, lw);
+  }
+  // LayerNorm of the n valid rows into `out` (f32)
+  void ln(cl_mem x, cl_mem w, cl_mem b, int Mp, int n, cl_mem out) {
+    cl_kernel k = kern("vit_ln", "");
+    int E = n_embd;
+    float ep = eps;
+    set_args(k, 0, x, E, w, b, ep, out);
+    (void)Mp;
+    size_t g[2] = {256, (size_t)n}, lw[2] = {256, 1};
+    e_.run("vit_ln", k, 2, g, lw);
+  }
+  void bias_act(cl_mem x, int N, cl_mem b, bool gelu, int n) {
+    cl_kernel k = kern("vit_bias_act", "");
+    int nn = N, gl = gelu ? 1 : 0;
+    set_args(k, 0, x, nn, b, gl);
+    size_t g[2] = {(size_t)N, (size_t)n};
+    e_.run("vit_bias_act", k, 2, g, nullptr);
+  }
+  void add(cl_mem x, int N, cl_mem a, bool per_row, int n) {
+    cl_kernel k = kern("vit_add", "");
+    int nn = N, pr = per_row ? 1 : 0;
+    set_args(k, 0, x, nn, a, pr);
+    size_t g[2] = {(size_t)N, (size_t)n};
+    e_.run("vit_add", k, 2, g, nullptr);
+  }
+};

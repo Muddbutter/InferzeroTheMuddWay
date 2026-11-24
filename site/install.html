@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Install and uninstall inferzero</title>
+<meta name="description" content="How to install inferzero on Windows and Linux in about five minutes, how to remove it cleanly, and how to use it from your own apps.">
+<meta name="color-scheme" content="light">
+<meta property="og:title" content="inferzero: free, open-source AI on your Intel PC">
+<meta property="og:description" content="Run Qwen, Gemma 4 and DeepSeek models on Intel Core Ultra graphics and Arc cards. Free, open source, no cloud.">
+<meta property="og:type" content="website">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to the content</a>
+
+<header>
+  <div class="wrap">
+    <a class="brand" href="index.html" aria-label="inferzero, home page"><svg class="mark" width="26" height="26" viewBox="0 0 64 64" aria-hidden="true"><rect class="l" x="1.5" y="1.5" width="13" height="13" rx="3"/><rect class="l" x="17.5" y="1.5" width="13" height="13" rx="3"/><rect class="l" x="33.5" y="1.5" width="13" height="13" rx="3"/><rect class="l" x="49.5" y="1.5" width="13" height="13" rx="3"/><rect class="d" x="1.5" y="17.5" width="13" height="13" rx="3"/><rect class="d" x="17.5" y="17.5" width="13" height="13" rx="3"/><rect class="l" x="33.5" y="17.5" width="13" height="13" rx="3"/><rect class="d" x="49.5" y="17.5" width="13" height="13" rx="3"/><rect class="d" x="1.5" y="33.5" width="13" height="13" rx="3"/><rect class="l" x="17.5" y="33.5" width="13" height="13" rx="3"/><rect class="d" x="33.5" y="33.5" width="13" height="13" rx="3"/><rect class="d" x="49.5" y="33.5" width="13" height="13" rx="3"/><rect class="l" x="1.5" y="49.5" width="13" height="13" rx="3"/><rect class="l" x="17.5" y="49.5" width="13" height="13" rx="3"/><rect class="l" x="33.5" y="49.5" width="13" height="13" rx="3"/><rect class="l" x="49.5" y="49.5" width="13" height="13" rx="3"/></svg>inferzero</a>
+    <nav aria-label="Main">
+      <a href="install.html" aria-current="page">Install</a>
+      <a href="results.html">Results</a>
+      <a href="multi-gpu.html">Several GPUs</a>
+      <a href="help.html">Help out</a>
+    </nav>
+    <div class="hdr-right">
+      <a class="gh" href="https://github.com/rizagp/inferzero">GitHub</a>
+      <a class="btn p sm" href="https://github.com/rizagp/inferzero/releases/latest">Download</a>
+    </div>
+  </div>
+</header>
+
+<main id="main">
+
+<div class="wrap hero small" id="top">
+  <h1>Install and uninstall</h1>
+  <p class="lead">Installing takes about five minutes, plus the model's download. Nothing is installed into Windows itself: removing inferzero is deleting its folders. Check <a href="index.html#need">what you need</a> first.</p>
+  <nav class="jump" aria-label="On this page">
+    <a href="#install">Install</a><a href="#docker">Docker and Unraid</a><a href="#uninstall">Uninstall</a><a href="#apps">From your own apps</a>
+  </nav>
+</div>
+
+<section id="start">
+  <div class="wrap">
+    <h3 class="sub" id="install">Install</h3>
+    <div class="steps">
+      <div class="card">
+        <h3>Windows</h3>
+        <ol class="go">
+          <li>Download <code>inferzero-…-win64.zip</code> from the <a href="https://github.com/rizagp/inferzero/releases/latest">latest release</a> and unpack it anywhere.</li>
+          <li>Double-click <code>zero-launcher.cmd</code>. (Windows may ask once: "More info", then "Run anyway".)</li>
+          <li>Pick a model (the one that suits your RAM is ticked) and press <b>Download and start</b>. The chat opens in your browser.</li>
+        </ol>
+      </div>
+      <div class="card">
+        <h3>Linux</h3>
+        <ol class="go">
+          <li>Download <code>inferzero-…-linux-x64.tar.gz</code> from the <a href="https://github.com/rizagp/inferzero/releases/latest">latest release</a> and unpack it.</li>
+          <li>Run <code>./zero-launcher.sh</code>: a menu in the terminal.</li>
+          <li>Pick a model; it downloads it and starts the server. Open the address it shows in your browser.</li>
+        </ol>
+      </div>
+    </div>
+    <h3 class="sub" id="docker">Docker and Unraid</h3>
+    <div class="steps">
+      <div class="card">
+        <h3>Docker (Linux)</h3>
+        <p>The <code>docker/</code> folder of the Linux package (or the source code) holds a <code>Dockerfile</code> and a <code>compose.yaml</code>. The host needs only the GPU's kernel driver:</p>
+<pre>cd docker
+docker compose up -d
+docker compose logs -f</pre>
+        <p class="note">The chat is then at <code>http://127.0.0.1:8090</code>. <code>compose.yaml</code> sets the model (<code>MODEL: 4b</code>), the number of GPUs and the options; it passes <code>/dev/dri</code> through and keeps the models and compiled kernels in folders on the host. It ran on Unraid with an Arc B580 (tenken, <a href="https://github.com/rizagp/inferzero/issues/40">#40</a>). The Kubernetes file (<code>docker/kubernetes.yaml</code>) is not tested yet.</p>
+      </div>
+      <div class="card">
+        <h3>Unraid</h3>
+        <p>A template kept by catduckgnaf, not by this project: <a href="https://github.com/catduckgnaf/catduck-unraid-templates/blob/main/templates/inferzero.xml">the template</a> and <a href="https://github.com/catduckgnaf/catduck-unraid-templates#inferzero">its setup notes</a>. Their other templates are in Community Applications; Inferzero was not listed there yet on 21 November, so add it from the template meanwhile. Its image, <code>ghcr.io/catduckgnaf/inferzero:2026.11.21.18</code>, is built from that release.</p>
+        <p class="note">So far it was started on an Intel GPU host and found the GPU, but no model has been run with it yet (<a href="https://github.com/rizagp/inferzero/issues/46#issuecomment-7064820396">#46</a>); results are welcome. For several GPUs on Unraid, see <a href="multi-gpu.html#p2pdma">P2PDMA</a>: Unraid's stock kernel lacks it.</p>
+      </div>
+    </div>
+    <h3 class="sub" id="uninstall">Uninstall cleanly</h3>
+    <div class="steps">
+      <div class="card">
+        <h3>Windows</h3>
+        <ol class="go">
+          <li>Stop the server: <b>Stop server</b> in the launcher (or the tray icon's <b>Stop the server</b>), then close the launcher.</li>
+          <li>Delete the folder you unpacked.</li>
+          <li>Delete <code>%USERPROFILE%\.inferzero</code>: your chats, recordings and transcripts, logs, settings and inferzero's own model files. Copy out anything you want to keep first.</li>
+          <li>Delete the models from <code>%USERPROFILE%\.cache\huggingface\hub</code>: the <code>models--…</code> folders it downloaded. Other AI programs share this folder, so keep the ones they use.</li>
+        </ol>
+        <p class="note">Only if you used <code>setup.cmd</code>: remove the folder from your <b>Path</b> (Settings › System › About › Advanced system settings › Environment Variables), and if you connected Pi, delete <code>zero-pi.cmd</code> and <code>zero-server.cmd</code> from <code>%USERPROFILE%\.pi\agent\bin</code> and the "inferzero" entry from <code>%USERPROFILE%\.pi\agent\models.json</code>.</p>
+      </div>
+      <div class="card">
+        <h3>Linux</h3>
+        <ol class="go">
+          <li>Stop the server (Ctrl+C in the launcher's terminal).</li>
+          <li>Delete the folder you unpacked.</li>
+          <li>Delete <code>~/.inferzero</code>: chats, recordings, logs, settings and inferzero's own model files.</li>
+          <li>Delete the models from <code>~/.cache/huggingface/hub</code> (or <code>$HF_HOME/hub</code>): the <code>models--…</code> folders it downloaded, keeping those other programs use.</li>
+        </ol>
+        <p class="note">Only if you installed the service (<code>--install-service</code>): <code>systemctl --user disable --now inferzero</code>, then delete <code>~/.config/systemd/user/inferzero.service</code>. In Docker: <code>docker compose down</code> in the <code>docker</code> folder, then remove the image and the two host folders it used.</p>
+      </div>
+    </div>
+    <div class="card" style="margin-top:16px" id="apps">
+      <h3>From your own apps</h3>
+      <p>While it runs, the server answers at <code>http://127.0.0.1:8090</code> like the OpenAI API:</p>
+<pre>curl http://127.0.0.1:8090/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "Hello!"}]}'</pre>
+      <p class="note">Step by step, with every option: the <a href="https://github.com/rizagp/inferzero/blob/main/USAGE.md">usage guide</a>. Building from source: <a href="https://github.com/rizagp/inferzero/blob/main/docs/install.md">install and build</a>.</p>
+    </div>
+  </div>
+</section>
+
+</main>
+
+
+<footer>
+  <div class="wrap">
+    <div>inferzero · Apache 2.0 · <span class="mono">release 2026.11.19.01</span><br>An independent project, not made or endorsed by Intel. Intel and Arc are trademarks of Intel Corporation or its subsidiaries.</div>
+    <div><a href="https://github.com/rizagp/inferzero">GitHub</a> · <a href="https://github.com/rizagp/inferzero/releases">Releases</a> · <a href="https://github.com/rizagp/inferzero/blob/main/USAGE.md">Usage guide</a> · <a href="https://github.com/rizagp/inferzero/blob/main/CHANGELOG.md">Changelog</a></div>
+  </div>
+</footer>
+</body>
+</html>

@@ -1,0 +1,1818 @@
+// inferzero: the subset of the OpenCL API the engine uses (it began as an OpenCL engine), implemented on Level Zero, so that
+// zero/engine.h (begun as a copy of the OpenCL engine's src/engine.h) runs unchanged on top of it. Buffers are device USM allocations (a sub-buffer is
+// a pointer into its parent), commands go to one in-order immediate command list (the same order as the former OpenCL engine's in-order
+// OpenCL queue, hence the same results), and kernels are the native binaries of the OpenCL compiler: built through
+// OpenCL.dll (loaded under other names) and the kernel cache (%USERPROFILE%\.inferzero\kernels) is the one the OpenCL engine used.
+#pragma once
+#include "../src/app_dir.h"
+#include "../src/kcache.h"
+#include "ze_min.h"
+#ifdef _WIN32
+#include <dxgi1_4.h>
+#pragma comment(lib, "dxgi.lib")
+#endif
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstring>
+#include <filesystem>
+#include <stdexcept>
+#include <fstream>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+typedef int32_t cl_int;
+typedef uint32_t cl_uint;
+typedef uint64_t cl_ulong;
+typedef cl_uint cl_bool;
+typedef cl_ulong cl_bitfield;
+typedef cl_bitfield cl_mem_flags;
+typedef cl_bitfield cl_map_flags;
+typedef cl_ulong cl_queue_properties;
+typedef cl_uint cl_device_info;
+typedef cl_uint cl_profiling_info;
+typedef cl_uint cl_buffer_create_type;
+
+namespace zrt { struct Dev; }
+struct ZMem {
+  char* ptr;
+  size_t size;
+  bool owner;
+  zrt::Dev* d = nullptr;  // (the GPU it was made on: freed there)
+};
+struct ZKernel {
+  ze_kernel_handle_t k;
+  std::string name;
+  uint32_t gx = 0, gy = 0, gz = 0;  // group size last set
+  // the value each argument was last given (as passed to Level Zero: a buffer as its device pointer then, which the
+  // engine's slots repoint): the same value again is not set again (a launch keeps the arguments it was appended with)
+  // (gen: zrt::mem_gen when it was set. Level Zero takes a buffer argument's allocation when it is set, not only its
+  //  address: after a free, a new buffer at the same address must be set again, see zrt::mem_free)
+  struct Arg { uint8_t sz = 0; bool set = false; uint32_t gen = 0; unsigned char v[16]; };
+  std::vector<Arg> args;
+};
+// indirect: built with -DXCACHE (see kernel()); bin_bytes: the native binary's size (bench/xw_peak --all: the code a
+// variant compiles to, a measure of its instructions)
+struct ZProg { ze_module_handle_t m; bool indirect = false; std::string opts; size_t bin_bytes = 0; };
+typedef ZMem* cl_mem;
+typedef ZKernel* cl_kernel;
+typedef ZProg* cl_program;
+typedef struct _z_queue* cl_command_queue;
+typedef struct _z_context* cl_context;
+typedef struct _z_device* cl_device_id;
+typedef struct _z_platform* cl_platform_id;
+typedef struct _z_event* cl_event;
+
+#define CL_SUCCESS 0
+#define CL_TRUE 1
+#define CL_FALSE 0
+#define CL_DEVICE_GLOBAL_MEM_SIZE 0x101F
+#define CL_MEM_READ_WRITE (1 << 0)
+#define CL_MEM_WRITE_ONLY (1 << 1)
+#define CL_MEM_READ_ONLY (1 << 2)
+#define CL_MEM_USE_HOST_PTR (1 << 3)
+#define CL_MEM_ALLOC_HOST_PTR (1 << 4)
+#define CL_MEM_COPY_HOST_PTR (1 << 5)
+#define CL_MAP_READ (1 << 0)
+#define CL_MAP_WRITE (1 << 1)
+#define CL_BUFFER_CREATE_TYPE_REGION 0x1220
+#define CL_PROFILING_COMMAND_START 0x1282
+#define CL_PROFILING_COMMAND_END 0x1283
+struct cl_buffer_region { size_t origin, size; };
+
+#define CL_CHECK(expr)                                                                       \
+  do {                                                                                       \
+    cl_int _e = (expr);                                                                      \
+    if (_e != CL_SUCCESS) {                                                                  \
+      zlog::eprintf("inferzero error %d at %s:%d: %s\n", _e, __FILE__, __LINE__, #expr); \
+      fflush(stderr);                                                                        \
+      _Exit(1); /* (as ZE_CHECK: exit() runs destructors under running threads) */            \
+    }                                                                                        \
+  } while (0)
+
+// ---- the runtime state: one context for every GPU of the driver; per GPU (Dev) its device, one in-order immediate
+// command list, its buffers. A thread works on zrt::D(): the device its zrt::cur names, device 0 when it set none (the
+// server's threads, Whisper / Qwen3-ASR, the expert prefetch); a multi-GPU shard's thread sets its own (engine_tp.h).
+namespace zrt {
+struct Mapping;
+struct Dev {
+  ze_device_handle_t dev = nullptr;
+  ze_command_list_handle_t cl = nullptr;
+  int q_ord = 0, q_idx = 0;  // (cl's queue group and queue: ARC_TP_SIM spreads its shards over the GPU's queues)
+  std::unordered_set<ZMem*> mems;
+  uint64_t global_mem = 0;
+  uint64_t device_bytes = 0;  // device USM allocated by the engine
+  char* stage = nullptr;      // host USM bounce buffer for reads / writes
+  size_t stage_n = 0;
+  ze_command_list_handle_t cl_copy = nullptr;  // (see copy_list)
+  const char* cl_copy_kind = "";
+  ze_event_handle_t copy_ev[4] = {};  // (see copy_event)
+  // (integrated() / xehpc() / hw_threads(), read once: they were a zeDeviceGetProperties each call, ~660 a token per
+  //  shard on the GEMV path, and a split model's shard threads called them together: 4 B60s' 27B step 18.4 -> 48.8 ms,
+  //  issue #4, 2026-11-21)
+  int integ = -1, xehpc_dev = -1;
+  int64_t hw_thr = -1, pci_id = -1;
+  ze_command_list_handle_t cl_tp = nullptr;  // (see tp_copy_list)
+  ze_event_handle_t tp_ev[32] = {};          // (see tp_event)
+  std::vector<ze_event_handle_t> ev_free;  // (see ev_get)
+  double ev_ns_per_tick = 0;
+  uint64_t ev_mask = ~0ull;
+  std::vector<Mapping>* maps = nullptr;  // (see clEnqueueMapBuffer)
+  int index = 0;
+  // (a split model's GPUs, zero/mgpu/engine_tp.h: sync() gives up after this long, or once *abort is set because
+  //  another GPU failed, instead of waiting forever for a GPU that hangs; one GPU: no limit, as always)
+  // (atomic: TpEngine sets and restores them while a thread it gave up on may still be waiting in sync())
+  std::atomic<uint64_t> sync_timeout_ns{UINT64_MAX};
+  std::atomic<const std::atomic<bool>*> abort{nullptr};
+  std::atomic<std::atomic<bool>*> fault{nullptr};  // (set when a wait gave up on its GPU: the split model is not trusted again)
+  // (a second Dev of the same GPU with lists of its own, a split model's sum thread (ARC_TP_OVERLAP, zero/mgpu/
+  //  engine_tp.h): its waits take the limit, abort and fault of this GPU's own Dev, which TpEngine sets and disarms)
+  Dev* guard = nullptr;
+  Dev& g() { return guard ? *guard : *this; }
+  // (ARC_BATCH, see zrt::batch_max: the regular lists kernels are recorded into, each appended to `cl` when full and
+  //  signalling `done` when it has run; `rec` the one being recorded, rec_n kernels in it, rec_cap its size)
+  struct RecList { ze_command_list_handle_t l = nullptr; ze_event_handle_t done = nullptr; bool used = false; };
+  std::vector<RecList> rec_pool;
+  int rec_next = 0, rec_cur = 0, rec_n = 0, rec_cap = 0;
+  ze_command_list_handle_t rec = nullptr;
+  // (this GPU's own ARC_BATCH default, from its own kind: tiered placement P0, 2026-11-20; -1 until known)
+  int batch_def = -1;
+  // (a GPU of another Level Zero driver than GPU 0's, a layer split's stage (#57: a B60 and an A770 on two drivers):
+  //  that driver's context, which its memory, modules, lists and events are made in; null: the shared ctx)
+  ze_context_handle_t zctx = nullptr;
+  ze_driver_handle_t zdrv = nullptr;  // (that driver; null: zrt::driver's, as GPU 0)
+  // (batch_append_for's answer for this GPU, looked up once: batching() asks it at every launch)
+  mutable std::atomic<void*> batch_app{nullptr};
+  mutable std::atomic<int> batch_app_known{0};
+};
+// a wait that gave up (Dev::sync_timeout_ns / abort): the split model's shards are out of step afterwards
+struct GpuWaitError : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+inline ze_context_handle_t ctx = nullptr;
+inline ze_driver_handle_t driver = nullptr;
+inline Dev dev0;
+inline std::vector<Dev*> devs{&dev0};  // devs[i]: GPU i (open_devices)
+inline thread_local Dev* cur = nullptr;
+// (a thread doing a split model's work: its shard thread, or the server's thread inside a mirrored call. Only its
+//  waits take the GPU's limit and abort: Whisper / Qwen3-ASR on GPU 0 wait as always, and their long waits never
+//  mark the split model faulty)
+inline thread_local bool tp_guarded = false;
+// (a split model's shard being made: an allocation that fails throws instead of ending the process, so the server
+//  can load the model on one GPU instead. ARC_TP_OOM=r (tests): the first allocation of 256 MB or more on shard r fails)
+inline thread_local bool oom_throws = false;
+inline thread_local bool oom_test = false;
+inline Dev& D() { return cur ? *cur : dev0; }
+// the context of a GPU's memory, modules, lists and events: its driver's (Dev::zctx), else the one shared ctx
+inline ze_context_handle_t ctx_of(const Dev& d) { return d.zctx ? d.zctx : ctx; }
+inline ze_context_handle_t C() { return ctx_of(D()); }
+// Every free of Level Zero memory the engine makes goes through mem_free, which counts it: clSetKernelArg's cache
+// takes an argument as unchanged only within the same count. Level Zero keeps the allocation a buffer argument was
+// set with, so a buffer freed and another made at the same address (the allocator reuses them) left a kernel whose
+// cached argument still named the freed allocation: the next launch read it inside zeCommandListAppendLaunchKernel
+// and the process ended, 0xC0000005 in ze_intel_gpu64.dll (2026-11-04, and three times on 2026-11-10 at the start of a
+// meeting's transcription: Qwen3-ASR's encoder grows its buffers after the server's 1-s warm-up clip)
+inline std::atomic<uint32_t> mem_gen{1};
+inline ze_result_t mem_free(ze_context_handle_t c, void* p) {
+  // (counted before the free: after it, another thread could get the same address and set it on a kernel before the
+  //  count moved; a review, 2026-11-17. Counting early is harmless: at worst an argument is set again)
+  mem_gen.fetch_add(1, std::memory_order_relaxed);
+  return zeMemFree(c, p);
+}
+// Called when the GPU runs out of memory (the share is shared with every other program: a browser or the desktop
+// taking more makes a launch or allocation fail): frees some memory (the engine shrinks its expert cache) and returns
+// true, or false when it cannot; the failed call is then retried.
+inline bool (*oom_hook)() = nullptr;
+
+// ---- ARC_BATCH=n (off by default): kernels recorded into regular in-order command lists of up to n kernels, each
+// appended to the immediate list when full (zeCommandListImmediateAppendCommandListsExp, Level Zero 1.9), instead of
+// each kernel appended there on its own. Same commands in the same order on the same list: the same results. What
+// changes is how the GPU gets them: on a Pro B60 (bench/replay_probe.cpp, 2026-11-06) 700 small kernels took 2.56 us
+// each appended one by one against 0.66 replayed from a recorded list, ~3 ms of a 27B token. The lists start at 4
+// kernels after every wait (an idle GPU gets work soon) and double up to n. Anything else that goes to the
+// immediate list (copies, fills, barriers, waits) first appends the list being recorded (imm(), sync()). Kernels
+// that signal an event (profiling, ARC_ZE_WATCH) and ARC_ZE_SYNC_EACH go to the immediate list as before.
+// (the default without ARC_BATCH, set when GPU 0 is known (Ctx::init): 64 on Alchemist (a discrete GPU with 8-lane
+//  sub-groups) on Windows and, since 2026-11-21, Linux; 0 elsewhere. Two A770s on Windows, the 27B's generation 12.67 -> 21.58 and 14.33 -> 22.66
+//  tok/s, the logits the same (hansong80, TheUniKian, issue #45, 2026-11-18): a kernel appended on its own cost
+//  33-44 us there (replay_probe), against 2.5 recorded. ARC_BATCH=0 turns it off)
+// (per GPU since 2026-11-20, tiered placement P0: each Dev's batch_def, set from that GPU's own kind when it opens
+//  (batch_default_for), so a split over unlike GPUs gives each its own; ARC_BATCH applies to every GPU. One GPU, or a
+//  split of one kind, runs exactly as before)
+inline int batch_env() {
+  static const int n = getenv("ARC_BATCH") ? std::max(0, std::min(4096, atoi(getenv("ARC_BATCH")))) : -1;
+  return n;
+}
+inline int batch_max(const Dev& d) { return batch_env() >= 0 ? batch_env() : std::max(0, d.batch_def); }
+inline int batch_max();
+// a GPU's default: 64 on a discrete GPU with 8-lane sub-groups (Alchemist) under Windows, 0 elsewhere
+// (Linux too since 2026-11-21: an A750 with the i915 driver, the 4B's generation 46.0 -> 66.6 tok/s, with MTP 68.4 ->
+//  88.5 with GU / DB as well (hakangit, issue #72); an A770 with the xe driver neither gains nor loses (128: -0.5 %
+//  against a 1.7 % drift; skipzx-lab, #45). The same commands in the same order: the same results)
+inline int batch_default_for(ze_device_handle_t dev) {
+  {
+  ze_device_properties_t p{};
+  p.stype = ZE_STYPE_DEVICE_PROPERTIES;
+  ze_device_compute_properties_t cp{};
+  cp.stype = ZE_STYPE_DEVICE_COMPUTE_PROPERTIES;
+  if (zeDeviceGetProperties(dev, &p) != 0 || zeDeviceGetComputeProperties(dev, &cp) != 0) return 0;
+  bool sg8 = false;
+  for (uint32_t i = 0; i < cp.numSubGroupSizes && i < ZE_SUBGROUPSIZE_COUNT; ++i) sg8 = sg8 || cp.subGroupSizes[i] == 8;
+  if (getenv("ARC_NO_SG8") && atoi(getenv("ARC_NO_SG8")) != 0) sg8 = false;
+  return sg8 && !(p.flags & 1u) ? 64 : 0;  // (flags bit 0: integrated)
+  }
+}
+struct BatchFns {
+  struct ListDesc { ze_structure_type_t stype; const void* pNext; uint32_t ordinal, flags; };
+  ze_result_t(__stdcall* create)(ze_context_handle_t, ze_device_handle_t, const ListDesc*, ze_command_list_handle_t*) = nullptr;
+  ze_result_t(__stdcall* close)(ze_command_list_handle_t) = nullptr;
+  ze_result_t(__stdcall* reset)(ze_command_list_handle_t) = nullptr;
+  ze_result_t(__stdcall* append)(ze_command_list_handle_t, uint32_t, ze_command_list_handle_t*, ze_event_handle_t, uint32_t,
+                                 ze_event_handle_t*) = nullptr;
+  bool ok = false;
+  bool loader_append = false;  // (append is the loader's export, for every driver)
+};
+inline BatchFns& batch_fns() {
+  static BatchFns f = [] {
+    BatchFns b;
+    void* zl = plat::dl_loaded("ze_loader.dll", "libze_loader.so.1");
+    if (!zl || !driver) return b;
+    b.create = (decltype(b.create))plat::dl_sym(zl, "zeCommandListCreate");
+    b.close = (decltype(b.close))plat::dl_sym(zl, "zeCommandListClose");
+    b.reset = (decltype(b.reset))plat::dl_sym(zl, "zeCommandListReset");
+    // (the loader's own export dispatches by the list's driver; without it, the driver's address: GPU 0's here, another
+    //  driver's in batch_append_for, audit 2026-11-23)
+    b.append = (decltype(b.append))plat::dl_sym(zl, "zeCommandListImmediateAppendCommandListsExp");
+    b.loader_append = b.append != nullptr;
+    if (!b.append) {
+      typedef ze_result_t(__stdcall * PFN_ext)(ze_driver_handle_t, const char*, void**);
+      auto ext = (PFN_ext)plat::dl_sym(zl, "zeDriverGetExtensionFunctionAddress");
+      void* p = nullptr;
+      if (ext && ext(driver, "zeCommandListImmediateAppendCommandListsExp", &p) == 0) b.append = (decltype(b.append))p;
+    }
+    b.ok = b.create && b.close && b.reset && b.append;
+    zlog::eprintf(b.ok ? "inferzero: ARC_BATCH=%d: kernels recorded in lists of up to %d\n"
+                         : "inferzero: ARC_BATCH=%d: this driver cannot append lists to an immediate list; off\n",
+            batch_max(), batch_max());
+    return b;
+  }();
+  return f;
+}
+inline int batch_max() { return batch_max(D()); }
+// append for d's driver: the loader's export, or GPU 0's driver's address, or (a GPU of another driver, Linux with
+// unlike cards) that driver's own, looked up once per driver; null when it has none
+using BatchAppend = decltype(BatchFns::append);
+inline BatchAppend batch_append_for(const Dev& d) {
+  BatchFns& b = batch_fns();
+  if (!b.ok) return nullptr;
+  if (b.loader_append || !d.zdrv || d.zdrv == driver) return b.append;
+  if (d.batch_app_known.load(std::memory_order_acquire)) return (BatchAppend)d.batch_app.load(std::memory_order_relaxed);
+  static std::mutex mu;
+  static std::vector<std::pair<ze_driver_handle_t, BatchAppend>> by_drv;
+  std::lock_guard<std::mutex> g(mu);
+  auto keep = [&d](BatchAppend f) {
+    d.batch_app.store((void*)f, std::memory_order_relaxed);
+    d.batch_app_known.store(1, std::memory_order_release);
+    return f;
+  };
+  for (auto& [dh, f] : by_drv)
+    if (dh == d.zdrv) return keep(f);
+  BatchAppend f = nullptr;
+  typedef ze_result_t(__stdcall * PFN_ext)(ze_driver_handle_t, const char*, void**);
+  void* zl = plat::dl_loaded("ze_loader.dll", "libze_loader.so.1");
+  auto ext = zl ? (PFN_ext)plat::dl_sym(zl, "zeDriverGetExtensionFunctionAddress") : nullptr;
+  void* p = nullptr;
+  if (ext && ext(d.zdrv, "zeCommandListImmediateAppendCommandListsExp", &p) == 0) f = (BatchAppend)p;
+  if (!f) zlog::eprintf("inferzero: GPU %d's driver cannot append lists to an immediate list: ARC_BATCH off there\n", d.index);
+  by_drv.push_back({d.zdrv, f});
+  return keep(f);
+}
+inline bool batching(const Dev& d) { return batch_max(d) > 0 && batch_append_for(d) != nullptr; }
+inline bool batching() { return batching(D()); }
+// the list being recorded appended to d's immediate list (no-op when none)
+inline void flush(Dev& d) {
+  if (!d.rec) return;
+  ze_command_list_handle_t l = d.rec;
+  d.rec = nullptr;  // (before anything that could wait: an oom_hook that synchronizes comes back here)
+  d.rec_n = 0;
+  d.rec_cap = std::min(d.rec_cap * 2, batch_max(d));
+  ZE_CHECK(batch_fns().close(l));
+  Dev::RecList& r = d.rec_pool[d.rec_cur];
+  const BatchAppend app = batch_append_for(d);  // (non-null: batching(d) let the recording start)
+  ze_result_t e = app(d.cl, 1, &l, r.done, 0, nullptr);
+  // (out of device memory; the hook frees on the calling thread's GPU, zrt::D(): only when d is that GPU, as
+  //  clReleaseMemObject can flush another GPU's list, whose shard thread may be using its cache)
+  for (int i = 0; e == (ze_result_t)0x70000003 && i < 8 && &d == &D() && oom_hook && oom_hook(); ++i)
+    e = app(d.cl, 1, &l, r.done, 0, nullptr);
+  ZE_CHECK(e);
+  r.used = true;
+}
+// d's immediate list, for a command that is not a kernel: what was recorded goes first
+inline ze_command_list_handle_t imm(Dev& d) { flush(d); return d.cl; }
+inline ze_command_list_handle_t imm() { return imm(D()); }
+// the list to record d's next kernel into: a free one of the pool (64 lists; one whose earlier recording has not run
+// yet is waited for, which only happens when the GPU is 64 lists behind)
+inline void sync();
+template <class W>
+inline void wait_plain(const Dev& d, W w, const char* what);
+inline ze_command_list_handle_t rec_list(Dev& d) {
+  if (d.rec) return d.rec;
+  const int kPool = 64;
+  if (d.rec_pool.empty()) {
+    uint32_t ng = 0, ord = 0;
+    ZE_CHECK(zeDeviceGetCommandQueueGroupProperties(d.dev, &ng, nullptr));
+    std::vector<ze_command_queue_group_properties_t> gp(ng);
+    for (auto& g : gp) g.stype = ZE_STYPE_COMMAND_QUEUE_GROUP_PROPERTIES;
+    ZE_CHECK(zeDeviceGetCommandQueueGroupProperties(d.dev, &ng, gp.data()));
+    for (uint32_t i = 0; i < ng; ++i)
+      if (gp[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COMPUTE) { ord = i; break; }  // (the immediate list's group)
+    ze_event_pool_desc_t pd{ZE_STYPE_EVENT_POOL_DESC, nullptr, 0x1 /* host visible */, (uint32_t)kPool};
+    ze_event_pool_handle_t pool = nullptr;
+    ZE_CHECK(zeEventPoolCreate(ctx_of(d), &pd, 1, &d.dev, &pool));
+    d.rec_pool.resize(kPool);
+    for (int i = 0; i < kPool; ++i) {
+      BatchFns::ListDesc ld{0xfu /* ZE_STRUCTURE_TYPE_COMMAND_LIST_DESC */, nullptr, ord, 8 /* in order */};
+      ZE_CHECK(batch_fns().create(ctx_of(d), d.dev, &ld, &d.rec_pool[i].l));
+      ze_event_desc_t ed{ZE_STYPE_EVENT_DESC, nullptr, (uint32_t)i, 0x4 /* signal: host scope */, 0};
+      ZE_CHECK(zeEventCreate(pool, &ed, &d.rec_pool[i].done));
+    }
+  }
+  d.rec_cur = d.rec_next;
+  d.rec_next = (d.rec_next + 1) % kPool;
+  Dev::RecList& r = d.rec_pool[d.rec_cur];
+  if (r.used) {
+    // (a split model's shard: through sync(), whose wait has the time limit and the abort of the other GPUs; it waits
+    //  for the whole list, which holds this one's earlier recording. d is D() here: the only caller passes it)
+    if (tp_guarded) sync();
+    else wait_plain(d, [&r](uint64_t t) { return zeEventHostSynchronize(r.done, t); }, "a recorded list");
+    ZE_CHECK(zeEventHostReset(r.done));
+    ZE_CHECK(batch_fns().reset(r.l));
+    r.used = false;
+  }
+  if (d.rec_cap < 4) d.rec_cap = std::min(4, batch_max(d));
+  d.rec = r.l;
+  return r.l;
+}
+
+// (the driver's UINT64_MAX wait does not spin a core: measured 2026-11-04, QUEUE 31.11 (1); polling with sleeps
+//  instead gained nothing)
+inline std::atomic<uint64_t> sync_n{0};  // (host waits, counted with ARC_LAUNCH_STATS)
+inline bool launch_stats_on();
+// The failsafe's wait limit (docs/gpu-failsafe.md 2): ARC_GPU_WAIT_S seconds for one wait of a GPU's work, past which
+// the process ends with the hang marker and code 3 (src/gpu_fail.h). Unset or 0: no limit, one wait as before. Off by
+// default until the longest real waits are measured on the iGPU (ARC_WAIT_STATS=1 prints them); bench/gpu_guard.ps1
+// sets it for test runs. (A split model's shards keep TpEngine's own limit, below.)
+inline uint64_t wait_limit_ns() {
+  static const uint64_t v = [] {
+    const char* e = getenv("ARC_GPU_WAIT_S");
+    double s = e ? atof(e) : 0.0;
+    // (at least 5 s: below about 1 s healthy waits would be taken for hangs; any value with ARC_GPU_FAULT_TEST)
+    if (s > 0 && s < 5 && !getenv("ARC_GPU_FAULT_TEST")) {
+      LOG_WRN("inferzero: ARC_GPU_WAIT_S=%s is below 5 s: 5 s used\n", e);
+      s = 5;
+    }
+    return s > 0 ? (uint64_t)std::max(1.0, s * 1e9) : UINT64_MAX;
+  }();
+  return v;
+}
+// ARC_WAIT_STATS=1: the longest single wait of the run, printed at the end (to choose the limit's default)
+inline std::atomic<uint64_t> wait_max_ns{0};
+inline bool wait_stats_on() {
+  static const bool on = [] {
+    const char* e = getenv("ARC_WAIT_STATS");
+    if (!e || atoi(e) == 0) return false;
+    std::atexit([] { zlog::eprintf("inferzero: the longest single GPU wait: %.3f s\n", wait_max_ns.load() / 1e9); });
+    return true;
+  }();
+  return on;
+}
+// One wait of a GPU's work (w(timeout) is the Level Zero wait), with the limit above; what: for the hang message
+template <class W>
+inline void wait_plain(const Dev& d, W w, const char* what) {
+  if (const int t = gpufail::fault_test()) {  // (ARC_GPU_FAULT_TEST: the first wait as if it had failed)
+    static std::atomic<bool> done{false};
+    if (!done.exchange(true)) {
+      (void)w(UINT64_MAX);
+      gpufail::gpu_fatal((gpufail::Kind)t, std::string("a test (ARC_GPU_FAULT_TEST) at GPU ") + std::to_string(d.index) + "'s first wait");
+    }
+  }
+  const uint64_t lim = wait_limit_ns();
+  const bool st = wait_stats_on();
+  const auto t0 = st ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+  const ze_result_t r = w(lim);
+  if (r == ZE_RESULT_NOT_READY && lim != UINT64_MAX)
+    gpufail::gpu_fatal(gpufail::Hang, "GPU " + std::to_string(d.index) + ": " + what + " did not finish within " +
+                                          std::to_string(lim / 1000000000ull) + " s (ARC_GPU_WAIT_S)");
+  if (r != ZE_RESULT_SUCCESS) ze_fail(r, __FILE__, __LINE__, what);
+  if (st) {
+    const uint64_t ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+    uint64_t m = wait_max_ns.load();
+    while (ns > m && !wait_max_ns.compare_exchange_weak(m, ns)) {}
+  }
+}
+inline void sync() {
+  Dev& d = D();
+  if (launch_stats_on()) ++sync_n;
+  if (d.rec) {
+    flush(d);
+    d.rec_cap = 0;  // (the GPU will be idle: the next lists start small again)
+  }
+  Dev& gd = d.g();
+  if (!tp_guarded || (gd.sync_timeout_ns.load() == UINT64_MAX && !gd.abort.load())) {
+    wait_plain(d, [&d](uint64_t t) { return zeCommandListHostSynchronize(d.cl, t); }, "the work it was given");
+    return;
+  }
+  const auto t0 = std::chrono::steady_clock::now();  // (in pieces of 100 ms: see Dev::sync_timeout_ns)
+  for (;;) {  // (the limit and abort read again each piece: TpEngine::disarm can call a wait off)
+    const ze_result_t r = zeCommandListHostSynchronize(d.cl, 100000000ull);
+    if (r == ZE_RESULT_SUCCESS) return;
+    if (r != ZE_RESULT_NOT_READY) ZE_CHECK(r);
+    const std::atomic<bool>* ab = gd.abort.load();
+    if (ab && ab->load(std::memory_order_relaxed))
+      throw GpuWaitError("GPU " + std::to_string(d.index) + ": wait left, another GPU failed");
+    const uint64_t lim = gd.sync_timeout_ns.load();
+    if ((uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count() > lim) {
+      if (std::atomic<bool>* f = gd.fault.load()) f->store(true);
+      // (a split model's GPU past its limit: the hang marker too, so no later start piles onto it, though TpEngine goes
+      //  on with the failover; audit 2026-11-23 M5)
+      gpufail::write_marker(gpufail::Hang, gpufail::last_kernel.load(), "split=1");
+      throw GpuWaitError("GPU " + std::to_string(d.index) + ": its work did not finish within " +
+                         std::to_string(lim / 1000000000ull) + " s (the GPU hangs?)");
+    }
+  }
+}
+// The same wait for an event or another list of this thread's GPU (a split model's pipelined sums, engine_tp.h):
+// with sync()'s limit and abort on a split model's thread, without them elsewhere
+template <class W>
+inline void wait_guarded(W w) {
+  Dev& d = D();
+  Dev& gd = d.g();
+  if (!tp_guarded || (gd.sync_timeout_ns.load() == UINT64_MAX && !gd.abort.load())) {
+    wait_plain(d, w, "a list or event it was given");
+    return;
+  }
+  const auto t0 = std::chrono::steady_clock::now();
+  for (;;) {
+    const ze_result_t r = w(100000000ull);
+    if (r == ZE_RESULT_SUCCESS) return;
+    if (r != ZE_RESULT_NOT_READY) ZE_CHECK(r);
+    const std::atomic<bool>* ab = gd.abort.load();
+    if (ab && ab->load(std::memory_order_relaxed))
+      throw GpuWaitError("GPU " + std::to_string(d.index) + ": wait left, another GPU failed");
+    const uint64_t lim = gd.sync_timeout_ns.load();
+    if ((uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count() > lim) {
+      if (std::atomic<bool>* f = gd.fault.load()) f->store(true);
+      // (a split model's GPU past its limit: the hang marker too, so no later start piles onto it, though TpEngine goes
+      //  on with the failover; audit 2026-11-23 M5)
+      gpufail::write_marker(gpufail::Hang, gpufail::last_kernel.load(), "split=1");
+      throw GpuWaitError("GPU " + std::to_string(d.index) + ": its copies did not finish within " +
+                         std::to_string(lim / 1000000000ull) + " s (the GPU hangs?)");
+    }
+  }
+}
+inline void event_wait(ze_event_handle_t e) {
+  wait_guarded([e](uint64_t t) { return zeEventHostSynchronize(e, t); });
+}
+inline void list_wait(ze_command_list_handle_t l) {
+  wait_guarded([l](uint64_t t) { return zeCommandListHostSynchronize(l, t); });
+}
+// A second immediate command list for copies that run while `cl` executes kernels (the expert cache's prompt
+// prefetch, xcache.h): on a copy engine when the device has one, else on another queue of the compute group.
+inline ze_command_list_handle_t new_copy_list(const char** kind, int* ord_out, int* idx_out);
+inline ze_command_list_handle_t copy_list() {
+  if (D().cl_copy) return D().cl_copy;
+  int ord = 0, idx = 0;
+  D().cl_copy = new_copy_list(&D().cl_copy_kind, &ord, &idx);
+  zlog::eprintf("inferzero: expert copies on a %s (queue group %d, queue %d)\n", D().cl_copy_kind, ord, idx);
+  return D().cl_copy;
+}
+// A split model's pipelined sums (zero/mgpu/engine_tp.h, ARC_TP_PIPE): a copy list of their own next to `cl`, on the
+// same kind of queue as copy_list (not that list: the expert prefetch appends to it from its own thread, and Level
+// Zero allows one thread per list)
+inline ze_command_list_handle_t tp_copy_list() {
+  if (D().cl_tp) return D().cl_tp;
+  const char* kind = "";
+  int ord = 0, idx = 0;
+  D().cl_tp = new_copy_list(&kind, &ord, &idx);
+  zlog::eprintf("inferzero: GPU %d: the split model's sums copy on a %s (queue group %d, queue %d)\n", D().index, kind,
+          ord, idx);
+  return D().cl_tp;
+}
+// its events (host visible; signalled with host scope, waited with device scope, as copy_event's)
+inline ze_event_handle_t tp_event(int i) {
+  if (!D().tp_ev[0]) {
+    ze_event_pool_desc_t pd{ZE_STYPE_EVENT_POOL_DESC, nullptr, 0x1 /* host visible */, 32};
+    ze_event_pool_handle_t pool = nullptr;
+    ZE_CHECK(zeEventPoolCreate(C(), &pd, 1, &D().dev, &pool));
+    for (uint32_t k = 0; k < 32; ++k) {
+      ze_event_desc_t ed{ZE_STYPE_EVENT_DESC, nullptr, k, 0x4 /* signal: host scope */, 0x2 /* wait: device scope */};
+      ZE_CHECK(zeEventCreate(pool, &ed, &D().tp_ev[k]));
+    }
+  }
+  return D().tp_ev[i & 31];
+}
+inline ze_command_list_handle_t new_copy_list(const char** kind, int* ord_out, int* idx_out) {
+  uint32_t ng = 0;
+  ZE_CHECK(zeDeviceGetCommandQueueGroupProperties(D().dev, &ng, nullptr));
+  std::vector<ze_command_queue_group_properties_t> gp(ng);
+  for (auto& g : gp) g.stype = ZE_STYPE_COMMAND_QUEUE_GROUP_PROPERTIES;
+  ZE_CHECK(zeDeviceGetCommandQueueGroupProperties(D().dev, &ng, gp.data()));
+  int ord = -1, idx = 0;
+  for (uint32_t i = 0; i < ng && ord < 0; ++i)  // a copy-only group
+    if ((gp[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COPY) && !(gp[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COMPUTE))
+      ord = (int)i, *kind = "copy engine";
+  for (uint32_t i = 0; i < ng && ord < 0; ++i)  // else the compute group, its second queue when it has one
+    if (gp[i].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COMPUTE)
+      ord = (int)i, idx = gp[i].numQueues > 1 ? 1 : 0, *kind = idx ? "second compute queue" : "compute queue";
+  if (ord < 0) ord = 0;
+  ze_command_queue_desc_t qd{ZE_STYPE_COMMAND_QUEUE_DESC, nullptr, (uint32_t)ord, (uint32_t)idx, 2 /* in order */,
+                             2 /* asynchronous */, 0};
+  ze_command_list_handle_t l = nullptr;
+  ZE_CHECK(zeCommandListCreateImmediate(C(), D().dev, &qd, &l));
+  *ord_out = ord;
+  *idx_out = idx;
+  return l;
+}
+// Events the copy list signals after a batch of copies: 0 and 1 (used alternately) the main list waits on before
+// kernels read the copied memory (the wait, device scope, has the compute side invalidate its caches, which a host
+// synchronization alone does not promise); 2 and 3 the copy thread waits on before it reuses a part of its staging.
+inline ze_event_handle_t copy_event(int i) {
+  if (!D().copy_ev[0]) {
+    ze_event_pool_desc_t pd{ZE_STYPE_EVENT_POOL_DESC, nullptr, 0x1 /* host visible */, 4};
+    ze_event_pool_handle_t pool = nullptr;
+    ZE_CHECK(zeEventPoolCreate(C(), &pd, 1, &D().dev, &pool));
+    for (uint32_t k = 0; k < 4; ++k) {
+      ze_event_desc_t ed{ZE_STYPE_EVENT_DESC, nullptr, k, 0x4 /* signal: host scope */, 0x2 /* wait: device scope */};
+      ZE_CHECK(zeEventCreate(pool, &ed, &D().copy_ev[k]));
+    }
+  }
+  return D().copy_ev[i & 3];
+}
+// this thread's GPU shares the system RAM (an iGPU: ZE_DEVICE_PROPERTY_FLAG_INTEGRATED)
+inline bool integrated() {
+  Dev& d = D();
+  if (d.integ < 0) {
+    ze_device_properties_t dp{};
+    dp.stype = ZE_STYPE_DEVICE_PROPERTIES;
+    d.integ = zeDeviceGetProperties(d.dev, &dp) == 0 && (dp.flags & 1u) ? 1 : 0;
+  }
+  return d.integ == 1;
+}
+// this thread's GPU is a Data Center GPU Max (Ponte Vecchio, Xe-HPC: device IDs 0x0BD0-0x0BDB, the Max 1550 0x0BD5;
+// or its name), 2026-11-21: the defaults hibagus's sweeps measured there (zero/xe2/engine_xe2.h xehpc_on)
+inline bool xehpc() {
+  Dev& d = D();
+  if (d.xehpc_dev < 0) {
+    ze_device_properties_t dp{};
+    dp.stype = ZE_STYPE_DEVICE_PROPERTIES;
+    d.xehpc_dev = zeDeviceGetProperties(d.dev, &dp) == 0 &&
+                          ((dp.deviceId >= 0x0BD0 && dp.deviceId <= 0x0BDB) || strstr(dp.name, "Data Center GPU Max") != nullptr)
+                      ? 1 : 0;
+  }
+  return d.xehpc_dev == 1;
+}
+// this thread's GPU's PCI device ID (Level Zero's deviceId: a Pro B60 0xE211, a Pro B65 0xE222, a Pro B70 0xE223); 0 if
+// not known
+inline uint32_t pci_device_id() {
+  Dev& d = D();
+  if (d.pci_id < 0) {
+    ze_device_properties_t dp{};
+    dp.stype = ZE_STYPE_DEVICE_PROPERTIES;
+    d.pci_id = zeDeviceGetProperties(d.dev, &dp) != 0 ? 0 : (int64_t)dp.deviceId;
+  }
+  return (uint32_t)d.pci_id;
+}
+// this thread's GPU is Battlemage's BMG-G21 die (0xE200-0xE21F: the B580 0xE20B, B570 0xE20C, Pro B60 0xE211, Pro B50
+// 0xE212, ...), not BMG-G31 (0xE220-0xE22F: the Pro B65 0xE222, B70 0xE223), whatever its core count
+inline bool bmg_g21() {
+  const uint32_t id = pci_device_id();
+  return id >= 0xE200 && id <= 0xE21F;
+}
+// this thread's GPU is Panther Lake's integrated Xe3 (the Arc B390 / B370: 0xB080-0xB0BF), not Lunar Lake's Xe2
+// (the 140V, 0x64xx)
+inline bool panther_lake() {
+  const uint32_t id = pci_device_id();
+  return id >= 0xB080 && id <= 0xB0BF;
+}
+// this thread's GPU's hardware threads (EUs x threads per EU: a Pro B70 2,048, a B60 1,280); 0 if not known
+inline uint32_t hw_threads() {
+  Dev& d = D();
+  if (d.hw_thr < 0) {
+    ze_device_properties_t dp{};
+    dp.stype = ZE_STYPE_DEVICE_PROPERTIES;
+    d.hw_thr = zeDeviceGetProperties(d.dev, &dp) != 0
+                   ? 0 : (int64_t)dp.numSlices * dp.numSubslicesPerSlice * dp.numEUsPerSubslice * dp.numThreadsPerEU;
+  }
+  return (uint32_t)d.hw_thr;
+}
+// kernel timestamps for profiling (engine.profile: clEnqueueNDRangeKernel asked for an event): events come from pools
+// of 4096 host-visible timestamp events and go back to a free list on clReleaseEvent
+inline ze_event_handle_t ev_get() {
+  if (D().ev_free.empty()) {
+    if (D().ev_ns_per_tick == 0) {
+      ze_device_properties_t dp{};
+      dp.stype = ZE_STYPE_DEVICE_PROPERTIES;  // (this stype: timerResolution in ns per tick)
+      ZE_CHECK(zeDeviceGetProperties(D().dev, &dp));
+      D().ev_ns_per_tick = dp.timerResolution ? (double)dp.timerResolution : 1.0;
+      if (dp.kernelTimestampValidBits && dp.kernelTimestampValidBits < 64) D().ev_mask = (1ull << dp.kernelTimestampValidBits) - 1;
+    }
+    const uint32_t n = 4096;
+    ze_event_pool_desc_t pd{ZE_STYPE_EVENT_POOL_DESC, nullptr, 0x1 | 0x4 /* host visible, kernel timestamps */, n};
+    ze_event_pool_handle_t pool;
+    ZE_CHECK(zeEventPoolCreate(C(), &pd, 1, &D().dev, &pool));
+    for (uint32_t i = 0; i < n; ++i) {
+      ze_event_desc_t ed{ZE_STYPE_EVENT_DESC, nullptr, i, 0x4 /* host scope */, 0};
+      ze_event_handle_t e;
+      ZE_CHECK(zeEventCreate(pool, &ed, &e));
+      D().ev_free.push_back(e);
+    }
+  }
+  ze_event_handle_t e = D().ev_free.back();
+  D().ev_free.pop_back();
+  return e;
+}
+inline void* host_alloc(size_t n) {
+  ze_host_mem_alloc_desc_t hd{ZE_STYPE_HOST_MEM_ALLOC_DESC, nullptr, 0};
+  void* p = nullptr;
+  if (oom_throws) {
+    if (zeMemAllocHost(C(), &hd, n, 4096, &p) != ZE_RESULT_SUCCESS)
+      throw std::runtime_error("host allocation of " + std::to_string(n >> 20) + " MB failed");
+    return p;
+  }
+  ZE_CHECK(zeMemAllocHost(C(), &hd, n, 4096, &p));
+  return p;
+}
+inline char* staging(size_t n) {
+  if (n > D().stage_n) {
+    // (the new one first, through host_alloc: a split model's shard short of memory throws (oom_throws) and leaves
+    //  the old buffer in place)
+    const size_t sz = std::max(n, (size_t)1 << 22);
+    char* p = (char*)host_alloc(sz);
+    if (D().stage) { sync(); mem_free(C(), D().stage); }
+    D().stage = p;
+    D().stage_n = sz;
+  }
+  return D().stage;
+}
+inline void* device_alloc(size_t n) {
+  ze_device_mem_alloc_desc_t dd{ZE_STYPE_DEVICE_MEM_ALLOC_DESC, nullptr, 0, 0};
+  void* p = nullptr;
+  ze_result_t r = ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY;
+  if (oom_test && n >= (256u << 20)) oom_test = false;
+  else r = zeMemAllocDevice(C(), &dd, std::max<size_t>(n, 64), 4096, D().dev, &p);
+  for (int i = 0; r != ZE_RESULT_SUCCESS && i < 8 && oom_hook && oom_hook(); ++i)
+    r = zeMemAllocDevice(C(), &dd, std::max<size_t>(n, 64), 4096, D().dev, &p);
+  if (r != ZE_RESULT_SUCCESS) {
+    char msg[160];
+    snprintf(msg, sizeof msg, "device allocation of %.1f MB failed on GPU %d (0x%x; %.2f GiB allocated)", n / 1e6,
+             D().index, r, D().device_bytes / 1073741824.0);
+    if (oom_throws) throw std::runtime_error(msg);
+    // (the end of the process: an error line, and the GPU and RAM numbers that say why, docs/logging.md)
+    LOG_ERR("inferzero: %s%s%s\n", msg, ze_result_text(r),
+            r == 0x70000002u || r == 0x70000003u ? ": close other programs that use the GPU, or take a smaller context or model" : "");
+    if (ze_fail_hook) ze_fail_hook();
+    fflush(stderr);
+    _Exit(1);
+  }
+  D().device_bytes += n;
+  return p;
+}
+// What Windows lets this process keep resident on the GPU now (WDDM budget, DXGI) and what it uses: the GPU share is
+// an upper bound, the budget shrinks when the system is short of memory. Returns false without the numbers.
+// non_local: the shared (system-memory) segment instead, what Windows lets the GPU map of host memory: pinned host
+// memory a discrete card copies from counts against it (the RAM tier of MoE experts, engine_stream.h; issue #82)
+inline bool video_budget(uint64_t& budget, uint64_t& usage, bool non_local = false) {
+#ifndef _WIN32
+  (void)budget, (void)usage, (void)non_local;
+  return false;  // (no WDDM budget on Linux: Level Zero Sysman later, docs/linux-port.md)
+#else
+  IDXGIFactory4* f = nullptr;
+  if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory4), (void**)&f))) return false;
+  bool ok = false;
+  // (the Intel adapter of this thread's GPU: on a discrete card the one with the most memory of its own, on an iGPU
+  //  the one with the least. The first Intel adapter, as before 2026-11-23, was the iGPU on a desktop with one and a
+  //  B70: "Windows budget 47.13 GiB" on a 32 GB card, issue #82)
+  const bool want_dedicated = !integrated();
+  uint64_t best = 0;
+  bool have = false;
+  // (audit 2026-11-12 #5: any failure ends the walk; before, an error other than NOT_FOUND ran the body with the
+  //  adapter the last pass had released)
+  for (UINT i = 0;; ++i) {
+    IDXGIAdapter1* a1 = nullptr;
+    if (f->EnumAdapters1(i, &a1) != S_OK || !a1) break;
+    DXGI_ADAPTER_DESC1 d{};
+    IDXGIAdapter3* a3 = nullptr;
+    if (SUCCEEDED(a1->GetDesc1(&d)) && d.VendorId == 0x8086 && !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
+        SUCCEEDED(a1->QueryInterface(__uuidof(IDXGIAdapter3), (void**)&a3))) {
+      const uint64_t ded = (uint64_t)d.DedicatedVideoMemory;
+      const bool better = !have || (want_dedicated ? ded > best : ded < best);
+      DXGI_QUERY_VIDEO_MEMORY_INFO m{};
+      if (better && SUCCEEDED(a3->QueryVideoMemoryInfo(0, non_local ? DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL : DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &m))) {
+        budget = m.Budget;
+        usage = m.CurrentUsage;
+        best = ded, have = true, ok = true;
+      }
+      a3->Release();
+    }
+    a1->Release();
+  }
+  f->Release();
+  return ok;
+#endif
+}
+inline int note_layer = -1, note_T = -1;  // (diagnostics: the layer and rows the engine is working on)
+inline void print_memory(int lvl = zlog::INF) {
+  if (note_layer >= 0) zlog::log(lvl, "  (layer %d, %d rows)\n", note_layer, note_T);
+  uint64_t b = 0, u = 0;
+  const uint64_t avail = plat::ram_available();
+  if (video_budget(b, u))
+    zlog::log(lvl, "  GPU memory: Windows budget %.2f GiB, in use %.2f GiB (allocated by the engine %.2f GiB); RAM free %.2f GiB\n",
+            b / 1073741824.0, u / 1073741824.0, D().device_bytes / 1073741824.0, avail / 1073741824.0);
+  uint64_t nb = 0, nu = 0;  // (the shared segment: RAM the GPU maps, pinned host memory included; issue #82)
+  if (!integrated() && video_budget(nb, nu, true))  // (an iGPU's memory is all local: 0 there)
+    zlog::log(lvl, "  RAM the GPU maps: Windows budget %.2f GiB, in use %.2f GiB\n", nb / 1073741824.0, nu / 1073741824.0);
+#ifndef _WIN32
+  else
+    zlog::log(lvl, "  GPU memory: allocated by the engine %.2f GiB; RAM free %.2f GiB\n", D().device_bytes / 1073741824.0,
+              avail / 1073741824.0);
+#endif
+}
+// memory the engine allocated itself (host USM, device pools) as a buffer kernels can take as an argument
+inline ZMem* wrap(void* p, size_t n) {
+  ZMem* m = new ZMem{(char*)p, n, false, &D()};
+  D().mems.insert(m);
+  return m;
+}
+struct Mapping { ZMem* m; size_t off, n; void* host; cl_map_flags flags; };  // (flags: a read-only map is not written back)
+inline std::vector<Mapping>& maps() {
+  if (!D().maps) D().maps = new std::vector<Mapping>;
+  return *D().maps;
+}
+
+// OpenCL.dll, only to compile kernels (its native binaries load into Level Zero)
+namespace rcl {
+typedef cl_int(__stdcall* GetPlatformIDs)(cl_uint, void**, cl_uint*);
+typedef cl_int(__stdcall* GetDeviceIDs)(void*, cl_ulong, cl_uint, void**, cl_uint*);
+typedef cl_int(__stdcall* GetDeviceInfo)(void*, cl_uint, size_t, void*, size_t*);
+typedef void*(__stdcall* CreateContext)(const intptr_t*, cl_uint, void* const*, void*, void*, cl_int*);
+typedef void*(__stdcall* CreateProgramWithSource)(void*, cl_uint, const char**, const size_t*, cl_int*);
+typedef cl_int(__stdcall* BuildProgram)(void*, cl_uint, void* const*, const char*, void*, void*);
+typedef cl_int(__stdcall* GetProgramBuildInfo)(void*, void*, cl_uint, size_t, void*, size_t*);
+typedef cl_int(__stdcall* GetProgramInfo)(void*, cl_uint, size_t, void*, size_t*);
+typedef cl_int(__stdcall* ReleaseProgram)(void*);
+typedef cl_int(__stdcall* GetPlatformInfo)(void*, cl_uint, size_t, void*, size_t*);
+inline GetPlatformInfo getPlatformInfo;
+inline GetPlatformIDs getPlatformIDs;
+inline GetDeviceIDs getDeviceIDs;
+inline GetDeviceInfo getDeviceInfo;
+inline CreateContext createContext;
+inline CreateProgramWithSource createProgramWithSource;
+inline BuildProgram buildProgram;
+inline GetProgramBuildInfo getProgramBuildInfo;
+inline GetProgramInfo getProgramInfo;
+inline ReleaseProgram releaseProgram;
+inline void *device = nullptr, *context = nullptr;
+// The compiler's device: the GPU the kernels run on. Its native binaries load only into a Level Zero device of the
+// same kind, and the engine reads its features (8-lane sub-groups, DPAS, 2D loads) from it. Before 2026-11-14 it was
+// the first GPU of the first platform with one, so a Linux machine with Mesa's rusticl listed first, a Windows one with
+// Microsoft's OpenCLOn12 listed first (a B70 on issue #12 has it), or an Intel iGPU listed before an Arc card could
+// compile for the wrong one (issue #11, a clinfo of 2 B60s with rusticl next to Intel's platform). Now: Intel's
+// platforms before others (those of Mesa, Microsoft and PoCL last), and on them the GPU with Level Zero GPU 0's PCI
+// device id (want_id, cl_intel_device_attribute_query) or else its name (want_name); with no match, the first GPU as
+// before. On a machine with one Intel GPU and only Intel's platform, the same device as before.
+inline std::string platform_name(void* p) {
+  char s[256] = {};
+  if (!getPlatformInfo || getPlatformInfo(p, 0x0902 /* CL_PLATFORM_NAME */, sizeof(s) - 1, s, nullptr) != 0) return "";
+  return s;
+}
+inline bool foreign_platform(const std::string& name) {  // (OpenCL on other stacks: not Intel's compiler)
+  std::string n = name;
+  for (char& c : n) c = (char)tolower((unsigned char)c);
+  for (const char* f : {"rusticl", "openclon12", "clover", "portable computing language", "pocl"})
+    if (n.find(f) != std::string::npos) return true;
+  return false;
+}
+inline bool load(const char* want_name = nullptr, uint32_t want_id = 0) {
+  if (context) return true;  // (a second engine in the process: the same compiler context, no second DLL reference)
+  void* h = plat::dl_open("OpenCL.dll", "libOpenCL.so.1");
+  if (!h) return false;
+#define RCL(var, name) var = (decltype(var))plat::dl_sym(h, name); if (!var) { plat::dl_close(h); return false; }
+  RCL(getPlatformIDs, "clGetPlatformIDs") RCL(getDeviceIDs, "clGetDeviceIDs") RCL(getDeviceInfo, "clGetDeviceInfo")
+  RCL(createContext, "clCreateContext") RCL(createProgramWithSource, "clCreateProgramWithSource")
+  RCL(buildProgram, "clBuildProgram") RCL(getProgramBuildInfo, "clGetProgramBuildInfo")
+  RCL(getProgramInfo, "clGetProgramInfo") RCL(releaseProgram, "clReleaseProgram")
+#undef RCL
+  getPlatformInfo = (GetPlatformInfo)plat::dl_sym(h, "clGetPlatformInfo");  // (only to rank the platforms)
+  auto fail = [&] {  // (no compiler context: the DLL let go, a later call starts over)
+    device = context = nullptr;
+    plat::dl_close(h);
+    return false;
+  };
+  cl_uint np = 0;
+  if (getPlatformIDs(0, nullptr, &np) != 0 || !np) return fail();
+  std::vector<void*> plats(np);
+  getPlatformIDs(np, plats.data(), nullptr);
+  // (the platforms in their order, others' stacks after Intel's and the rest)
+  std::vector<void*> order;
+  for (int pass = 0; pass < 2; ++pass)
+    for (void* p : plats)
+      if (foreign_platform(platform_name(p)) == (pass == 1)) order.push_back(p);
+  // (the first GPU in that order, an Intel one (vendor 0x8086) before others: the choice when none matches Level Zero's;
+  //  a hybrid laptop's NVIDIA or AMD GPU only when there is no Intel one at all, as before; review of 2026-11-14)
+  void* first = nullptr;
+  void* first_any = nullptr;
+  void* match = nullptr;
+  for (void* p : order) {
+    cl_uint nd = 0;
+    if (getDeviceIDs(p, 1u << 2, 0, nullptr, &nd) != 0 || !nd) continue;
+    std::vector<void*> ds(nd);
+    if (getDeviceIDs(p, 1u << 2, nd, ds.data(), nullptr) != 0) continue;
+    if (!first_any) first_any = ds[0];
+    if (!first)
+      for (void* d : ds) {
+        cl_uint vendor = 0;
+        if (getDeviceInfo(d, 0x1001 /* CL_DEVICE_VENDOR_ID */, sizeof vendor, &vendor, nullptr) == 0 && vendor == 0x8086) {
+          first = d;
+          break;
+        }
+      }
+    if (!want_id && !(want_name && *want_name)) {
+      if (first) break;  // (no hints: the first Intel GPU, else keep looking for one)
+      continue;
+    }
+    for (void* d : ds) {
+      cl_uint id = 0;
+      char name[256] = {};
+      const bool id_ok = want_id && getDeviceInfo(d, 0x4251 /* CL_DEVICE_ID_INTEL */, sizeof id, &id, nullptr) == 0 && id == want_id;
+      const bool name_ok = want_name && *want_name && getDeviceInfo(d, 0x102B /* CL_DEVICE_NAME */, sizeof(name) - 1, name, nullptr) == 0 &&
+                           std::string(name) == want_name;
+      if (id_ok || (name_ok && !match)) match = d;
+      if (id_ok) break;
+    }
+    if (match) break;
+  }
+  device = match ? match : first ? first : first_any;
+  if (!device) return fail();
+  cl_int err = 0;
+  context = createContext(nullptr, 1, &device, nullptr, nullptr, &err);
+  if (err != 0 || !context) return fail();
+  {  // (which OpenCL platform compiles the kernels, and which were there: a Mesa rusticl or PoCL mix-up shows at
+     //  once in the log; 2026-11-23, a B580 under CachyOS with rusticl next to Intel's lost its GPU)
+    void* pl = nullptr;
+    char dname[256] = {}, dver[128] = {};
+    getDeviceInfo(device, 0x1031 /* CL_DEVICE_PLATFORM */, sizeof pl, &pl, nullptr);
+    getDeviceInfo(device, 0x102B /* CL_DEVICE_NAME */, sizeof(dname) - 1, dname, nullptr);
+    getDeviceInfo(device, 0x102D /* CL_DRIVER_VERSION */, sizeof(dver) - 1, dver, nullptr);
+    const std::string pn = pl ? platform_name(pl) : std::string();
+    std::string all;
+    for (void* p : plats) all += (all.empty() ? "" : ", ") + platform_name(p);
+    if (foreign_platform(pn))
+      LOG_WRN("inferzero: the kernels compile on OpenCL platform \"%s\" (%s, driver %s), not Intel's: install Intel's "
+              "compute runtime (platforms: %s)\n", pn.c_str(), dname, dver, all.c_str());
+    else
+      zlog::eprintf("inferzero: kernels compiled by OpenCL platform \"%s\" (%s, driver %s); platforms: %s\n", pn.c_str(),
+                    dname, dver, all.c_str());
+  }
+  return true;
+}
+// The compiler's device and context for another Level Zero GPU (P0, 2026-11-22: a layer split over unlike cards, each
+// stage's kernels compiled for its own GPU): the OpenCL GPU whose CL_DEVICE_ID_INTEL is want_id (else whose name is
+// want_name), with a context of its own, made once and kept for the process. GPU 0's: `device` / `context` above.
+// False when no such OpenCL device is found (the caller keeps GPU 0's)
+struct DevCtx {
+  uint32_t id;
+  void* dev;
+  void* ctx;
+};
+inline bool device_for(const char* want_name, uint32_t want_id, void*& d, void*& c) {
+  static std::mutex mu;
+  static std::vector<DevCtx> known;
+  std::lock_guard<std::mutex> g(mu);
+  for (const DevCtx& k : known)
+    if (k.id == want_id) { d = k.dev, c = k.ctx; return true; }
+  if (!context) return false;
+  cl_uint np = 0;
+  if (getPlatformIDs(0, nullptr, &np) != 0 || !np) return false;
+  std::vector<void*> plats(np);
+  getPlatformIDs(np, plats.data(), nullptr);
+  void* match = nullptr;
+  for (void* p : plats) {
+    if (foreign_platform(platform_name(p))) continue;
+    cl_uint nd = 0;
+    if (getDeviceIDs(p, 1u << 2, 0, nullptr, &nd) != 0 || !nd) continue;
+    std::vector<void*> ds(nd);
+    if (getDeviceIDs(p, 1u << 2, nd, ds.data(), nullptr) != 0) continue;
+    for (void* x : ds) {
+      cl_uint id = 0;
+      char name[256] = {};
+      const bool id_ok = want_id && getDeviceInfo(x, 0x4251 /* CL_DEVICE_ID_INTEL */, sizeof id, &id, nullptr) == 0 && id == want_id;
+      const bool name_ok = want_name && *want_name &&
+                           getDeviceInfo(x, 0x102B /* CL_DEVICE_NAME */, sizeof(name) - 1, name, nullptr) == 0 &&
+                           std::string(name) == want_name;
+      if (id_ok || (name_ok && !match)) match = x;
+      if (id_ok) break;
+    }
+    if (match) break;
+  }
+  if (!match) return false;
+  if (match == device) {
+    d = device, c = context;
+  } else {
+    cl_int err = 0;
+    void* ctx = createContext(nullptr, 1, &match, nullptr, nullptr, &err);
+    if (err != 0 || !ctx) return false;
+    d = match, c = ctx;
+  }
+  known.push_back({want_id, d, c});
+  return true;
+}
+}  // namespace rcl
+}  // namespace zrt
+
+// ---- the OpenCL calls of the engine
+inline cl_int clFinish(cl_command_queue) { zrt::sync(); return CL_SUCCESS; }
+inline cl_int clFlush(cl_command_queue) { return CL_SUCCESS; }
+namespace zrt {
+// (counts the enqueued commands that can write a GPU buffer: a kernel, a write, a copy, a fill, an unmap; the host CPU
+//  path reuses its copy of the activations while it has not moved, zero/xe2/engine_hostcpu.h)
+inline std::atomic<uint64_t> gpu_writes{0};
+}  // namespace zrt
+inline cl_int clEnqueueCopyBuffer(cl_command_queue, cl_mem src, cl_mem dst, size_t so, size_t doff, size_t n, cl_uint,
+                                  const cl_event*, cl_event* ev) {
+  zrt::gpu_writes.fetch_add(1, std::memory_order_relaxed);  // (a GPU buffer may change: the host CPU path's input copy is stale, engine_hostcpu.h)
+  if (ev) *ev = nullptr;
+  if (!n) return CL_SUCCESS;
+  if (so + n > src->size || doff + n > dst->size) {  // (refused as OpenCL does, not copied over what follows)
+    zlog::eprintf("inferzero: copy of %zu bytes past a buffer's end (source %zu + %zu of %zu, destination %zu + %zu of %zu; refused)\n",
+            n, so, n, src->size, doff, n, dst->size);
+    return -30;
+  }
+  ZE_CHECK(zeCommandListAppendMemoryCopy(zrt::imm(), dst->ptr + doff, src->ptr + so, n, nullptr, 0, nullptr));
+  return CL_SUCCESS;
+}
+inline bool out_of_bounds(const char* what, cl_mem b, size_t off, size_t n) {
+  if (b && off + n <= b->size) return false;
+  zlog::eprintf("inferzero: %s of %zu bytes at offset %zu past the end of a %zu-byte buffer (refused)\n", what, n,
+          off, b ? b->size : (size_t)0);
+  return true;
+}
+inline cl_int clEnqueueReadBuffer(cl_command_queue, cl_mem b, cl_bool, size_t off, size_t n, void* host, cl_uint,
+                                  const cl_event*, cl_event* ev) {
+  if (ev) *ev = nullptr;
+  if (out_of_bounds("read", b, off, n)) return -30;
+  char* s = zrt::staging(n);
+  ZE_CHECK(zeCommandListAppendMemoryCopy(zrt::imm(), s, b->ptr + off, n, nullptr, 0, nullptr));
+  zrt::sync();
+  memcpy(host, s, n);
+  return CL_SUCCESS;
+}
+inline cl_int clEnqueueWriteBuffer(cl_command_queue, cl_mem b, cl_bool, size_t off, size_t n, const void* host, cl_uint,
+                                   const cl_event*, cl_event* ev) {
+  zrt::gpu_writes.fetch_add(1, std::memory_order_relaxed);  // (a GPU buffer may change: the host CPU path's input copy is stale, engine_hostcpu.h)
+  if (ev) *ev = nullptr;
+  if (out_of_bounds("write", b, off, n)) return -30;
+  char* s = zrt::staging(n);
+  zrt::sync();  // (the bounce buffer may still be read by an earlier copy)
+  memcpy(s, host, n);
+  ZE_CHECK(zeCommandListAppendMemoryCopy(zrt::imm(), b->ptr + off, s, n, nullptr, 0, nullptr));
+  zrt::sync();
+  return CL_SUCCESS;
+}
+inline cl_int clEnqueueFillBuffer(cl_command_queue, cl_mem b, const void* pattern, size_t ps, size_t off, size_t n,
+                                  cl_uint, const cl_event*, cl_event* ev) {
+  zrt::gpu_writes.fetch_add(1, std::memory_order_relaxed);  // (a GPU buffer may change: the host CPU path's input copy is stale, engine_hostcpu.h)
+  if (ev) *ev = nullptr;
+  if (out_of_bounds("fill", b, off, n)) return -30;
+  ZE_CHECK(zeCommandListAppendMemoryFill(zrt::imm(), b->ptr + off, pattern, ps, n, nullptr, 0, nullptr));
+  zrt::sync();  // (the pattern is the caller's)
+  return CL_SUCCESS;
+}
+inline void* clEnqueueMapBuffer(cl_command_queue, cl_mem b, cl_bool, cl_map_flags flags, size_t off, size_t n, cl_uint,
+                                const cl_event*, cl_event* ev, cl_int* err) {
+  if (ev) *ev = nullptr;
+  // (bounds and a null buffer refused as the read / write / fill calls refuse them: audit 2026-11-14 L1)
+  if (out_of_bounds("map", b, off, n)) {
+    if (err) *err = -30;
+    return nullptr;
+  }
+  void* h = zrt::host_alloc(n);
+  if (flags & CL_MAP_READ) {
+    ZE_CHECK(zeCommandListAppendMemoryCopy(zrt::imm(), h, b->ptr + off, n, nullptr, 0, nullptr));
+    zrt::sync();
+  }
+  zrt::maps().push_back({b, off, n, h, flags});
+  if (err) *err = CL_SUCCESS;
+  return h;
+}
+inline cl_int clEnqueueUnmapMemObject(cl_command_queue, cl_mem b, void* p, cl_uint, const cl_event*, cl_event* ev) {
+  zrt::gpu_writes.fetch_add(1, std::memory_order_relaxed);  // (a GPU buffer may change: the host CPU path's input copy is stale, engine_hostcpu.h)
+  if (ev) *ev = nullptr;
+  for (size_t i = 0; i < zrt::maps().size(); ++i)
+    if (zrt::maps()[i].host == p && zrt::maps()[i].m == b) {
+      // (written back only for a map that may have been written, as OpenCL does: audit 2026-11-14 L2; the one caller,
+      //  engine_load.h, maps for writing)
+      if (zrt::maps()[i].flags & (CL_MAP_WRITE | (1 << 2) /* CL_MAP_WRITE_INVALIDATE_REGION */)) {
+        ZE_CHECK(zeCommandListAppendMemoryCopy(zrt::imm(), b->ptr + zrt::maps()[i].off, p, zrt::maps()[i].n, nullptr, 0, nullptr));
+        zrt::sync();
+      }
+      zrt::mem_free(zrt::C(), p);
+      zrt::maps().erase(zrt::maps().begin() + i);
+      return CL_SUCCESS;
+    }
+  return -30;  // (not a live map of b: nothing of ours to free)
+}
+inline cl_mem clCreateBuffer(cl_context, cl_mem_flags flags, size_t n, void* host, cl_int* err) {
+  ZMem* m = new ZMem{(char*)zrt::device_alloc(n), n, true, &zrt::D()};
+  zrt::D().mems.insert(m);
+  if ((flags & CL_MEM_COPY_HOST_PTR) && host) clEnqueueWriteBuffer(nullptr, m, CL_TRUE, 0, n, host, 0, nullptr, nullptr);
+  if (err) *err = CL_SUCCESS;
+  return m;
+}
+inline cl_mem clCreateSubBuffer(cl_mem parent, cl_mem_flags, cl_buffer_create_type, const void* region, cl_int* err) {
+  const cl_buffer_region* r = (const cl_buffer_region*)region;
+  if (r->origin + r->size > parent->size) {
+    if (err) *err = -13;
+    return nullptr;
+  }
+  ZMem* m = new ZMem{parent->ptr + r->origin, r->size, false, &zrt::D()};
+  zrt::D().mems.insert(m);
+  if (err) *err = CL_SUCCESS;
+  return m;
+}
+inline cl_int clReleaseMemObject(cl_mem m) {
+  if (!m) return CL_SUCCESS;
+  zrt::Dev& d = m->d ? *m->d : zrt::D();
+  if (m->owner) {
+    // (its result ignored as before: a split model frees its shards after a fault, engine_tp.h. With ARC_GPU_WAIT_S
+    //  set, a free that waits past it is a hang too: audit 2026-11-23)
+    const uint64_t lim = zrt::wait_limit_ns();
+    if (zeCommandListHostSynchronize(zrt::imm(d), lim) == ZE_RESULT_NOT_READY && lim != UINT64_MAX)
+      gpufail::gpu_fatal(gpufail::Hang, "GPU " + std::to_string(d.index) + ": the work before a buffer's free did not finish within " +
+                                            std::to_string(lim / 1000000000ull) + " s (ARC_GPU_WAIT_S)");
+    zrt::mem_free(zrt::ctx_of(d), m->ptr);
+    d.device_bytes -= m->size;
+  }
+  d.mems.erase(m);
+  delete m;
+  return CL_SUCCESS;
+}
+// ARC_LAUNCH_STATS=1 (diagnostics, runz prints them per generated token): kernel launches, and the host time spent
+// setting their arguments and appending them (the CPU's share of a step, against the GPU's)
+namespace zrt {
+inline const bool launch_stats = (getenv("ARC_LAUNCH_STATS") && atoi(getenv("ARC_LAUNCH_STATS")) != 0);
+inline bool launch_stats_on() { return launch_stats; }
+inline std::atomic<uint64_t> launch_n{0}, launch_ns{0}, setarg_ns{0};
+struct LaunchTimer {
+  std::atomic<uint64_t>& acc;
+  std::chrono::steady_clock::time_point t0 = launch_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+  ~LaunchTimer() {
+    if (launch_stats) acc += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+  }
+};
+
+// ARC_ZE_WATCH=ms (diagnostics: which kernel runs long or loses the device; slow, every launch waited for alone).
+// Each launch signals an event of its own and is waited for on that event, not on the shared command list, so the
+// time and an error belong to it and not to another engine's work. A launch over `ms` is printed with its global /
+// local sizes and arguments ("slow kernel"); one still running after 1.5 s is printed while it runs (a TDR is coming:
+// Windows resets the GPU at 2 s); an error prints the last 64 launches (name, sizes, arguments, time) and ends the
+// process as before. The arguments are the values given to Level Zero (a buffer as its device address).
+inline const long watch_ms = getenv("ARC_ZE_WATCH") ? atol(getenv("ARC_ZE_WATCH")) : 0;
+struct WatchEntry {
+  uint64_t seq = 0;
+  std::string name;
+  uint32_t gs[3]{}, ls[3]{};
+  std::vector<ZKernel::Arg> args;
+  double ms = -1;  // (-1: not finished)
+};
+inline std::mutex watch_mu;
+inline WatchEntry watch_ring[64];
+inline uint64_t watch_seq = 0;
+inline std::string watch_args(const std::vector<ZKernel::Arg>& args) {
+  std::string s;
+  char b[48];
+  for (size_t i = 0; i < args.size(); ++i) {
+    const ZKernel::Arg& a = args[i];
+    if (!a.set) snprintf(b, sizeof b, "%s?", i ? " " : "");
+    else if (a.sz == 4) {
+      int32_t v;
+      memcpy(&v, a.v, 4);
+      snprintf(b, sizeof b, "%s%d", i ? " " : "", v);
+    } else if (a.sz == 8) {
+      uint64_t v;
+      memcpy(&v, a.v, 8);
+      snprintf(b, sizeof b, "%s0x%llx", i ? " " : "", (unsigned long long)v);
+    } else {
+      snprintf(b, sizeof b, "%s(%u bytes)", i ? " " : "", (unsigned)a.sz);
+    }
+    s += b;
+  }
+  return s;
+}
+inline void watch_print(const WatchEntry& e, const char* what, int lvl = zlog::INF) {
+  zlog::log(lvl, "%s #%llu %s: %s ms, global %u x %u x %u, local %u x %u x %u, args %s\n", what, (unsigned long long)e.seq,
+          e.name.c_str(), e.ms < 0 ? "not finished" : std::to_string((long long)std::llround(e.ms)).c_str(), e.gs[0], e.gs[1],
+          e.gs[2], e.ls[0], e.ls[1], e.ls[2], watch_args(e.args).c_str());
+}
+// (called by clEnqueueNDRangeKernel once the launch is appended; keep: the caller asked for the event, else it goes
+//  back to the pool)
+inline void watch_wait(ZKernel* k, ze_event_handle_t ev, bool keep, const uint32_t gs[3], const uint32_t ls[3]) {
+  // (this launch's own copy for its prints: the ring's slot is shared, another thread's launches can reuse it while
+  //  this one waits; the time goes back into the slot only while it still holds this launch)
+  WatchEntry e;
+  e.name = k->name;
+  for (int d = 0; d < 3; ++d) e.gs[d] = gs[d], e.ls[d] = ls[d];
+  e.args = k->args;
+  {
+    std::lock_guard<std::mutex> g(watch_mu);
+    e.seq = ++watch_seq;
+    watch_ring[e.seq % 64] = e;
+  }
+  const auto t0 = std::chrono::steady_clock::now();
+  bool warned = false;
+  for (;;) {
+    const ze_result_t r = zeEventHostSynchronize(ev, 50000000ull);  // (50 ms a piece)
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (r == ZE_RESULT_SUCCESS) {
+      e.ms = ms;
+      {
+        std::lock_guard<std::mutex> g(watch_mu);
+        if (watch_ring[e.seq % 64].seq == e.seq) watch_ring[e.seq % 64].ms = ms;
+      }
+      if (ms > (double)watch_ms) watch_print(e, "slow kernel");
+      break;
+    }
+    if (r != ZE_RESULT_NOT_READY) {
+      LOG_ERR("Level Zero error 0x%x%s waiting for kernel #%llu %s after %.0f ms; the last launches, oldest first:\n", r,
+              ze_result_text(r), (unsigned long long)e.seq, k->name.c_str(), ms);
+      std::lock_guard<std::mutex> g(watch_mu);
+      for (uint64_t s = watch_seq > 63 ? watch_seq - 63 : 1; s <= watch_seq; ++s) watch_print(watch_ring[s % 64], "  launch", zlog::ERR);
+      if (r != 0x70000001u && ze_fail_hook) ze_fail_hook();  // (a lost device: nothing more asked of the GPU)
+      gpufail::ze_exit(r, "waiting for kernel " + k->name);
+    }
+    if (ms * 1e6 > (double)wait_limit_ns()) {  // (ARC_GPU_WAIT_S: a hang)
+      std::lock_guard<std::mutex> g(watch_mu);
+      for (uint64_t s = watch_seq > 63 ? watch_seq - 63 : 1; s <= watch_seq; ++s) watch_print(watch_ring[s % 64], "  launch", zlog::ERR);
+      gpufail::gpu_fatal(gpufail::Hang, "kernel " + k->name + " did not finish within " +
+                                            std::to_string(wait_limit_ns() / 1000000000ull) + " s (ARC_GPU_WAIT_S)");
+    }
+    if (!warned && ms > 1500) {
+      warned = true;
+      watch_print(e, "kernel still running after 1.5 s (a GPU timeout is near)");
+      fflush(stderr);
+    }
+  }
+  if (!keep) {
+    zeEventHostReset(ev);
+    D().ev_free.push_back(ev);
+  }
+}
+}  // namespace zrt
+// a buffer argument (a registered cl_mem) becomes its USM pointer; anything else is passed as given
+inline cl_int clSetKernelArg(cl_kernel k, cl_uint i, size_t sz, const void* v) {
+  zrt::LaunchTimer lt{zrt::setarg_ns};
+  void* p = nullptr;
+  if (sz == sizeof(void*) && v) {
+    ZMem* m = *(ZMem* const*)v;
+    if (m && zrt::D().mems.count(m)) {
+      p = m->ptr;
+      v = &p;
+    }
+  }
+  // (ARC_ARG_CACHE=0: every argument set at every launch, as before. Not the cause of 2026-11-04's lost devices: the
+  //  server lost it with the cache off too, at a GPU timeout (TDR, LiveKernelEvent 141))
+  static const bool cache = !(getenv("ARC_ARG_CACHE") && atoi(getenv("ARC_ARG_CACHE")) == 0);
+  ZKernel::Arg* a = nullptr;
+  const uint32_t gen = zrt::mem_gen.load(std::memory_order_relaxed);  // (read before the set: a free meanwhile counts)
+  // (the values are kept with the cache on, and with ARC_ZE_WATCH for its launch ring, where they are only recorded)
+  if ((cache || zrt::watch_ms > 0) && v && sz <= sizeof(ZKernel::Arg::v) && i < 64) {  // (local memory, v null: set each time)
+    if (k->args.size() <= i) k->args.resize(i + 1);
+    a = &k->args[i];
+    if (cache && a->set && a->sz == sz && a->gen == gen && memcmp(a->v, v, sz) == 0) return CL_SUCCESS;
+  }
+  if (zeKernelSetArgumentValue(k->k, i, sz, v) != ZE_RESULT_SUCCESS) {
+    if (a) a->set = false;
+    return -51;
+  }
+  if (a) {
+    a->sz = (uint8_t)sz;
+    a->gen = gen;
+    memcpy(a->v, v, sz);
+    a->set = true;
+  }
+  return CL_SUCCESS;
+}
+namespace zrt {
+// the launch this thread is appending (src/crash_log.h prints it when the process crashes inside the driver's
+// append: its kernel, sizes and arguments, and which 8-byte arguments lie in no live buffer of this GPU)
+inline thread_local const ZKernel* last_k = nullptr;
+inline thread_local uint32_t last_gs[3]{}, last_ls[3]{};
+inline void print_last_launch() {
+  if (!last_k) return;
+  fprintf(stderr, "  the launch this thread was appending: %s, global %u x %u x %u, local %u x %u x %u\n   arguments: %s\n",
+          last_k->name.c_str(), last_gs[0], last_gs[1], last_gs[2], last_ls[0], last_ls[1], last_ls[2],
+          watch_args(last_k->args).c_str());
+  for (size_t i = 0; i < last_k->args.size(); ++i) {
+    const ZKernel::Arg& a = last_k->args[i];
+    if (!a.set || a.sz != 8) continue;
+    uint64_t v;
+    memcpy(&v, a.v, 8);
+    if (!v) continue;
+    bool in = false;
+    for (const ZMem* m : D().mems)
+      if (v >= (uint64_t)m->ptr && v < (uint64_t)m->ptr + m->size) { in = true; break; }
+    if (!in) fprintf(stderr, "   argument %zu (0x%llx) lies in no live buffer of this GPU\n", i, (unsigned long long)v);
+    if (a.gen != mem_gen.load(std::memory_order_relaxed))
+      fprintf(stderr, "   argument %zu was set before a later free (set again at the next launch)\n", i);
+  }
+  fflush(stderr);
+}
+}  // namespace zrt
+inline cl_int clEnqueueNDRangeKernel(cl_command_queue, cl_kernel k, cl_uint dim, const size_t*, const size_t* g,
+                                     const size_t* l, cl_uint, const cl_event*, cl_event* ev) {
+  zrt::gpu_writes.fetch_add(1, std::memory_order_relaxed);  // (a GPU buffer may change: the host CPU path's input copy is stale, engine_hostcpu.h)
+  zrt::LaunchTimer lt{zrt::launch_ns};
+  if (zrt::launch_stats) ++zrt::launch_n;
+  if (ev) *ev = nullptr;
+  uint32_t ls[3] = {1, 1, 1}, gs[3] = {1, 1, 1};
+  for (cl_uint d = 0; d < dim; ++d) {
+    if (g[d] == 0) return CL_SUCCESS;  // (nothing to run: no launch, rather than a zero-size one the driver may refuse)
+    if (g[d] > UINT32_MAX) {           // (a size past 32 bits would run a truncated grid)
+      zlog::eprintf("inferzero: %s: global size %zu past 32 bits (refused)\n", k->name.c_str(), g[d]);
+      return -63;  // (CL_INVALID_GLOBAL_WORK_SIZE)
+    }
+    gs[d] = (uint32_t)g[d];
+  }
+  if (l) {
+    for (cl_uint d = 0; d < dim; ++d) ls[d] = (uint32_t)l[d];
+  } else {
+    ZE_CHECK(zeKernelSuggestGroupSize(k->k, gs[0], gs[1], gs[2], &ls[0], &ls[1], &ls[2]));
+    // (Level Zero runs whole work-groups only: a group size that does not divide the global size would start
+    //  work-items past it, and most kernels have no bounds checks of their own; take the largest divisor not above
+    //  the suggestion)
+    for (int d = 0; d < 3; ++d)
+      while (ls[d] > 1 && gs[d] % ls[d]) --ls[d];
+  }
+  if (ls[0] != k->gx || ls[1] != k->gy || ls[2] != k->gz) {
+    ZE_CHECK(zeKernelSetGroupSize(k->k, ls[0], ls[1], ls[2]));
+    k->gx = ls[0], k->gy = ls[1], k->gz = ls[2];
+  }
+  ze_group_count_t gc{(gs[0] + ls[0] - 1) / ls[0], (gs[1] + ls[1] - 1) / ls[1], (gs[2] + ls[2] - 1) / ls[2]};
+  if (gs[0] % ls[0] || gs[1] % ls[1] || gs[2] % ls[2]) {
+    // OpenCL would run a smaller last work-group; here the last group runs whole and its extra work-items would
+    // read and write past the data. A launch like that is a bug in the caller (round the global size and give the
+    // kernel a bounds check), so it fails loudly instead of corrupting memory.
+    zlog::eprintf("inferzero: %s: global size %u x %u x %u is not a multiple of the work-group %u x %u x %u\n",
+            k->name.c_str(), gs[0], gs[1], gs[2], ls[0], ls[1], ls[2]);
+    return -54;  // (CL_INVALID_WORK_GROUP_SIZE)
+  }
+  zrt::last_k = k;
+  gpufail::last_kernel.store(k->name.c_str(), std::memory_order_relaxed);  // (the failsafe's messages)
+  for (int d = 0; d < 3; ++d) zrt::last_gs[d] = gs[d], zrt::last_ls[d] = ls[d];
+  ze_event_handle_t sig = ev || zrt::watch_ms > 0 ? zrt::ev_get() : nullptr;
+  if (ev) *ev = (cl_event)sig;
+  // (ARC_BATCH: recorded, see zrt::batch_max; a kernel with an event, ARC_ZE_SYNC_EACH or ARC_FAKE_OOM: as before)
+  // (the switches once; whether this GPU batches, per GPU: tiered placement P0)
+  static const bool batch_ok = !(getenv("ARC_ZE_SYNC_EACH") && atoi(getenv("ARC_ZE_SYNC_EACH")) != 0) && !getenv("ARC_FAKE_OOM");
+  if (batch_ok && !sig && zrt::batching(zrt::D())) {
+    zrt::Dev& d = zrt::D();
+    if (zeCommandListAppendLaunchKernel(zrt::rec_list(d), k->k, &gc, nullptr, 0, nullptr) == ZE_RESULT_SUCCESS) {
+      if (++d.rec_n >= d.rec_cap) zrt::flush(d);
+      return CL_SUCCESS;
+    }
+    // (a recording that failed: what the list holds goes now, and this kernel through the immediate list below)
+  }
+  ze_result_t r = zeCommandListAppendLaunchKernel(zrt::imm(), k->k, &gc, sig, 0, nullptr);
+  static const long fake_oom = getenv("ARC_FAKE_OOM") ? atol(getenv("ARC_FAKE_OOM")) : 0;  // (test: launch N "fails")
+  static std::atomic<long> launches{0};  // (several threads launch: a split shard's main list and its sum thread)
+  const long nth = fake_oom ? ++launches : 0;
+  if (fake_oom && nth % fake_oom == 0 && r == ZE_RESULT_SUCCESS) {
+    zrt::sync();  // (the kernel was appended: let it finish, then report the failure as if it had not been)
+    zlog::eprintf("(test: launch %ld of %s reported as out of device memory)\n", nth, k->name.c_str());
+    if (zrt::oom_hook && zrt::oom_hook()) return CL_SUCCESS;
+  }
+  for (int i = 0; r == (ze_result_t)0x70000003 && i < 8 && zrt::oom_hook && zrt::oom_hook(); ++i)  // (out of device memory)
+    r = zeCommandListAppendLaunchKernel(zrt::imm(), k->k, &gc, sig, 0, nullptr);
+  if (r != ZE_RESULT_SUCCESS) {
+    LOG_ERR("Level Zero error 0x%x%s launching %s (global %u x %u x %u, local %u x %u x %u)\n", r, ze_result_text(r), k->name.c_str(),
+            gs[0], gs[1], gs[2], ls[0], ls[1], ls[2]);
+    if (r != 0x70000001u && ze_fail_hook) ze_fail_hook();
+    gpufail::ze_exit(r, "launching " + k->name);
+  }
+  if (zrt::watch_ms > 0) {  // (ARC_ZE_WATCH: this launch waited for alone, timed, kept in the ring; see zrt::watch_wait)
+    zrt::watch_wait(k, sig, ev != nullptr, gs, ls);
+    return CL_SUCCESS;
+  }
+  static const bool sync_each = (getenv("ARC_ZE_SYNC_EACH") && atoi(getenv("ARC_ZE_SYNC_EACH")) != 0);  // (debug: which kernel loses the device)
+  if (sync_each) {
+    const uint64_t lim = zrt::wait_limit_ns();
+    const ze_result_t s = zeCommandListHostSynchronize(zrt::D().cl, lim);
+    if (s == ZE_RESULT_NOT_READY && lim != UINT64_MAX)
+      gpufail::gpu_fatal(gpufail::Hang, "kernel " + k->name + " did not finish within " + std::to_string(lim / 1000000000ull) +
+                                            " s (ARC_GPU_WAIT_S)");
+    if (s != ZE_RESULT_SUCCESS) {
+      LOG_ERR("Level Zero error 0x%x%s running %s (global %u x %u x %u, local %u x %u x %u)\n", s, ze_result_text(s), k->name.c_str(),
+              gs[0], gs[1], gs[2], ls[0], ls[1], ls[2]);
+      if (s != 0x70000001u && ze_fail_hook) ze_fail_hook();
+      gpufail::ze_exit(s, "running " + k->name);
+    }
+  }
+  return CL_SUCCESS;
+}
+inline cl_int clGetDeviceInfo(cl_device_id, cl_device_info p, size_t sz, void* v, size_t* ret) {
+  if (p == CL_DEVICE_GLOBAL_MEM_SIZE && sz >= 8) { *(cl_ulong*)v = zrt::D().global_mem; if (ret) *ret = 8; return CL_SUCCESS; }
+  return -30;
+}
+inline cl_int clWaitForEvents(cl_uint, const cl_event*) { zrt::sync(); return CL_SUCCESS; }
+inline cl_int clGetEventProfilingInfo(cl_event, cl_profiling_info, size_t sz, void* v, size_t*) {
+  if (v && sz >= 8) *(cl_ulong*)v = 0;
+  return CL_SUCCESS;
+}
+inline cl_int clReleaseEvent(cl_event e) {  // (only kernel events are real: back to the free list)
+  if (e) { ZE_CHECK(zeEventHostReset((ze_event_handle_t)e)); zrt::D().ev_free.push_back((ze_event_handle_t)e); }
+  return CL_SUCCESS;
+}
+inline cl_int clReleaseKernel(cl_kernel k) {
+  if (!k) return CL_SUCCESS;
+  if (zrt::last_k == k) zrt::last_k = nullptr;  // (the crash log must not read a kernel that is gone)
+  {
+    const char* nm = k->name.c_str();
+    gpufail::last_kernel.compare_exchange_strong(nm, nullptr);  // (nor the failsafe's message)
+  }
+  zeKernelDestroy(k->k);
+  delete k;
+  return CL_SUCCESS;
+}
+inline cl_int clReleaseProgram(cl_program p) { if (p) { zeModuleDestroy(p->m); delete p; } return CL_SUCCESS; }
+inline cl_int clReleaseCommandQueue(cl_command_queue) { return CL_SUCCESS; }
+inline cl_int clReleaseContext(cl_context) { return CL_SUCCESS; }
+
+struct ClRt {
+  std::string device_id, cache_dir;
+  bool sg8 = true;  // (sub-groups of 8 lanes: Xe-LPG yes; Xe2 / Xe3 (Lunar Lake, Battlemage, Panther Lake) only 16 / 32)
+  bool soft_fail = false;  // (a failed compile, module or kernel creation throws instead of ending the process: XMX check)
+  bool xmx = false;  // (the driver offers DPAS: Xe2 / Xe3, Arrow Lake H; the engine still checks it, Engine::xmx_check)
+  bool block2d = false;  // (cl_intel_subgroup_2d_block_io: 2D block loads, Xe2 / Xe3; zero/xe2/engine_xe2.h ARC_GEMM_2D)
+  // the old-driver warning in words, empty when none (serverz's /props "driver_warning": the web UI's banner, the
+  // launchers' line); copy it under its lock
+  static std::string& driver_warning() { static std::string s; return s; }
+  static std::mutex& driver_warning_mu() { static std::mutex m; return m; }
+  static std::string driver_warning_text() {
+    std::lock_guard<std::mutex> g(driver_warning_mu());
+    return driver_warning();
+  }
+  static uint64_t fnv1a(const std::string& s) {
+    uint64_t h = 1469598103934665603ull;
+    for (unsigned char c : s) { h ^= c; h *= 1099511628211ull; }
+    return h;
+  }
+  // (non-null placeholders: the engine passes them back to the calls above)
+  cl_platform_id platform = (cl_platform_id)1;
+  cl_device_id device = (cl_device_id)1;
+  cl_context ctx = (cl_context)1;
+  cl_command_queue queue = (cl_command_queue)1;
+  // (the compiler's device and context of this engine's GPU, set in init: GPU 0's unless a layer split's stage runs on
+  //  a GPU of another kind, zrt::rcl::device_for)
+  void* cldev = nullptr;
+  void* clctx = nullptr;
+
+  bool init(bool = true) {
+    // (Level Zero first, since 2026-11-14: its GPU 0 decides which OpenCL device compiles the kernels, rcl::load)
+    if (!zrt::ctx && !ze_start()) return false;
+    ze_device_properties_t p0{};
+    p0.stype = ZE_STYPE_DEVICE_PROPERTIES;
+    const bool have0 = zeDeviceGetProperties(zrt::dev0.dev, &p0) == ZE_RESULT_SUCCESS;
+    if (!zrt::rcl::load(have0 ? p0.name : nullptr, have0 ? p0.deviceId : 0)) { LOG_ERR("cannot load OpenCL.dll (needed to compile kernels): is the Intel graphics driver installed?\n"); return false; }
+    // (this engine's GPU, zrt::D(): GPU 0's compiler, or, on another GPU of a layer split over unlike cards, that
+    //  GPU's own (P0, 2026-11-22), so its capabilities are read and its kernels built for it. One GPU, or GPUs of one
+    //  kind: GPU 0's, as before)
+    cldev = zrt::rcl::device, clctx = zrt::rcl::context;
+    if (zrt::D().dev != zrt::dev0.dev) {
+      ze_device_properties_t pd{};
+      pd.stype = ZE_STYPE_DEVICE_PROPERTIES;
+      if (zeDeviceGetProperties(zrt::D().dev, &pd) == ZE_RESULT_SUCCESS && (!have0 || pd.deviceId != p0.deviceId) &&
+          !zrt::rcl::device_for(pd.name, pd.deviceId, cldev, clctx))
+        LOG_WRN("inferzero: no OpenCL device for GPU %d (%s): its kernels are built for GPU 0's kind\n", zrt::D().index, pd.name);
+    }
+    char name[256] = {}, drv[256] = {};
+    zrt::rcl::getDeviceInfo(cldev, 0x102B, sizeof(name) - 1, name, nullptr);  // CL_DEVICE_NAME
+    zrt::rcl::getDeviceInfo(cldev, 0x102D, sizeof(drv) - 1, drv, nullptr);   // CL_DRIVER_VERSION
+    device_id = std::string(name) + "|" + drv;  // (the same key as the OpenCL engine's kernel cache)
+#ifdef _WIN32
+    {  // (2026-11-20: a Windows Update put a February 2024 Intel driver, 31.0.101.5328, in place of 32.0.101.9150 on
+       //  the laptop; on it Flash Next's logits were wrong (KL 1.5-5 against f32, 0.0022 on 32.0.101.9175) and a run
+       //  ended in a device lost. Said once: the 32.0.101 drivers are the ones measured)
+      // (the oldest driver measured right: docs/install.md's 32.0.101.9033)
+      static std::atomic<bool> said_drv{false};
+      unsigned v[4] = {0, 0, 0, 0};
+      // (ARC_TEST_DRIVER=x.y.z.w: checked as if the driver were that one, a test of this warning)
+      const char* dv = getenv("ARC_TEST_DRIVER") ? getenv("ARC_TEST_DRIVER") : drv;
+      const bool parsed = sscanf(dv, "%u.%u.%u.%u", &v[0], &v[1], &v[2], &v[3]) == 4;
+      // (the oldest measured right on any card: manoreken2's B60s on 32.0.101.8976 (issue #3), a1ex4's 140V on 8991 (#60);
+      //  docs/install.md's 9033 was the iGPUs' minimum and warned those. Self audit 2026-11-20, F1)
+      const unsigned ok[4] = {32, 0, 101, 8976};
+      bool older = false;
+      for (int i = 0; parsed && i < 4; ++i)
+        if (v[i] != ok[i]) { older = v[i] < ok[i]; break; }
+      if (older && !said_drv.exchange(true)) {
+        LOG_WRN("inferzero: the Intel graphics driver is %s, older than 32.0.101.8976, the oldest measured right: "
+                "answers may be wrong (Windows Update can install an old driver over a newer one). Install Intel's "
+                "current Arc / Core Ultra graphics driver\n", dv);
+        // (W2, 2026-11-20: also for the web UI and the launchers, through serverz's /props "driver_warning")
+        std::lock_guard<std::mutex> g(driver_warning_mu());
+        driver_warning() = std::string("The Intel graphics driver is ") + dv +
+                           ", older than 32.0.101.8976, the oldest measured right: answers may be wrong. Windows Update "
+                           "can install an old driver over a newer one. Install Intel's current Arc / Core Ultra "
+                           "graphics driver.";
+      }
+    }
+#endif
+    {  // CL_DEVICE_SUB_GROUP_SIZES_INTEL; ARC_NO_SG8=1 takes the 16-lane kernels anyway (tests)
+      size_t sz[8] = {}, ret = 0;
+      if (zrt::rcl::getDeviceInfo(cldev, 0x4108, sizeof sz, sz, &ret) == 0 && ret >= sizeof(size_t)) {
+        sg8 = false;
+        for (size_t i = 0; i < ret / sizeof(size_t) && i < 8; ++i) sg8 = sg8 || sz[i] == 8;
+      }
+      if (getenv("ARC_NO_SG8") && atoi(getenv("ARC_NO_SG8")) != 0) sg8 = false;
+      // (once per process, naming the GPU: the query is the OpenCL device's, GPU 0's, at every runtime start, so a
+      //  split model printed the same line once per GPU and once more (Reddit 2026-11-12); a split model's GPUs are all
+      //  of GPU 0's kind, engine_tp.h refuses others)
+      static std::atomic<bool> said{false};
+      if (!sg8 && !said.exchange(true))
+        zlog::eprintf("inferzero: GPU 0 (%s): no 8-lane sub-groups, so the 16-lane kernels\n", name);
+      // (Alchemist: kernels in recorded lists by default, zrt::batch_max; GPU 0's from the same rule as the others',
+      //  batch_default_for, on Windows and Linux. Until 2026-11-21 (release .21.06) this line was Windows-only, so
+      //  .21.05's Linux default reached only a split model's other GPUs: one A750 stayed unbatched, hakangit, #72)
+      // (only from GPU 0's own engine: a layer split's stage on another kind reads its own sg8 here)
+      if (zrt::dev0.batch_def < 0 && zrt::D().dev == zrt::dev0.dev) zrt::dev0.batch_def = sg8 && have0 && !(p0.flags & 1u) ? 64 : 0;
+    }
+    {  // CL_DEVICE_EXTENSIONS: DPAS from OpenCL C (Engine::xmx_check decides whether it is used); ARC_NO_XMX=1: off
+      std::string ext(16384, '\0');
+      size_t ret = 0;
+      if (zrt::rcl::getDeviceInfo(cldev, 0x1030, ext.size() - 1, ext.data(), &ret) == 0) {
+        xmx = ext.find("cl_intel_subgroup_matrix_multiply_accumulate") != std::string::npos;
+        block2d = ext.find("cl_intel_subgroup_2d_block_io") != std::string::npos;
+      }
+      if (getenv("ARC_NO_XMX") && atoi(getenv("ARC_NO_XMX")) != 0) xmx = false;
+    }
+    if (!getenv("ARC_NO_KCACHE")) {  // (a folder per driver, swept once per process: src/kcache.h)
+      cache_dir = kcache_dir(app_dir() + PLAT_SEP "kernels", drv);
+      kcache_sweep(app_dir() + PLAT_SEP "kernels", cache_dir);
+    }
+    return true;
+  }
+  // The Level Zero runtime, once per process (init, before the OpenCL compiler is chosen): a second engine (the
+  // server switching models, after the first one freed its memory) keeps it: the context, its command lists and
+  // events, the staging buffer (all of zrt:: belongs to that context)
+  static bool ze_start() {
+    if (zrt::ctx) return true;
+    gpufail::check_marker();  // (a GPU hang since this computer started: no GPU work, code 3; src/gpu_fail.h)
+    if (!ze_load()) { zlog::eprintf("cannot load ze_loader.dll (Level Zero)\n"); return false; }
+    ZE_CHECK(zeInit(1));
+    // the first driver whose device is a GPU (zeInit(1) lists GPU drivers only; after a zeInit(0) of the NPU
+    // experiment, ARC_NPU=1, the NPU's driver is listed too and could come first)
+    uint32_t nd = 0;
+    ZE_CHECK(zeDriverGet(&nd, nullptr));
+    std::vector<ze_driver_handle_t> drvs(nd);
+    ZE_CHECK(zeDriverGet(&nd, drvs.data()));
+    ze_driver_handle_t drvh = nullptr;
+    for (ze_driver_handle_t d : drvs) {
+      uint32_t n = 1;
+      ze_device_handle_t x = nullptr;
+      if (zeDeviceGet(d, &n, &x) != 0 || !n) continue;
+      ze_device_properties_t p{};
+      p.stype = ZE_STYPE_DEVICE_PROPERTIES;
+      if (zeDeviceGetProperties(x, &p) == 0 && p.type == 1) {
+        drvh = d;
+        zrt::dev0.dev = x;
+        snprintf(gpufail::gpu_name, sizeof gpufail::gpu_name, "%s", p.name);  // (for the hang marker)
+        break;
+      }
+    }
+    if (!drvh) { LOG_ERR("no Level Zero GPU driver: is the Intel graphics driver installed (Arc or Core Ultra graphics)?\n"); return false; }
+    uint32_t nm = 1;
+    ze_device_memory_properties_t mp{};
+    mp.stype = ZE_STYPE_DEVICE_MEMORY_PROPERTIES;
+    ZE_CHECK(zeDeviceGetMemoryProperties(zrt::dev0.dev, &nm, &mp));
+    zrt::dev0.global_mem = mp.totalSize;
+    ze_context_desc_t cd{ZE_STYPE_CONTEXT_DESC, nullptr, 0};
+    ZE_CHECK(zeContextCreate(drvh, &cd, &zrt::ctx));  // (every GPU of the driver: host memory they all reach)
+    zrt::driver = drvh;
+    ze_command_queue_desc_t qd{ZE_STYPE_COMMAND_QUEUE_DESC, nullptr, 0, 0, 2 /* in order */, 2 /* asynchronous */, 0};
+    ZE_CHECK(zeCommandListCreateImmediate(zrt::ctx, zrt::dev0.dev, &qd, &zrt::dev0.cl));
+    ze_fail_hook = [] { zrt::print_memory(zlog::ERR); };  // (after a fatal error: E lines, kept at -lv 0)
+    return true;
+  }
+  // GPUs 1..n-1 of the driver next to device 0 (after init), each with its own command list: zrt::devs. sim: n
+  // "GPUs" that are all device 0, each with its own list (multi-GPU tests on one GPU, ARC_TP_SIM). Returns the
+  // number open, or 0 and why in err (fewer GPUs than asked, others of another kind).
+  // (mixed: GPUs of other kinds too, after GPU 0's kind, discrete before integrated: a layer split, whose stages are
+  //  engines of their own, each compiling for its GPU (ClRt::init, rcl::device_for; P0, 2026-11-22). A tensor split's
+  //  shards share GPU 0's kernels, so it keeps one kind)
+  static int open_devices(int n, bool sim, std::string& err, bool mixed = false) {
+    if (!zrt::ctx || !zrt::driver) { err = "the runtime is not started"; return 0; }
+    if ((int)zrt::devs.size() >= n) return n;
+    std::vector<ze_device_handle_t> gpus;
+    std::vector<ze_driver_handle_t> gpu_drv;  // (each GPU's driver; empty under ARC_TP_SIM)
+    if (sim) {
+      gpus.assign(n, zrt::dev0.dev);
+    } else {
+      // (mixed: the GPUs of every Level Zero driver, GPU 0's driver first. One driver per GPU kind is how Linux's
+      //  compute runtime can list a B60 and an A770 (skipzx-lab, #57: driver 0 the B60, driver 1 the A770), and a
+      //  context belongs to one driver: a GPU of another driver gets that driver's own context below (Dev::zctx).
+      //  A tensor split stays on GPU 0's driver: its shards share one context's memory and events)
+      std::vector<ze_driver_handle_t> drvs{zrt::driver};
+      if (mixed) {
+        uint32_t nd = 0;
+        if (zeDriverGet(&nd, nullptr) == 0 && nd > 1) {
+          std::vector<ze_driver_handle_t> all_d(nd);
+          if (zeDriverGet(&nd, all_d.data()) == 0)
+            for (ze_driver_handle_t dh : all_d)
+              if (dh != zrt::driver) drvs.push_back(dh);
+        }
+      }
+      gpus.push_back(zrt::dev0.dev);
+      gpu_drv.push_back(zrt::driver);
+      ze_device_properties_t p0{};
+      p0.stype = ZE_STYPE_DEVICE_PROPERTIES;
+      ZE_CHECK(zeDeviceGetProperties(zrt::dev0.dev, &p0));
+      int other = 0;  // (GPUs of another kind: the kernels are compiled for GPU 0's, a module of them would not load)
+      std::vector<std::pair<ze_device_handle_t, ze_driver_handle_t>> same_other, others[2];  // (discrete, integrated)
+      for (ze_driver_handle_t dh : drvs) {
+        uint32_t c = 0;
+        if (zeDeviceGet(dh, &c, nullptr) != 0 || !c) continue;
+        std::vector<ze_device_handle_t> all(c);
+        if (zeDeviceGet(dh, &c, all.data()) != 0) continue;
+        for (ze_device_handle_t x : all) {
+          ze_device_properties_t p{};
+          p.stype = ZE_STYPE_DEVICE_PROPERTIES;
+          if (x == zrt::dev0.dev || zeDeviceGetProperties(x, &p) != 0 || p.type != 1) continue;
+          if (p.deviceId == p0.deviceId && dh == zrt::driver) {
+            gpus.push_back(x);
+            gpu_drv.push_back(dh);
+          } else if (p.deviceId == p0.deviceId) {
+            same_other.push_back({x, dh});
+          } else {
+            ++other;
+            others[(p.flags & 1u) ? 1 : 0].push_back({x, dh});
+          }
+        }
+      }
+      if (mixed)
+        for (auto* o : {&same_other, &others[0], &others[1]})
+          for (auto& g : *o) gpus.push_back(g.first), gpu_drv.push_back(g.second);
+      if ((int)gpus.size() < n) {
+        err = std::to_string(n) + " GPUs asked for, " + (mixed ? "the drivers have " : "the driver has ") +
+              std::to_string(gpus.size()) + (mixed ? "" : " of GPU 0's kind") +
+              (other && !mixed ? " (and " + std::to_string(other) + " of another kind: --split layer can use them)" : "");
+        return 0;
+      }
+    }
+    // (ARC_TP_SIM: the shards on the GPU's compute queues in turn, group 0 queue 0 first as device 0's own list, so a
+    //  shard's list waiting on another's event (ARC_TP_EVSUM) does not hold up the queue that event needs; real GPUs
+    //  each have their own. Fewer queues than shards: they share, as before, and the event sums stay off under SIM)
+    std::vector<std::pair<int, int>> qs;
+    if (sim) {
+      uint32_t ng = 0;
+      ZE_CHECK(zeDeviceGetCommandQueueGroupProperties(zrt::dev0.dev, &ng, nullptr));
+      std::vector<ze_command_queue_group_properties_t> gp(ng);
+      for (auto& g : gp) g.stype = ZE_STYPE_COMMAND_QUEUE_GROUP_PROPERTIES;
+      ZE_CHECK(zeDeviceGetCommandQueueGroupProperties(zrt::dev0.dev, &ng, gp.data()));
+      for (uint32_t g = 0; g < ng; ++g)
+        if (gp[g].flags & ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COMPUTE)
+          for (uint32_t q = 0; q < gp[g].numQueues; ++q) qs.push_back({(int)g, (int)q});
+    }
+    for (int i = (int)zrt::devs.size(); i < n; ++i) {
+      zrt::Dev* d = new zrt::Dev{};  // (kept until the process ends, as device 0's state: a later engine reuses it)
+      d->dev = gpus[i];
+      d->index = i;
+      if (!sim && i < (int)gpu_drv.size() && gpu_drv[i] != zrt::driver) {
+        // (a GPU of another driver: that driver's context, one per driver, kept for the process as zrt::ctx is)
+        d->zdrv = gpu_drv[i];
+        static std::vector<std::pair<ze_driver_handle_t, ze_context_handle_t>> drv_ctx;
+        for (auto& f : drv_ctx)
+          if (f.first == gpu_drv[i]) d->zctx = f.second;
+        if (!d->zctx) {
+          ze_context_desc_t cd{ZE_STYPE_CONTEXT_DESC, nullptr, 0};
+          ZE_CHECK(zeContextCreate(gpu_drv[i], &cd, &d->zctx));
+          drv_ctx.push_back({gpu_drv[i], d->zctx});
+        }
+        zlog::eprintf("inferzero: GPU %d is on another Level Zero driver than GPU 0: its own context\n", i);
+      }
+      uint32_t nm = 1;
+      ze_device_memory_properties_t mp{};
+      mp.stype = ZE_STYPE_DEVICE_MEMORY_PROPERTIES;
+      ZE_CHECK(zeDeviceGetMemoryProperties(d->dev, &nm, &mp));
+      d->global_mem = mp.totalSize;
+      // (its own ARC_BATCH default, P0; a simulated shard is GPU 0 again: GPU 0's)
+      d->batch_def = sim ? std::max(0, zrt::dev0.batch_def) : zrt::batch_default_for(d->dev);
+      // (a GPU of another driver: ARC_BATCH's list append only where the loader exports it, as batch_fns otherwise
+      //  takes its address from GPU 0's driver, which another driver's lists must not be given)
+      if (d->zctx) {
+        void* zl = plat::dl_loaded("ze_loader.dll", "libze_loader.so.1");
+        if (!zl || !plat::dl_sym(zl, "zeCommandListImmediateAppendCommandListsExp")) d->batch_def = 0;
+      }
+      if (sim && i < (int)qs.size()) d->q_ord = qs[i].first, d->q_idx = qs[i].second;
+      ze_command_queue_desc_t qd{ZE_STYPE_COMMAND_QUEUE_DESC, nullptr, (uint32_t)d->q_ord, (uint32_t)d->q_idx,
+                                 2 /* in order */, 2 /* asynchronous */, 0};
+      ZE_CHECK(zeCommandListCreateImmediate(zrt::ctx_of(*d), d->dev, &qd, &d->cl));
+      if (sim) zlog::eprintf("inferzero: ARC_TP_SIM: shard %d on queue group %d, queue %d\n", i, d->q_ord, d->q_idx);
+      zrt::devs.push_back(d);
+    }
+    return n;
+  }
+
+  // The native binary for (source, options): from the shared kernel cache, else compiled by OpenCL and saved there.
+  cl_program build(const std::string& src, const std::string& opts) {
+    std::string path;
+    std::vector<uint8_t> bin;
+    if (!cache_dir.empty()) {
+      char hex[17];
+      snprintf(hex, sizeof(hex), "%016llx", (unsigned long long)fnv1a(src + "\x01" + opts + "\x01" + device_id));
+      path = cache_dir + PLAT_SEP + hex + ".bin";
+      // (ARC_KLIST=1: which cached binary holds which options, for reading its assembly: ocloc disasm)
+      static const bool klist = getenv("ARC_KLIST") && atoi(getenv("ARC_KLIST")) != 0;
+      if (klist) zlog::eprintf("kernel binary %s.bin: %s\n", hex, opts.c_str());
+      std::ifstream f(path, std::ios::binary);
+      if (f) bin.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+      if (!bin.empty()) kcache_touch(path);  // (its last use, for the sweep's trim)
+    }
+    bool cached = !bin.empty();
+  compile:
+    if (bin.empty()) {
+      cl_int err = 0;
+      const char* s = src.c_str();
+      const size_t sn = src.size();
+      void* prog = zrt::rcl::createProgramWithSource(clctx, 1, &s, &sn, &err);
+      err = zrt::rcl::buildProgram(prog, 1, &cldev, opts.c_str(), nullptr, nullptr);
+      if (err != 0) {
+        size_t ln = 0;
+        zrt::rcl::getProgramBuildInfo(prog, cldev, 0x1183, 0, nullptr, &ln);
+        std::string log(ln, 0);
+        zrt::rcl::getProgramBuildInfo(prog, cldev, 0x1183, ln, log.data(), nullptr);
+        zrt::rcl::releaseProgram(prog);
+        if (soft_fail) throw std::runtime_error("kernel build failed: " + log.substr(0, 200));
+        zlog::eprintf("build log:\n%s\n", log.c_str());
+        CL_CHECK(err);
+      }
+      size_t bn = 0;
+      zrt::rcl::getProgramInfo(prog, 0x1165, sizeof(bn), &bn, nullptr);
+      try {
+        bin.resize(bn);
+      } catch (...) {
+        zrt::rcl::releaseProgram(prog);
+        throw;
+      }
+      uint8_t* bp = bin.data();
+      zrt::rcl::getProgramInfo(prog, 0x1166, sizeof(bp), &bp, nullptr);
+      zrt::rcl::releaseProgram(prog);
+      if (!path.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(cache_dir, ec);
+        const std::string tmp = kcache_tmp(path);  // (this process's own: two compiling the same kernel mixed one file)
+        bool ok = false;
+        {
+          std::ofstream o(tmp, std::ios::binary);
+          o.write((const char*)bin.data(), (std::streamsize)bin.size());
+          o.close();
+          ok = !o.fail();
+        }
+        if (ok) std::filesystem::rename(tmp, path, ec);  // (a short write (disk full) is never installed)
+        else std::filesystem::remove(tmp, ec);
+      }
+    }
+    // The OpenCL build option -cl-intel-256-GRF-per-thread does not survive into a Level Zero module made from the
+    // native binary: the kernels ran with the default register file and spilled (attn_decode at HD 256: 4 KB per
+    // thread, 1.9 -> 3.6 ms per layer at 64K context). The module asks for the large register file itself.
+    const bool big_grf = opts.find("-cl-intel-256-GRF-per-thread") != std::string::npos;
+    ze_module_desc_t md{ZE_STYPE_MODULE_DESC, nullptr, 1 /* native */, bin.size(), bin.data(),
+                        big_grf ? "-ze-opt-large-register-file" : "", nullptr};
+    ZProg* p = new ZProg{};
+    p->bin_bytes = bin.size();
+    p->indirect = opts.find("-DXCACHE") != std::string::npos;
+    p->opts = opts;
+    ze_module_build_log_handle_t log = nullptr;
+    const ze_result_t r = zeModuleCreate(zrt::C(), zrt::D().dev, &md, &p->m, &log);
+    if (r != ZE_RESULT_SUCCESS && cached) {  // a damaged cache file: compiled again from the source
+      if (log) zeModuleBuildLogDestroy(log);
+      delete p;
+      std::error_code ec;
+      std::filesystem::remove(path, ec);
+      bin.clear();
+      cached = false;
+      goto compile;
+    }
+    if (r != ZE_RESULT_SUCCESS) {
+      size_t ln = 0;
+      zeModuleBuildLogGetString(log, &ln, nullptr);
+      std::string s(ln, 0);
+      zeModuleBuildLogGetString(log, &ln, s.data());
+      if (log) zeModuleBuildLogDestroy(log);  // (before the throw: it was left behind on a soft failure)
+      delete p;
+      if (soft_fail) throw std::runtime_error("zeModuleCreate failed: " + s.substr(0, 200));
+      zlog::eprintf("zeModuleCreate failed 0x%x: %s\n", r, s.c_str());
+      fflush(stderr);
+      _Exit(1);
+    }
+    if (log) zeModuleBuildLogDestroy(log);
+    return p;
+  }
+  cl_kernel kernel(cl_program prog, const char* name) {
+    ZKernel* k = new ZKernel{};
+    k->name = name;
+    ze_kernel_desc_t kd{ZE_STYPE_KERNEL_DESC, nullptr, 0, name};
+    const ze_result_t r = zeKernelCreate(prog->m, &kd, &k->k);
+    if (r != ZE_RESULT_SUCCESS) {
+      delete k;
+      if (soft_fail) throw std::runtime_error(std::string("zeKernelCreate failed: ") + name);
+      zlog::eprintf("zeKernelCreate(%s) failed 0x%x\n", name, r);
+      exit(1);
+    }
+    // The expert kernels (-DXCACHE) reach memory that is not one of their arguments (each expert's address comes from
+    // a table): with indirect access the driver keeps every allocation resident for them; without it an expert in a
+    // piece of the cache that Windows had paged out was a page fault ("device lost" now and then, in the server).
+    // Only for them: on every kernel it made the driver touch every allocation per launch (27B: slower).
+    if (prog->indirect) zeKernelSetIndirectAccess(k->k, 7 /* device | host | shared */);
+    static const bool kprops = (getenv("ARC_ZE_KPROPS") && atoi(getenv("ARC_ZE_KPROPS")) != 0);  // (debug: private / spill memory per kernel)
+    if (kprops) {
+      ze_kernel_properties_t kp{};
+      kp.stype = (ze_structure_type_t)0x1e;
+      if (zeKernelGetProperties(k->k, &kp) == ZE_RESULT_SUCCESS && (kp.privateMemSize || kp.spillMemSize))
+        zlog::eprintf("kernel %s: private %u bytes, spill %u bytes per work-item/thread [%s]\n", name, kp.privateMemSize,
+                kp.spillMemSize, prog->opts.c_str());
+    }
+    return k;
+  }
+  size_t spill_bytes(cl_kernel) { return 0; }
+  cl_mem buffer(cl_mem_flags flags, size_t bytes, const void* host = nullptr) {
+    cl_int err;
+    cl_mem m = clCreateBuffer(ctx, flags | (host ? CL_MEM_COPY_HOST_PTR : 0), bytes, (void*)host, &err);
+    CL_CHECK(err);
+    return m;
+  }
+  static double event_ms(cl_event e) {  // (kernel time from the Level Zero timestamps; call after clFinish)
+    if (!e) return 0.0;
+    ze_kernel_timestamp_result_t ts{};
+    if (zeEventQueryKernelTimestamp((ze_event_handle_t)e, &ts) != ZE_RESULT_SUCCESS) return 0.0;
+    const uint64_t t = (ts.context.kernelEnd - ts.context.kernelStart) & zrt::D().ev_mask;
+    return t * zrt::D().ev_ns_per_tick * 1e-6;
+  }
+};
+
+inline std::string read_file(const std::string& path) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f) { zlog::eprintf("cannot open %s\n", path.c_str()); exit(1); }
+  std::stringstream ss;
+  ss << f.rdbuf();
+  return ss.str();
+}
+
+// A kernel program kept in parts, files in a fixed order, that were one file once (ops.cl 3,516 lines, decode.cl
+// 2,047). A kernel of part k builds from parts 0..k: the text before it is what it was in the one file, so its code is
+// too, and a norm's or a GEMV's build no longer compiles the attention, encoder, Flash Next or MoE kernels after it.
+struct KernelParts {
+  static constexpr std::initializer_list<const char*> kOps = {"ops.cl", "ops_attn.cl", "ops_attn_g.cl", "ops_vit.cl",
+                                                              "ops_flashnext.cl", "ops_dflash.cl", "ops_gdn.cl",
+                                                              "ops_ds41.cl", "ops_inkling.cl"};
+  static constexpr std::initializer_list<const char*> kDecode = {"decode.cl", "decode_moe.cl"};
+  std::vector<std::string> prefix;              // prefix[k]: parts 0..k
+  std::unordered_map<std::string, int> part_of;  // kernel name -> its part
+  void load(const std::string& dir, std::initializer_list<const char*> parts) {
+    std::string s;
+    prefix.clear();
+    part_of.clear();
+    for (const char* f : parts) {
+      const std::string t = read_file(dir + "/" + f);
+      for (size_t i = t.find("__kernel void "); i != std::string::npos; i = t.find("__kernel void ", i + 1)) {
+        size_t a = i + 14, b = a;
+        while (b < t.size() && (isalnum((unsigned char)t[b]) || t[b] == '_')) ++b;
+        part_of.emplace(t.substr(a, b - a), (int)prefix.size());
+      }
+      prefix.push_back(s += t);
+    }
+  }
+  const std::string& all() const { return prefix.back(); }
+  const std::string& for_kernel(const char* name) const {
+    const auto it = part_of.find(name);
+    return it == part_of.end() ? all() : prefix[it->second];  // (an unknown name: the whole set, its build error)
+  }
+};
+
+template <typename T> inline void set_args(cl_kernel k, cl_uint i, const T& v) { CL_CHECK(clSetKernelArg(k, i, sizeof(T), &v)); }
+template <typename T, typename... R> inline void set_args(cl_kernel k, cl_uint i, const T& v, const R&... rest) {
+  set_args(k, i, v);
+  set_args(k, i + 1, rest...);
+}
+// the kernel's last argument, at the index its compiled signature has (Level Zero's numKernelArgs): for an argument a
+// build option appends, such as Inkling's -DMOE_SITU table, whose index hand counts got wrong (117c938, the
+// Researcher's review: moe_gateup_q's at 13 / 16 for 11 / 14). Throws on a kernel without arguments
+template <typename T> inline void set_last_arg(cl_kernel k, const T& v) {
+  ze_kernel_properties_t kp{};
+  kp.stype = (ze_structure_type_t)0x1e;  // (ZE_STRUCTURE_TYPE_KERNEL_PROPERTIES, as the ARC_ZE_KPROPS line)
+  ZE_CHECK(zeKernelGetProperties(k->k, &kp));
+  if (kp.numKernelArgs == 0) throw std::runtime_error("set_last_arg: a kernel without arguments");
+  set_args(k, kp.numKernelArgs - 1, v);
+}

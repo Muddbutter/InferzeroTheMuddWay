@@ -1,0 +1,244 @@
+// The log's first lines (docs/logging.md): which build, on what system and GPU, with which switches; what a report of
+// a problem needs before anything else. The model's own lines follow at its load (server_load.h: model, memory).
+#pragma once
+#ifdef _WIN32
+#include <intrin.h>
+#else
+#include <cpuid.h>
+#include <sys/utsname.h>
+extern char** environ;
+#endif
+#include <algorithm>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <string>
+#include <vector>
+
+namespace srvstart {
+
+// bin\PREBUILT.txt's first line ("inferzero 2026.11.12.12 (built ..., commit ...)") in a package; else a build here
+inline std::string version(const std::filesystem::path& exe_dir) {
+  std::ifstream f(exe_dir / "PREBUILT.txt");
+  std::string l;
+  if (f && std::getline(f, l) && !l.empty()) {
+    if (l.size() >= 3 && (unsigned char)l[0] == 0xEF && (unsigned char)l[1] == 0xBB && (unsigned char)l[2] == 0xBF) l.erase(0, 3);
+    while (!l.empty() && (l.back() == '\r' || l.back() == ' ')) l.pop_back();
+    return l;
+  }
+  return std::string("inferzero built from source (") + __DATE__ + ")";
+}
+// the system: "Windows 11 build 26200"; Linux: /etc/os-release's PRETTY_NAME and the kernel ("Ubuntu 24.04.3 LTS,
+// kernel 6.6.87.2-microsoft-standard-WSL2")
+inline std::string windows() {
+#ifndef _WIN32
+  std::string name = "Linux";
+  std::ifstream f("/etc/os-release");
+  for (std::string l; std::getline(f, l);)
+    if (l.rfind("PRETTY_NAME=", 0) == 0) {
+      name = l.substr(12);
+      if (name.size() >= 2 && name.front() == '"' && name.back() == '"') name = name.substr(1, name.size() - 2);
+    }
+  utsname u{};
+  if (uname(&u) == 0) name += std::string(", kernel ") + u.release;
+  return name;
+#else
+  typedef LONG(WINAPI * Rtl)(OSVERSIONINFOW*);
+  OSVERSIONINFOW v{};
+  v.dwOSVersionInfoSize = sizeof v;
+  if (HMODULE nt = GetModuleHandleW(L"ntdll.dll"))
+    if (auto f = (Rtl)(void*)GetProcAddress(nt, "RtlGetVersion"); f && f(&v) == 0)
+      return std::string(v.dwBuildNumber >= 22000 ? "Windows 11" : "Windows 10") + " build " + std::to_string(v.dwBuildNumber);
+  return "Windows";
+#endif
+}
+inline void cpuid4(int r[4], unsigned leaf) {
+#ifdef _WIN32
+  __cpuid(r, (int)leaf);
+#else
+  unsigned a = 0, b = 0, c = 0, d = 0;
+  __cpuid(leaf, a, b, c, d);
+  r[0] = (int)a, r[1] = (int)b, r[2] = (int)c, r[3] = (int)d;
+#endif
+}
+inline std::string cpu() {
+  int r[4] = {};
+  cpuid4(r, 0x80000000);
+  if ((unsigned)r[0] < 0x80000004u) return "CPU";
+  char b[49] = {};
+  for (int i = 0; i < 3; ++i) {
+    cpuid4(r, 0x80000002 + i);
+    memcpy(b + 16 * i, r, 16);
+  }
+  std::string s = b;
+  while (!s.empty() && s.back() == ' ') s.pop_back();
+  while (!s.empty() && s.front() == ' ') s.erase(0, 1);
+  return s;
+}
+// the ARC_* switches set in the environment (any case: Windows' names are), a value that looks secret not shown, and
+// the user's folder in a value as %USERPROFILE% (the log is pasted into issues)
+inline std::string switches() {
+  std::string o;
+  const char* up_env = plat::home_env();
+  const std::string home = up_env ? up_env : "";
+  auto lower = [](std::string s) {
+    for (char& c : s) c = (char)tolower((unsigned char)c);
+    return s;
+  };
+#ifdef _WIN32
+  char** const env = _environ;
+#else
+  char** const env = environ;
+#endif
+  for (char** e = env; e && *e; ++e) {
+    const std::string kv = *e;
+    if (kv.size() < 4 || lower(kv.substr(0, 4)) != "arc_") continue;
+    const size_t eq = kv.find('=');
+    const std::string k = kv.substr(0, eq);
+    std::string v = eq == std::string::npos ? "" : kv.substr(eq + 1);
+    const std::string up = lower(k);
+    bool secret = false;
+    for (const char* w : {"token", "secret", "pass", "key", "auth", "cred", "cookie"})
+      secret = secret || up.find(w) != std::string::npos;
+    // (each search goes on after the replacement put in: from the start, a HOME of "~" was found again forever)
+    if (!home.empty())
+#ifdef _WIN32
+      for (size_t at = 0; (at = lower(v).find(lower(home), at)) != std::string::npos; at += sizeof("%USERPROFILE%") - 1)
+        v.replace(at, home.size(), "%USERPROFILE%");
+#else
+      for (size_t at = 0; (at = v.find(home, at)) != std::string::npos; at += 1)  // (1: "~"; case-sensitive paths)
+        v.replace(at, home.size(), "~");
+#endif
+    for (char& c : v)
+      if ((unsigned char)c < 0x20) c = '?';
+    o += (o.empty() ? "" : " ") + k + "=" + (secret ? std::string("(set)") : v);
+  }
+  return o.empty() ? "none" : o;
+}
+inline void print_head(const std::filesystem::path& exe_dir) {
+  LOG_INF("%s\n", version(exe_dir).c_str());
+  LOG_INF("system: %s, %s, %u logical processors (%d cores), RAM %.1f GiB (%.1f free)\n", windows().c_str(), cpu().c_str(),
+          std::thread::hardware_concurrency(), plat::physical_cores(), plat::ram_total() / 1073741824.0,
+          plat::ram_available() / 1073741824.0);
+  LOG_INF("ARC_* switches set: %s\n", switches().c_str());
+}
+// (the GPU runtime started here: after the NPU's zeInit(0), see server.cpp)
+inline void print_gpu() {
+  ClRt rt;
+  if (rt.init(false)) {
+    char name[256] = {}, drv[128] = {};
+    cl_uint eus = 0, mhz = 0;
+    cl_ulong mem = 0;
+    // (the OpenCL runtime's own answers, as gpu_bench asks them: the Level Zero shim knows only the memory size)
+    zrt::rcl::getDeviceInfo(zrt::rcl::device, 0x102B, sizeof(name) - 1, name, nullptr);  // CL_DEVICE_NAME
+    zrt::rcl::getDeviceInfo(zrt::rcl::device, 0x102D, sizeof(drv) - 1, drv, nullptr);   // CL_DRIVER_VERSION
+    zrt::rcl::getDeviceInfo(zrt::rcl::device, 0x1002, sizeof(eus), &eus, nullptr);       // CL_DEVICE_MAX_COMPUTE_UNITS
+    zrt::rcl::getDeviceInfo(zrt::rcl::device, 0x100C, sizeof(mhz), &mhz, nullptr);       // CL_DEVICE_MAX_CLOCK_FREQUENCY
+    clGetDeviceInfo(rt.device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(mem), &mem, nullptr);
+    LOG_INF("GPU: %s, driver %s, %u EUs, %u MHz, %.1f GiB %s, XMX %s, %s sub-groups\n", name, drv, eus, mhz,
+            mem / 1073741824.0, zrt::integrated() ? "(shared with the CPU)" : "of its own", rt.xmx ? "yes" : "no",
+            rt.sg8 ? "8- and 16-lane" : "16-lane");
+    if (rt.queue) clReleaseCommandQueue(rt.queue);
+    if (rt.ctx) clReleaseContext(rt.ctx);
+  } else {
+    LOG_ERR("GPU: none found (Level Zero did not start: is the Intel graphics driver installed?)\n");
+  }
+}
+// The launchers' option catalog, scripts/options.tsv: one map a row, by the header's column names (a field the row
+// lacks is empty). Found next to the package (bin/../scripts) or in the folder the server runs in; none: no rows.
+// head: the header's names, to tell an old catalog without a column from an empty field
+struct OptionCatalog {
+  std::vector<std::string> head;
+  std::vector<std::map<std::string, std::string>> rows;
+  bool has(const char* c) const { return std::find(head.begin(), head.end(), c) != head.end(); }
+};
+inline OptionCatalog option_catalog(const std::filesystem::path& exe_dir) {
+  OptionCatalog cat;
+  std::ifstream f;
+  for (const auto& p : {exe_dir.parent_path() / "scripts" / "options.tsv", exe_dir / "scripts" / "options.tsv",
+                        std::filesystem::current_path() / "scripts" / "options.tsv"}) {
+    f.open(p, std::ios::binary);
+    if (f) break;
+    f.clear();
+  }
+  if (!f) return cat;
+  auto split = [](std::string l) {
+    if (!l.empty() && l.back() == '\r') l.pop_back();
+    std::vector<std::string> v;
+    for (size_t a = 0;;) {
+      const size_t b = l.find('\t', a);
+      v.push_back(l.substr(a, b == std::string::npos ? std::string::npos : b - a));
+      if (b == std::string::npos) break;
+      a = b + 1;
+    }
+    return v;
+  };
+  std::string line;
+  if (!std::getline(f, line)) return cat;
+  cat.head = split(line);
+  while (std::getline(f, line)) {
+    const std::vector<std::string> v = split(line);
+    std::map<std::string, std::string> r;
+    for (size_t i = 0; i < cat.head.size(); ++i) r[cat.head[i]] = i < v.size() ? v[i] : std::string();
+    cat.rows.push_back(std::move(r));
+  }
+  return cat;
+}
+// The speed and accuracy options (scripts/options.tsv, QUEUE O5, 2026-11-21) that are in effect, in words: an env
+// option whose variable is set, a flag option on the command line, however they got there (the launchers, zero-server
+// -Opt, Docker's OPTIONS, by hand). "options: CPU experts: off; Copy drafting; Resident weights (12)". Without the
+// catalog (option_catalog), no line
+inline std::string options_in_effect(const std::filesystem::path& exe_dir, const std::vector<std::string>& args) {
+  const OptionCatalog cat = option_catalog(exe_dir);
+  if (cat.head.empty()) return "";
+  for (const char* c : {"kind", "name", "on", "off", "title"})
+    if (!cat.has(c)) return "";
+  std::string out;
+  auto add = [&](const std::string& s) { out += (out.empty() ? "" : "; ") + s; };
+  for (const auto& r : cat.rows) {
+    const std::string kind = r.at("kind"), name = r.at("name"), on = r.at("on"), off = r.at("off"), title = r.at("title");
+    if (name.empty() || title.empty()) continue;
+    if (kind == "env") {
+      const char* e = getenv(name.c_str());
+      if (!e) continue;
+      const std::string val = e;
+      if (val == on) add(title);
+      else if (!off.empty() && val == off) add(title + ": off");
+      else add(title + " (" + name + "=" + val + ")");
+    } else if (kind == "flag") {
+      for (size_t i = 0; i < args.size(); ++i) {
+        if (args[i] != name) continue;
+        // (on: empty, a switch; "<GiB>", a value the user gives, shown; a word, the value that turns it on: --split
+        //  layer is "Multi-GPU by layers", --split tensor is the default and not named)
+        const std::string val = i + 1 < args.size() ? args[i + 1] : std::string();
+        if (on.empty()) add(title);
+        else if (on[0] == '<') add(title + " (" + val + ")");
+        else if (val == on) add(title);
+        else continue;
+        break;
+      }
+    }
+  }
+  return out.empty() ? "none (the defaults)" : out;
+}
+inline void print_options(const std::filesystem::path& exe_dir, const std::vector<std::string>& args) noexcept {
+  try {
+    const std::string o = options_in_effect(exe_dir, args);
+    if (!o.empty()) LOG_INF("options: %s\n", o.c_str());
+  } catch (...) {
+  }
+}
+// (never stops the server: a part that fails says so and the start goes on)
+inline void print(const std::filesystem::path& exe_dir, bool gpu) noexcept {
+  try {
+    if (gpu) print_gpu();
+    else print_head(exe_dir);
+  } catch (const std::exception& e) {
+    LOG_WRN("start-up information incomplete: %s\n", e.what());
+  } catch (...) {
+    LOG_WRN("start-up information incomplete\n");
+  }
+}
+
+}  // namespace srvstart

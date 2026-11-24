@@ -1,0 +1,344 @@
+# inferzero setup: everything needed on this laptop, in one command. Safe to run again: done steps are skipped.
+#
+#   setup                        check the requirements, build, choose models to download, connect Pi
+#   setup -Models 27b,4b         download these without asking (27b 35b 35b-gsq flash flash-ar4 9b 4b g12 g31 e4b whisper asr, all, none)
+#   setup -Tests                 also build the test tools and run the regression tests (needs the 4B model)
+#   setup -NoPi                  leave Pi alone
+#   setup -Yes                   do not ask (the downloads of the models given with -Models)
+#   setup -Rebuild               build the exes from source even in a ready-to-use package (needs Visual Studio)
+#   setup -Help                  all options
+#
+# Steps: 1 requirements (Windows, Intel Arc GPU, Visual Studio C++ compiler unless the package is prebuilt; no Python; Pi)
+#  2 build bin\serverz.exe, runz.exe, clinfo.exe, transcribez.exe, zero_recorder.exe when missing or
+# older than the sources (a ready-to-use package, bin\PREBUILT.txt: kept as shipped)  3 GPU check (OpenCL 3.0, DP4a,
+# sub-groups, memory)  4 models (Hugging Face cache, downloaded by scripts\hf-get.ps1: no Python; 35b-gsq converted)
+# 5 Pi (zero-pi / zero-server commands, Pi's model list)  6 regression tests (-Tests).
+param([string[]]$Models = @(), [switch]$Tests, [switch]$NoPi, [switch]$Yes, [switch]$Rebuild, [switch]$Help)
+$ErrorActionPreference = "Stop"
+$root = $PSScriptRoot
+$bin = Join-Path $root "bin"
+# a ready-to-use package (scripts\make-package.ps1) ships its exes built: no compiler, no build step (-Rebuild: build)
+$prebuiltFile = Join-Path $bin "PREBUILT.txt"
+$prebuilt = (Test-Path $prebuiltFile) -and -not $Rebuild
+$Models = @(($Models -join ",") -split "[,;\s]+" | Where-Object { $_ } | ForEach-Object { $_.ToLower() })
+if ($Help -or ($Models | Where-Object { $_ -in "--help", "-h", "help", "/?", "-?" })) {
+  Write-Host @'
+setup: everything inferzero needs on this laptop, in one command. Safe to run again: done steps are skipped.
+
+USAGE
+  setup                          check, build, ask which models to download, connect Pi
+  setup -Models 27b,4b           download these without asking: 27b 35b 35b-gsq flash flash-ar4 9b 4b g12 g31 e4b, whisper asr
+                                 (speech to text), or all / none
+  setup -Tests                   also build the test tools and run the regression tests (needs the 4B model)
+  setup -NoPi                    leave Pi alone
+  setup -Yes                     do not ask: downloads go ahead (with -Models: those models;
+                                 without: none are downloaded)
+  setup -Rebuild                 build the exes from source even in a ready-to-use package (needs Visual Studio)
+  setup -Help, --help, -h        this text
+
+STEPS
+  1 requirements   64-bit Windows, an Intel Arc GPU and its driver, the Visual Studio C++ compiler (not for a
+                   ready-to-use package; vswhere, $env:ARC_VCVARS = a vcvars64.bat overrides), Pi (optional); no
+                   Python (no step needs it). Missing ones: where to get them.
+  2 build          bin\serverz.exe, runz.exe, clinfo.exe, transcribez.exe (Whisper), zero_recorder.exe (meetings)
+                   when missing or older than their sources (a ready-to-use package keeps its own); the compiler
+                   output goes to %USERPROFILE%\.inferzero\build.log (shown when a build fails). A running server
+                   is stopped first if serverz.exe has to be rebuilt.
+  3 GPU check      bin\clinfo.exe: OpenCL device, DP4a (cl_khr_integer_dot_product), Intel sub-groups, GPU memory
+  4 models         into the Hugging Face cache (HF_HUB_CACHE / HF_HOME respected) by scripts\hf-get.ps1: curl.exe,
+                   resumed after a cut, each file's SHA256 checked; no Python. Gemma with its drafter and image
+                   projector (Gemma asks you to accept its terms on huggingface.co: then set HF_TOKEN). 35b-gsq is
+                   converted by bin\convert_gsq.exe (the 4B for its tokenizer). The free disk space is checked. Then: every model the server
+                   finds, with its context for the current GPU memory.
+  5 Pi             scripts\install-pi.ps1: the zero-pi and zero-server commands, Pi's model list. Without Pi:
+                   asks to put this folder on PATH, for its zero-server.cmd
+  6 tests          with -Tests: tests\run_tests.ps1 (unit tests, templates, accuracy vs f32, MTP / DFlash2, slots, API)
+
+MODELS
+  27b  Qwen3.8 27B (ISTA-DASLab GSQ-RCO IQ3_S, MTP)        12.1 GB
+  35b  Qwen3.6 35B-A3B (Unsloth UD-IQ4_XS, MTP) + image projector  19.1 GB
+  35b-gsq  Qwen3.6 35B-A3B 2-bit GSQ (converted here, no MTP)  12.6 GB download, 11.7 GB converted
+  flash-ar4  Qwen3.8 Flash Next with Intel's AutoRound INT4 experts (safetensors imported here;
+           precise mode by itself)  189 GB download, ~290 GB of disk at the most, ~207 GB kept (the
+           UD-Q4_K_XL stays as a model of its own; the AutoRound shards are deleted when you agree)
+  9b   Qwen3.5 9B (Unsloth UD-Q4_K_XL, MTP)                6.1 GB
+  4b   Qwen3.5 4B (Unsloth UD-Q4_K_XL, MTP)                3.0 GB
+  g12  Gemma 4 12B (Google QAT Q4_0) + image projector + drafter  7.4 GB
+  g31  Gemma 4 31B (Google QAT Q4_0) + image projector + drafter  19.1 GB (32 GB RAM; slow)
+  e4b  Gemma 4 E4B (Google QAT Q4_0) + projector (images, audio) + drafter  6.2 GB
+  whisper  Whisper large-v3 (faster-whisper): transcripts with words' times, live text   3.1 GB
+  asr  Qwen3-ASR 1.7B Q8_0 + its projector: the default speech model                  2.4 GB
+       (both for zero-server start -Whisper auto: the web UI's Transcripts / Meetings tabs, voice messages)
+
+Not installed by setup: the graphics driver, Visual Studio Build Tools and Pi (vendor installers).
+'@
+  exit 0
+}
+
+function Head($n, $t) { Write-Host ""; Write-Host "[$n/6] $t" -ForegroundColor Cyan }
+function Ok($m) { Write-Host "  ok    $m" }
+function Note($m) { Write-Host "  note  $m" -ForegroundColor Yellow }
+function Bad($m, $fix) { Write-Host "  FAIL  $m" -ForegroundColor Red; if ($fix) { Write-Host "        $fix" }; exit 1 }
+function Ask($q, [bool]$def = $true) {
+  if ($Yes) { return $true }
+  $a = Read-Host "  $q $(if ($def) { '[Y/n]' } else { '[y/N]' })"
+  if (-not $a) { return $def }
+  return $a -match '^(y|yes|ya)$'
+}
+
+Write-Host "inferzero setup ($root)"
+
+# ---------------------------------------------------------------- 1. requirements
+Head 1 "Requirements"
+if (-not [Environment]::Is64BitOperatingSystem) { Bad "64-bit Windows is required." }
+$os = Get-CimInstance Win32_OperatingSystem
+Ok "$($os.Caption) $($os.Version)"
+$cpu = (Get-CimInstance Win32_Processor | Select-Object -First 1).Name.Trim()
+Ok "CPU: $cpu"
+$ramGb = [Math]::Round($os.TotalVisibleMemorySize / 1MB, 1)
+if ($ramGb -lt 15) { Note "RAM $ramGb GB: enough for the 4B / E4B models only (32 GB for the 12B-35B models)" } else { Ok "RAM: $ramGb GB" }
+$gpus = @(Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match "Intel" })
+if (-not $gpus) { Bad "No Intel GPU found. inferzero needs an Intel Core Ultra with Arc integrated graphics." }
+foreach ($g in $gpus) { Ok "GPU: $($g.Name), driver $($g.DriverVersion)" }
+if (-not ($gpus | Where-Object { $_.Name -match "Arc" })) { Note "only Intel Arc integrated graphics (Xe-LPG tested; Xe2 / Xe3 reported to work) is supported" }
+
+# Visual Studio C++ compiler (the same search as build.ps1): not for a ready-to-use package
+. (Join-Path $PSScriptRoot "scripts\vcvars.ps1")
+$vcvars = if ($prebuilt) { "" } else { Find-VcVars }
+if ($prebuilt) { Ok "C++ compiler: not needed (ready-to-use package: $((Get-Content -Encoding UTF8 $prebuiltFile -TotalCount 1).Trim()))" }
+elseif ($null -eq $vcvars) {
+  Bad "No Visual Studio C++ compiler found." ("Install 'Build Tools for Visual Studio' (https://visualstudio.microsoft.com/downloads/, " +
+    "under 'Tools for Visual Studio') with the workload 'Desktop development with C++', then run setup again.")
+}
+elseif ($vcvars) { Ok "C++ compiler: $(Split-Path (Split-Path (Split-Path (Split-Path $vcvars))))" }
+else { Ok "C++ compiler: cl from this Developer prompt ($env:VCToolsInstallDir)" }
+
+# (no Python: the downloads are scripts\hf-get.ps1's, the 35b-gsq conversion bin\convert_gsq.exe's and the flash-ar4
+#  import bin\import_autoround_experts.exe's, since 2026-11-15)
+
+$piBin = Join-Path $env:USERPROFILE ".pi\agent\bin"
+$hasPi = Test-Path $piBin
+if ($hasPi) { Ok "Pi: $piBin" } elseif (-not $NoPi) { Note "Pi not found (optional): https://pi.dev, run it once, then run setup again" }
+
+# ---------------------------------------------------------------- 2. build
+Head 2 "Build"
+# compiler output goes to %USERPROFILE%\.inferzero\build.log; shown only when a build fails
+. (Join-Path $root "scripts\app-dir.ps1")
+$buildLog = Join-Path (Get-AppDir) "build.log"
+New-Item -ItemType Directory -Force (Split-Path $buildLog) | Out-Null
+function Build([string[]]$srcs) {
+  $ErrorActionPreference = "Continue"
+  & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root "build.ps1") @srcs *> $buildLog
+  if ($LASTEXITCODE -ne 0) {
+    Get-Content -Encoding UTF8 $buildLog | Where-Object { $_ -match "error|failed" } | Select-Object -First 15 | ForEach-Object { Write-Host "        $_" }
+    Bad "build failed" "full compiler output: $buildLog"
+  }
+  Ok "built $($srcs -join ', ')"
+}
+$newestHeader = (Get-ChildItem (Join-Path $root "src") -Filter *.h | Measure-Object LastWriteTime -Maximum).Maximum
+# (inferzero: zero\serverz.cpp is tools\server.cpp on zero\engine.h, so it depends on both and on zero\*.h)
+$newestZero = (Get-ChildItem (Join-Path $root "zero") -Filter *.h | Measure-Object LastWriteTime -Maximum).Maximum
+$need = @()
+if ($prebuilt) { Ok "ready-to-use package: the exes as shipped ($((Get-Content -Encoding UTF8 $prebuiltFile -TotalCount 1).Trim()); setup -Rebuild builds them)" }
+foreach ($t in $(if ($prebuilt) { @() } else { "tools\clinfo", "zero\serverz", "zero\runz", "zero\transcribez", "tools\zero_recorder" })) {
+  $name = Split-Path $t -Leaf
+  $exe = Join-Path $bin "$name.exe"
+  $src = Get-Item (Join-Path $root "$t.cpp")
+  $deps = @($newestHeader, $src.LastWriteTime)
+  if ($t -like "zero*") { $deps += $newestZero }
+  # (serverz: tools\server.cpp and the headers beside it, server_*.h / web_tools.h / api_compat.h / sampler.h)
+  if ($t -eq "zero\serverz") {
+    $deps += (Get-ChildItem -Path (Join-Path $root "tools\*") -Include server.cpp, *.h -File | Measure-Object LastWriteTime -Maximum).Maximum
+  }
+  $stale = -not (Test-Path $exe) -or @($deps | Where-Object { (Get-Item $exe).LastWriteTime -lt $_ }).Count -gt 0
+  if ($stale) { $need += "$t.cpp" } else { Ok "bin\$name.exe is up to date" }
+}
+if ($need) {
+  $running = @(Get-Process server, serverz -ErrorAction SilentlyContinue | Where-Object { $_.Path -like (Join-Path $bin "server*.exe") })
+  if ($running.Count -and $need -contains "zero\serverz.cpp") {
+    Note "stopping the running inferzero server to rebuild it"
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root "scripts\zero-server.ps1") stop | Out-Null
+  }
+  Write-Host "  building $($need -join ', ') (about a minute)..."
+  Build $need
+}
+
+# ---------------------------------------------------------------- 3. GPU check
+Head 3 "GPU check (bin\clinfo.exe)"
+$ErrorActionPreference = "Continue"
+$ci = @(& (Join-Path $bin "clinfo.exe") 2>&1 | ForEach-Object { "$_" })
+$ErrorActionPreference = "Stop"
+$ciText = $ci -join "`n"
+if ($LASTEXITCODE -ne 0 -or $ciText -notmatch "device:") {
+  Bad "No OpenCL GPU found ($($ci | Select-Object -First 1))" "Install or update the Intel graphics driver (Intel Arc & Iris Xe Graphics, or Intel Driver & Support Assistant), restart, run setup again."
+}
+$dev = ($ci | Where-Object { $_ -match "device:" } | Select-Object -First 1).Trim()
+Ok $dev
+foreach ($ext in "cl_khr_integer_dot_product", "cl_intel_subgroups", "cl_intel_required_subgroup_size") {
+  if ($ciText -notmatch "$ext\s+yes") { Bad "the GPU driver lacks $ext" "Update the Intel graphics driver." }
+}
+Ok "OpenCL: DP4a (cl_khr_integer_dot_product) and Intel sub-groups available"
+if ($ciText -match "global mem: ([\d.]+) GiB") {
+  Ok "GPU memory: $($Matches[1]) GiB (Intel Graphics Software can change it; each model's context follows it)"
+}
+
+# ---------------------------------------------------------------- 4. models
+Head 4 "Models"
+$hub = if ($env:HF_HUB_CACHE) { $env:HF_HUB_CACHE } elseif ($env:HF_HOME) { Join-Path $env:HF_HOME "hub" } else { Join-Path $env:USERPROFILE ".cache\huggingface\hub" }
+# (not $arcModels: PowerShell names ignore case, and model-catalog.ps1 below sets $ArcModels, the list, over it; the
+#  35b-gsq step then made a folder named after a catalog row; gee456, issue #49)
+$modelDir = Join-Path (Get-AppDir) "models"
+$gsq35 = Join-Path $modelDir "Qwen3.6-35B-A3B-GSQ2-arc.gguf"
+. (Join-Path $root "scripts\model-catalog.ps1")  # (the models, shared with the launcher; downloads without Python)
+# (35b-gsq: the 2-bit GSQ file, converted by bin\convert_gsq.exe: smaller, no MTP; setup's own step)
+$catalog = @($ArcModels) + @([pscustomobject]@{ key = "35b-gsq"; name = "Qwen3.6 35B-A3B 2-bit GSQ (converted)"
+    repo = "ISTA-DASLab/Qwen3.6-35B-A3B-2Bit-GSQ"; gb = 12.6; files = @() })
+# (flash-ar4: in the shared list, scripts\model-catalog.ps1, imported by scripts\autoround.ps1, which the list
+#  dot-sources; not scripts\get-autoround.ps1, whose param block set this script's -Yes to false)
+$ErrorActionPreference = "Continue"
+$listed = @(& (Join-Path $bin "serverz.exe") --list-models 2>$null | ConvertFrom-Json | ForEach-Object { $_ })
+$ErrorActionPreference = "Stop"
+# (in the Hugging Face cache, or anywhere the server finds the same file: a package in .inferzero\zero\models, a
+#  folder of model-dirs.txt; before, a 35B kept as a package was offered for download again)
+function Present($m) {
+  # (a file from before 2026-11-10, keyed arcinferzero.*, is listed as unsupported: converted again)
+  if ($m.key -eq "35b-gsq") { return (Test-Path $gsq35) -and -not ($listed | Where-Object { $_.path -and $_.path -ieq $gsq35 -and -not $_.supported }) }
+  if ($m.key -eq "flash-ar4") { return Test-AutoRound }
+  if (Test-ArcModel $m $hub) { return $true }
+  $main = Split-Path $m.files[0] -Leaf
+  $pkg = $main -replace "-00001-of-\d{5}\.gguf$", ".gguf"  # (a split model kept as a package: one GGUF, Flash Next)
+  return [bool]($listed | Where-Object { $_.supported -and ($_.file -in $main, $pkg -or ($_.path -and (Split-Path $_.path -Leaf) -in $main, $pkg)) })
+}
+foreach ($m in $catalog) { $m | Add-Member have (Present $m) }
+foreach ($m in $catalog) {
+  Write-Host ("  {0} {1,-7} {2,-60} {3,5:N1} GB" -f $(if ($m.have) { "[x]" } else { "[ ]" }), $m.key, $m.name, $m.gb)
+}
+$want = @()
+if ($Models) {
+  # (all: every model but Flash Next, 141 GB of disk: by name only)
+  if ($Models -contains "all") { $want = @($catalog | Where-Object { $_.key -notin "flash", "flash-ar4" } | ForEach-Object { $_.key }) }
+  elseif ($Models -notcontains "none") {
+    foreach ($k in $Models) { if (-not ($catalog | Where-Object { $_.key -eq $k })) { Bad "unknown model '$k'" "use 27b 35b 35b-gsq flash flash-ar4 9b 4b g12 g31 e4b whisper asr, all or none" } }
+    $want = $Models
+  }
+} elseif (-not $Yes) {
+  $a = Read-Host "  Models to download (e.g. '27b 4b whisper asr'; Enter = none)"
+  $want = @(($a -split "[,;\s]+") | Where-Object { $_ } | ForEach-Object { $_.ToLower() })
+  foreach ($k in $want) { if (-not ($catalog | Where-Object { $_.key -eq $k })) { Bad "unknown model '$k'" "use 27b 35b 35b-gsq flash flash-ar4 9b 4b g12 g31 e4b whisper asr" } }
+}
+$todo = @($catalog | Where-Object { $want -contains $_.key -and -not $_.have })
+if ($todo | Where-Object { $_.key -eq "35b-gsq" }) {  # its tokenizer comes from the 4B GGUF
+  $m4 = $catalog | Where-Object { $_.key -eq "4b" }
+  $m4Queued = @($todo | Where-Object { $_.key -eq "4b" }).Count -gt 0
+  if (-not $m4.have -and -not $m4Queued) { Note "the 35B GSQ conversion takes its tokenizer from the 4B model: downloading it too" }
+  # (the 4B first, also when it was asked for: the 35B step reads its GGUF)
+  if (-not $m4.have) { $todo = @($m4) + @($todo | Where-Object { $_.key -ne "4b" }) }
+}
+if ($todo) {
+  # (the 35B GSQ conversion: bin\convert_gsq.exe, of the package or built here from its source)
+  $convert = Join-Path $bin "convert_gsq.exe"
+  if (($todo | Where-Object { $_.key -eq "35b-gsq" }) -and -not (Test-Path $convert)) {
+    & (Join-Path $root "build.ps1") "tools\convert_gsq.cpp" | Out-Host
+    if (-not (Test-Path $convert)) { Bad "bin\convert_gsq.exe could not be built" "take a package from the releases page, or -Models 35b (no conversion)" }
+  }
+  $gb = ($todo | Measure-Object gb -Sum).Sum
+  # (disk: the download and what the first start writes, Flash Next's 56 GB expert file)
+  $need = ($todo | ForEach-Object { if ($_.disk) { $_.disk } else { $_.gb } } | Measure-Object -Sum).Sum
+  # (best effort: Split-Path -Qualifier throws on a UNC or relative cache path, which ended setup; scripts\hf-get.ps1
+  #  checks each download's room again; audit 2026-11-14)
+  $drive = try { Get-PSDrive ((Split-Path $hub -Qualifier -ErrorAction Stop).TrimEnd(":")) -ErrorAction Stop } catch { $null }
+  if ($drive -and $drive.Free / 1GB -lt $need + 5) { Bad ("not enough disk space: {0:N0} GB needed, {1:N0} GB free on {2}:" -f ($need + 5), ($drive.Free / 1GB), $drive.Name) }
+  if (-not $Yes -and -not $Models) { if (-not (Ask ("Download {0} ({1:N1} GB)?" -f (($todo | ForEach-Object { $_.key }) -join ", "), $gb))) { $todo = @() } }
+  foreach ($m in $todo) {
+    Write-Host "  downloading $($m.key): $($m.repo)"
+    if ($m.key -eq "flash-ar4") {
+      try { $null = Install-AutoRound -Yes:$Yes } catch { Bad "the AutoRound import failed" "$_" }
+    } elseif ($m.key -eq "35b-gsq") {
+      # (the whole checkpoint, every file of the repository, by scripts\hf-get.ps1: what huggingface_hub's
+      #  snapshot_download took before 2026-11-15)
+      try {
+        $tok = Get-HfToken; $hh = @{}; if ($tok) { $hh.Authorization = "Bearer $tok" }
+        $files = @(Invoke-RestMethod "https://huggingface.co/api/models/$($m.repo)/tree/main?recursive=1" -Headers $hh -TimeoutSec 60 |
+            ForEach-Object { $_ } | Where-Object { $_.type -eq "file" } | ForEach-Object { $_.path })
+        $snap = Get-HfFiles $m.repo $files
+      } catch { Bad "download failed: $($m.repo)" "$_" }
+      $vocab = (Get-ChildItem $hub -Recurse -Filter "Qwen3.5-4B-UD-Q4_K_XL.gguf" | Select-Object -First 1).FullName
+      New-Item -ItemType Directory -Force $modelDir | Out-Null
+      Write-Host "  converting to $gsq35 (about 3 minutes)..."
+      & $convert $snap $gsq35 --vocab-from $vocab
+      if ($LASTEXITCODE -ne 0) { Bad "conversion failed" }
+    } else {
+      try { $null = Install-ArcModel $m } catch { Bad "download failed: $($m.repo)" "$_" }
+    }
+    Ok "$($m.key) downloaded"
+  }
+}
+# what the server finds, with each model's context for the current GPU memory (computed in seconds, remembered)
+$ErrorActionPreference = "Continue"
+$found = @(& (Join-Path $bin "serverz.exe") --list-models 2>$null | ConvertFrom-Json | ForEach-Object { $_ }) | Where-Object { $_.supported }
+$ErrorActionPreference = "Stop"
+if ($found) {
+  Write-Host "  The server finds:"
+  foreach ($f in $found) { Write-Host ("    {0,-32} context {1,7:N0} tokens   ({2})" -f $f.alias, $f.ctx, $f.name) }
+} else {
+  Note "no model yet: run setup again with -Models (e.g. setup -Models 4b)"
+}
+
+# ---------------------------------------------------------------- 5. Pi
+Head 5 "Pi"
+if ($NoPi) { Ok "skipped (-NoPi)" }
+elseif (-not $hasPi) { Note "Pi not installed: https://pi.dev; afterwards run setup again (or scripts\install-pi.ps1)" }
+else {
+  $ErrorActionPreference = "Continue"
+  $out = @(& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root "scripts\install-pi.ps1") 2>&1 | ForEach-Object { "$_" })
+  $code = $LASTEXITCODE
+  $ErrorActionPreference = "Stop"
+  if ($code -ne 0) { $out | ForEach-Object { Write-Host "        $_" }; Bad "connecting Pi failed" }
+  $out | Where-Object { $_.Trim() } | ForEach-Object { Ok $_ }
+}
+# zero-server without Pi: this folder's zero-server.cmd, on the user's PATH when they agree (Pi's own bin folder already
+# has a zero-server.cmd)
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+$onPath = @("$userPath;$env:Path" -split ';' | Where-Object { $_ -and $_.TrimEnd('\') -ieq $root.TrimEnd('\') }).Count -gt 0
+if (-not ($hasPi -and -not $NoPi) -and -not $onPath -and (Test-Path (Join-Path $root "zero-server.cmd"))) {
+  if (Ask "Add $root to your PATH, so 'zero-server' works in every new terminal?") {
+    [Environment]::SetEnvironmentVariable("Path", $(if ($userPath) { $userPath.TrimEnd(';') + ";$root" } else { $root }), "User")
+    Ok "zero-server added to PATH (new terminals; remove it in Settings > System > About > Advanced > Environment Variables)"
+  } else { Ok "zero-server: run it as $root\zero-server.cmd" }
+} elseif ($onPath) { Ok "zero-server: $root is on PATH" }
+
+# ---------------------------------------------------------------- 6. regression tests
+Head 6 "Regression tests"
+if (-not $Tests) { Ok "skipped (setup -Tests runs them: kernels, tokenizer, templates, accuracy vs f32, MTP, API)" }
+elseif ($prebuilt) { Note "the tests build their own tools: setup -Rebuild -Tests (needs Visual Studio's C++ compiler)" }
+else {
+  $m4 = (Get-ChildItem $hub -Recurse -Filter "Qwen3.5-4B-UD-Q4_K_XL.gguf" -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
+  if (-not $m4) { Note "the tests need the 4B model: setup -Models 4b -Tests" }
+  else {
+    [string[]]$tools = @("tools\tok_test.cpp", "tools\chat_render.cpp", "tools\ref_forward.cpp", "tools\tool_stream_test.cpp",
+                         "tests\test_http.cpp", "tests\test_api_compat.cpp", "tests\test_xcache_pools.cpp", "tests\test_sampler.cpp",
+                         "tests\test_hc.cpp", "tests\test_quant_rows.cpp", "tests\test_web_tools.cpp",
+                         "tests\test_gguf_pack.cpp", "tests\test_json.cpp", "tests\test_fa.cpp",
+                         "tests\test_route.cpp", "tests\test_chat_store.cpp", "tests\test_doc_read.cpp",
+                         "tests\test_office.cpp", "tests\test_pdf_scan.cpp", "tests\test_audio.cpp")
+    Write-Host "  building the test tools..."
+    Build $tools
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root "scripts\zero-server.ps1") stop | Out-Null  # (GPU memory)
+    $g = (Get-ChildItem $hub -Recurse -Filter "gemma-4-12b-it-qat-q4_0.gguf" -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
+    $targs = @{ Model4B = $m4 }; if ($g) { $targs.ModelGemma = $g }
+    Push-Location $root
+    try { & (Join-Path $root "tests\run_tests.ps1") @targs } finally { Pop-Location }
+  }
+}
+
+# ---------------------------------------------------------------- done
+Write-Host ""
+Write-Host "Done." -ForegroundColor Green
+if ($hasPi -and -not $NoPi) {
+  Write-Host "  Open a new terminal, go to a project folder and run:  zero-pi        (zero-pi --help: all options)"
+}
+Write-Host "  The easiest start: double-click zero-launcher.cmd (choose a model, Start: the web UI opens in the browser;"
+Write-Host "  'Get models' downloads more)."
+Write-Host "  Server without Pi:  zero-server start   (web UI http://127.0.0.1:8090/, API http://127.0.0.1:8090/v1;"
+Write-Host "  not on PATH: $root\zero-server.cmd; zero-server help lists list, logs, doctor, pull, presets, -DryRun)"
+Write-Host "  The first start of a model compiles its GPU kernels once (a minute or two)."

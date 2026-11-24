@@ -1,0 +1,706 @@
+// Minimal HTTP/1.1 server: one thread per connection, keep-alive, CORS, and server-sent events. The sockets go through
+// src/platform_net.h (Winsock2 on Windows, as before; BSD sockets on Linux), the media files through plat::SeqFile.
+#pragma once
+#include "platform_net.h"  // (first: winsock2.h before windows.h)
+#include "platform.h"
+#include <algorithm>
+#include <chrono>
+#include <atomic>
+#include <cctype>
+#include <charconv>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <map>
+#include <string>
+#include <thread>
+
+struct HttpRequest {
+  std::string method, path, query, body;
+  std::map<std::string, std::string> headers;  // lower-case keys
+  bool local_peer = false;  // (the connection comes from this machine: 127.x.x.x or ::1, whatever the Host header says)
+  bool remote = false;  // (a signed-in remote request through a tunnel: tools/server_remote.h, HttpServer::gate)
+  bool foreign = false;  // (from a page of another local server, let through by foreign_ok: the model API only)
+  std::string peer;     // (the client's address, for the log: 127.0.0.1, 192.168.1.20)
+  std::string header(const std::string& k) const {
+    auto it = headers.find(k);
+    return it == headers.end() ? "" : it->second;
+  }
+};
+
+class HttpResponse {
+ public:
+  explicit HttpResponse(plat::socket_t s) : s_(s) {}
+  // Only a page served from this machine may read a response cross-origin (see HttpServer::serve_requests).
+  std::string cors_origin;
+  // Taps: another API format served by the same handler (the server's Ollama / Anthropic / Responses endpoints run
+  // its OpenAI chat handler): with on_send set a complete response goes there instead of the socket, with on_event
+  // set the handler's server-sent events do (sse_begin then writes nothing; the tap writes its own stream).
+  std::function<void(int status, const std::string& body)> on_send;
+  std::function<bool(const std::string& data)> on_event;
+  // further header lines for send() (each ending in \r\n), e.g. Content-Disposition for a download
+  std::string extra;
+  // every reply: the browser takes Content-Type as given (a JSON or text reply is never run as a script or page);
+  // not twice when `extra` has it already (/files/<id>)
+  std::string nosniff() const {
+    return extra.find("X-Content-Type-Options") == std::string::npos ? "X-Content-Type-Options: nosniff\r\n" : "";
+  }
+  // A stream of another kind (application/x-ndjson, or named server-sent events): headers, then write().
+  void begin_stream(const std::string& content_type) {
+    status_ = 200;
+    std::string h = "HTTP/1.1 200 OK\r\nContent-Type: " + content_type + "\r\nCache-Control: no-cache\r\n";
+    h += cors();
+    h += "Connection: close\r\n\r\n";
+    raw(h);
+    streaming_ = true;
+  }
+  bool write(const std::string& d) { return raw(d); }
+  // Complete response with a body.
+  void send(int status, const std::string& content_type, const std::string& body) {
+    status_ = status;
+    // (for the log only, never stops the reply; cleared by a later success: an inner request answered on the same
+    //  response (the file tools') must not leave its error on the outer reply's line)
+    if (status >= 400) {
+      try { err_ = error_text(body); } catch (const std::exception&) {}
+    } else {
+      err_.clear();
+    }
+    if (on_send) {
+      done_ = true;
+      on_send(status, body);
+      return;
+    }
+    std::string h = "HTTP/1.1 " + std::to_string(status) + " " + reason(status) + "\r\n";
+    h += "Content-Type: " + content_type + "\r\n";
+    h += "Content-Length: " + std::to_string(body.size()) + "\r\n";
+    h += cors();
+    h += nosniff();
+    h += extra;
+    h += close_after ? "Connection: close\r\n\r\n" : "Connection: keep-alive\r\n\r\n";
+    raw(h);
+    if (!no_body) raw(body);
+    done_ = true;
+  }
+  bool no_body = false;      // (a HEAD request: the headers only, or the body would be read as the next reply on this connection)
+  bool close_after = false;  // (the connection closes after this reply: said so, not keep-alive; BUGS.md 7)
+  // A file, or the one byte range a Range header asks for ("bytes=a-b", "bytes=a-", "bytes=-n": 206 with
+  // Content-Range; past the end: 416), read and sent 1 MB at a time (media of gigabytes for a <video> that seeks).
+  // The file is opened shared for writing and deleting: one being played can still be replaced or deleted (a <video>
+  // that pauses keeps its request, and so the file, open for a minute).
+  void send_file(const std::filesystem::path& p, const std::string& content_type, const std::string& range) {
+    plat::SeqFile fh;
+    if (!fh.open(p)) return send(404, "text/plain", "not found");
+    uint64_t size = 0;
+    if (!fh.size(size)) return send(404, "text/plain", "not found");
+    uint64_t a = 0, b = size;  // [a, b)
+    bool part = false;
+    if (range.rfind("bytes=", 0) == 0 && range.find(',') == std::string::npos) {
+      const std::string r = range.substr(6);
+      const size_t dash = r.find('-');
+      auto num = [](const std::string& s, uint64_t& v) {
+        if (s.empty()) return false;
+        const auto res = std::from_chars(s.data(), s.data() + s.size(), v);
+        return res.ec == std::errc() && res.ptr == s.data() + s.size();
+      };
+      auto unsatisfiable = [&]() {
+        extra += "Content-Range: bytes */" + std::to_string(size) + "\r\n";
+        send(416, "text/plain", "range not satisfiable");
+      };
+      uint64_t x = 0, y = 0;
+      const std::string l = dash == std::string::npos ? r : r.substr(0, dash);
+      const std::string rr = dash == std::string::npos ? "" : r.substr(dash + 1);
+      if (dash != std::string::npos && l.empty() && num(rr, y)) {  // the last y bytes
+        if (y == 0 || size == 0) return unsatisfiable();
+        a = size - std::min(y, size);
+        part = true;
+      } else if (dash != std::string::npos && num(l, x) && (rr.empty() || (num(rr, y) && y >= x))) {
+        if (x >= size) return unsatisfiable();
+        a = x;
+        b = rr.empty() || y >= size ? size : y + 1;  // (y + 1 not taken past the end: it wraps at 2^64 - 1)
+        part = true;
+      }
+    }
+    status_ = part ? 206 : 200;
+    std::string h = std::string("HTTP/1.1 ") + (part ? "206 Partial Content" : "200 OK") + "\r\n";
+    h += "Content-Type: " + content_type + "\r\n";
+    h += "Content-Length: " + std::to_string(b - a) + "\r\nAccept-Ranges: bytes\r\n";
+    if (part) h += "Content-Range: bytes " + std::to_string(a) + "-" + std::to_string(b - 1) + "/" + std::to_string(size) + "\r\n";
+    h += cors();
+    h += nosniff();
+    h += extra;
+    h += close_after ? "Connection: close\r\n\r\n" : "Connection: keep-alive\r\n\r\n";
+    raw(h);
+    fh.seek(a);
+    std::string buf(1 << 20, '\0');
+    for (uint64_t left = b - a; left > 0 && ok_;) {
+      const size_t n = (size_t)std::min<uint64_t>(left, buf.size());
+      const size_t got = fh.read(buf.data(), n);
+      if (got == 0) { ok_ = false; break; }  // (the file shrank: the length promised cannot be kept)
+      raw(got == buf.size() ? buf : buf.substr(0, got));
+      left -= got;
+    }
+    done_ = true;
+  }
+  // Server-sent events: begin, then write events, then end (the connection is closed afterwards).
+  void sse_begin() {
+    status_ = 200;
+    if (on_event) return;
+    std::string h = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n";
+    h += cors();
+    h += "Connection: close\r\n\r\n";
+    raw(h);
+    streaming_ = true;
+  }
+  bool sse_event(const std::string& data) { return on_event ? on_event(data) : raw("data: " + data + "\n\n"); }
+  bool sse_comment(const std::string& text) { return on_event ? ok_ : raw(": " + text + "\n\n"); }
+  void sse_end() { done_ = true; }
+  bool streaming() const { return streaming_; }
+  // a response with no socket of its own (an inner request, e.g. one OCR page): asked whether the outer client left
+  std::function<bool()> gone_hook;
+  bool done() const { return done_; }
+  bool alive() const { return ok_; }
+  // (for the log: the status sent, 0 = none; the bytes written to the socket; an error reply's message)
+  int status() const { return status_; }
+  size_t bytes() const { return bytes_; }
+  const std::string& error() const { return err_; }
+  // an error body's "message" (the JSON error form), else its start, one line of at most 300 characters
+  static std::string error_text(const std::string& body) {
+    std::string m;
+    const size_t k = body.find("\"message\"");
+    if (k != std::string::npos) {
+      size_t q = body.find('"', body.find(':', k) + 1);
+      if (q != std::string::npos)
+        for (size_t i = q + 1; i < body.size() && body[i] != '"' && m.size() < 300; ++i) {
+          if (body[i] == '\\' && i + 1 < body.size()) ++i;
+          m += body[i];
+        }
+    }
+    if (m.empty()) m = body.substr(0, 300);
+    for (char& ch : m)
+      if (ch == '\n' || ch == '\r') ch = ' ';
+    return m;
+  }
+  // The client closed the connection (or it broke) while the response is being prepared, e.g. Pi's Esc: the request
+  // was read completely, so the socket becomes readable only with the end of the stream (or a reset). Polled
+  // without blocking or writing anything (microseconds).
+  bool client_gone() {
+    if (!ok_) return true;
+    if (gone_hook && gone_hook()) return !(ok_ = false);
+    if (s_ == plat::kNoSocket) return false;
+    if (plat::sock_peer_gone(s_)) ok_ = false;
+    return !ok_;
+  }
+
+ private:
+  plat::socket_t s_;
+  bool done_ = false, streaming_ = false, ok_ = true;
+  int status_ = 0;
+  size_t bytes_ = 0;
+  std::string err_;
+  std::string cors() const {
+    if (cors_origin.empty()) return "";
+    return "Access-Control-Allow-Origin: " + cors_origin + "\r\nVary: Origin\r\n" +
+           "Access-Control-Allow-Headers: Content-Type, Authorization\r\n" +
+           "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n";
+  }
+  static const char* reason(int s) {
+    switch (s) {
+      case 200: return "OK"; case 204: return "No Content"; case 301: return "Moved Permanently"; case 400: return "Bad Request"; case 403: return "Forbidden";
+      case 404: return "Not Found"; case 405: return "Method Not Allowed"; case 408: return "Request Timeout"; case 409: return "Conflict";
+      case 413: return "Payload Too Large"; case 415: return "Unsupported Media Type"; case 416: return "Range Not Satisfiable";
+      case 429: return "Too Many Requests"; case 500: return "Internal Server Error"; case 502: return "Bad Gateway";
+      case 507: return "Insufficient Storage";
+      case 503: return "Service Unavailable"; default: return "OK";
+    }
+  }
+  bool raw(const std::string& d) {
+    size_t off = 0;
+    while (ok_ && off < d.size()) {
+      const int n = plat::sock_send(s_, d.data() + off, (int)std::min<size_t>(d.size() - off, 1 << 20));
+      if (n <= 0) { ok_ = false; break; }
+      off += n;
+    }
+    bytes_ += off;
+    return ok_;
+  }
+};
+
+class HttpServer {
+ public:
+  using Handler = std::function<void(const HttpRequest&, HttpResponse&)>;
+  Handler handler;
+  // (remote access, tools/server_remote.h: before the host and origin checks; 0 = not remote, the usual checks;
+  //  1 = answered there; 2 = a signed-in remote request, to the handler with rq.remote set)
+  std::function<int(HttpRequest&, HttpResponse&)> gate;
+  // (the same, from the request line and headers alone, before the body is read: "" = go on, else a 401 and the
+  //  connection closed)
+  std::function<std::string(const HttpRequest&)> head_gate;
+  // (after each request the handler answered: the log's access line, the metrics; ms from the handler's start)
+  std::function<void(const HttpRequest&, const HttpResponse&, double ms)> on_done;
+
+  // host may be an IPv4 / IPv6 literal or a name (localhost). An unknown host is an error: it must never silently
+  // become INADDR_ANY (that exposed the server on every interface when --host was mistyped).
+  bool listen(const std::string& host, int port) {
+    loopback_ = local_host(host);
+    if (!plat::net_init()) return false;
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    addrinfo* ai = nullptr;
+    const std::string service = std::to_string(port);
+    if (getaddrinfo(host.c_str(), service.c_str(), &hints, &ai) != 0 || !ai) return false;
+    for (addrinfo* a = ai; a; a = a->ai_next) {
+      ls_ = plat::sock_open(a->ai_family, a->ai_socktype, a->ai_protocol);
+      if (ls_ == plat::kNoSocket) continue;
+      plat::sock_flag(ls_, SOL_SOCKET, SO_REUSEADDR);
+      if (a->ai_family == AF_INET6) {  // (::1: no need to accept IPv4 on the same socket)
+        plat::sock_flag(ls_, IPPROTO_IPV6, IPV6_V6ONLY);
+      }
+      if (plat::sock_bind_listen(ls_, a->ai_addr, (size_t)a->ai_addrlen, 64)) break;
+      plat::sock_close(ls_);
+      ls_ = plat::kNoSocket;
+    }
+    freeaddrinfo(ai);
+    return ls_ != plat::kNoSocket;
+  }
+
+  void run() {
+    while (true) {
+      plat::socket_t c = plat::sock_accept(ls_);
+      if (c == plat::kNoSocket) {  // (out of sockets or memory, a network change: tried again shortly, not in a busy loop)
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        continue;
+      }
+      if (conns_.fetch_add(1) >= kMaxConns) {  // (each connection may hold a body of up to 256 MiB)
+        conns_.fetch_sub(1);
+        plat::sock_close(c);
+        continue;
+      }
+      try {
+        std::thread([this, c] {
+          serve(c);
+          conns_.fetch_sub(1);
+        }).detach();
+      } catch (...) {
+        conns_.fetch_sub(1);
+        plat::sock_close(c);
+      }
+    }
+  }
+
+ private:
+  plat::socket_t ls_ = plat::kNoSocket;
+  std::atomic<int> conns_{0};
+  std::atomic<size_t> body_bytes_{0};  // (request bodies being read or handled now, see kBodyBudget)
+  bool loopback_ = false;  // (bound to this machine only: requests must name it in Host, see serve)
+  static constexpr int kMaxConns = 64;
+  static constexpr size_t kMaxBody = 256u << 20;  // (base64 images and audio; larger requests get 413)
+  static constexpr size_t kBodyBudget = 1ull << 30;  // all connections' bodies at once (more: 503)
+  static constexpr size_t kMaxHead = 1u << 20;    // request line + headers; a body may follow
+
+  // http://127.0.0.1:PORT, http://localhost:PORT, http://[::1]:PORT (any port / pathless origin)
+  static bool local_origin(const std::string& origin) {
+    std::string o = origin;
+    std::transform(o.begin(), o.end(), o.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+    if (o.compare(0, 7, "http://") != 0) return false;  // (https on a local port is not served here)
+    o.erase(0, 7);
+    // (an IPv6 literal: up to its ']', the ':' inside it is not the port's; then only a port or a path may follow)
+    size_t e = o.find_first_of(":/");
+    if (!o.empty() && o[0] == '[') {
+      e = o.find(']');
+      if (e == std::string::npos || (e + 1 < o.size() && o[e + 1] != ':' && o[e + 1] != '/')) return false;
+      ++e;
+    }
+    const std::string h = o.substr(0, e);
+    return h == "127.0.0.1" || h == "localhost" || h == "[::1]" || h == "::1";
+  }
+  // a Host header's host part, lower case, without the port
+  static std::string host_part(const std::string& host) {
+    std::string h = host;
+    std::transform(h.begin(), h.end(), h.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+    if (!h.empty() && h[0] == '[') h = h.substr(0, h.find(']') + 1);
+    else if (std::count(h.begin(), h.end(), ':') == 1) h = h.substr(0, h.find(':'));
+    return h;
+  }
+  // four decimal parts 0-255: "127.0.0.1" yes, "127.0.0.1.evil.com" no
+  static bool ipv4_literal(const std::string& h) {
+    int parts = 0;
+    for (size_t i = 0; i <= h.size(); ++parts) {
+      const size_t e = std::min(h.find('.', i), h.size());
+      if (e == i || e - i > 3) return false;
+      int v = 0;
+      for (size_t k = i; k < e; ++k) {
+        if (!isdigit((unsigned char)h[k])) return false;
+        v = v * 10 + (h[k] - '0');
+      }
+      if (v > 255) return false;
+      i = e + 1;
+      if (e == h.size()) { ++parts; break; }
+    }
+    return parts == 4;
+  }
+  // a Host header (or a bind address) naming this machine: localhost, 127.x.x.x or [::1], with or without a port.
+  // (A literal address only: a name that only starts like one, "127.0.0.1.evil.com", is another site's, whose DNS
+  //  can point at this machine: DNS rebinding.)
+  static bool local_host(const std::string& host) {
+    const std::string h = host_part(host);
+    return h == "localhost" || (ipv4_literal(h) && h.rfind("127.", 0) == 0) || h == "[::1]" || h == "::1";
+  }
+  // a Host header that is an address (or localhost), not a DNS name: what a server opened to the network (--host)
+  // accepts, as a rebinding attack needs a name of its own that resolves to this machine
+  static bool address_host(const std::string& host) {
+    const std::string h = host_part(host);
+    if (h == "localhost" || ipv4_literal(h)) return true;
+    if (h.size() < 3 || h.front() != '[' || h.back() != ']') return false;
+    return h.find_first_not_of("0123456789abcdef:.", 1) == h.size() - 1;  // ([ipv6], v4-mapped included)
+  }
+  // the page the server itself served (the web UI opened from another device with --host): Origin = http://<Host>
+  static bool same_origin(const std::string& origin, const std::string& host) {
+    if (host.empty()) return false;
+    std::string o = origin, h = "http://" + host;
+    for (std::string* x : {&o, &h})
+      std::transform(x->begin(), x->end(), x->begin(), [](unsigned char c) { return (char)std::tolower(c); });
+    return o == h;
+  }
+  // What a page served by another local server (http://localhost:<another port>: another tool's web UI, any page a
+  // local program serves) may ask of this one: the model API (reads, and generation: chat, completions, messages,
+  // responses, Ollama's, tokenize, audio transcription). Never the server's tools (run_command runs PowerShell, the
+  // file tools write), its settings (slots, the session cache) or the user's chats, files and transcripts: those
+  // only from the server's own page (Origin = http://<Host>) or a client that sends no Origin (Pi, curl, scripts).
+  // An OPTIONS preflight is judged by the method it announces.
+  static bool foreign_ok(const HttpRequest& rq) {
+    const std::string& p = rq.path;
+    auto under = [&](const char* pre) {
+      const size_t n = strlen(pre);
+      return p.compare(0, n, pre) == 0 && (p.size() == n || p[n] == '/');
+    };
+    for (const char* pre : {"/v1/files", "/files", "/v1/chats", "/v1/transcripts", "/v1/live", "/v1/tools", "/v1/server", "/sessions",
+                            "/v1/memory", "/v1/projects", "/v1/remote", "/v1/mcp"})
+      if (under(pre)) return false;
+    const std::string m = rq.method == "OPTIONS" ? rq.header("access-control-request-method") : rq.method;
+    if (m == "GET" || m == "HEAD") return true;
+    if (m != "POST") return false;
+    static const char* const gen[] = {"/v1/chat/completions", "/chat/completions", "/v1/completions", "/completions",
+                                      "/v1/messages", "/messages", "/v1/messages/count_tokens", "/messages/count_tokens",
+                                      "/v1/responses", "/responses", "/api/chat", "/api/generate", "/api/show",
+                                      "/tokenize", "/v1/audio/transcriptions", "/v1/audio/translations"};
+    for (const char* g : gen)
+      if (p == g) return true;
+    return false;
+  }
+
+  // A non-negative integer (decimal, or hex for chunk sizes, which may carry ";extensions"), else false.
+  static bool parse_size(std::string v, int base, size_t& out) {
+    if (base == 16) v = v.substr(0, v.find(';'));
+    const size_t a = v.find_first_not_of(" \t"), b = v.find_last_not_of(" \t");
+    if (a == std::string::npos) return false;
+    const char *f = v.data() + a, *l = v.data() + b + 1;
+    const auto r = std::from_chars(f, l, out, base);
+    return r.ec == std::errc() && r.ptr == l;
+  }
+  // the access line's hook for a request answered outside run_handler (the gate, OPTIONS); never throws
+  void done_hook(const HttpRequest& rq, const HttpResponse& rs, double ms) noexcept {
+    if (!on_done) return;
+    try {
+      on_done(rq, rs, ms);
+    } catch (const std::exception& ex_) { LOG_WRN("inferzero: the access line failed: %s\n", ex_.what()); } catch (...) { LOG_WRN("inferzero: the access line failed\n"); }
+  }
+  // (refused before a handler: logged here, a warning: the request is not one the server reads)
+  static void reply_close(plat::socket_t c, int status, const char* msg) {
+    LOG_WRN("HTTP %d, connection closed: %s\n", status, msg);
+    HttpResponse rs(c);
+    rs.close_after = true;
+    rs.send(status, "application/json", std::string("{\"error\":{\"message\":\"") + msg + "\"}}");
+    plat::sock_close(c);
+  }
+
+  // One connection: requests until it closes. Nothing may escape this thread (it is detached: an exception would
+  // end the whole server), so malformed requests get 400 / 413 and the connection is closed.
+  void serve(plat::socket_t c) {
+    try {
+      serve_requests(c);
+    } catch (...) {
+      plat::sock_close(c);
+    }
+  }
+  void serve_requests(plat::socket_t c) {
+    const unsigned tmo = 600000;
+    plat::sock_recv_timeout(c, tmo);
+    // a client that stops reading (half-open connection, stalled proxy) must not hold the engine: sends give up
+    // after 60 s, the response is then dead and the generation stops at the next token
+    plat::sock_send_timeout(c, 60000);
+    plat::sock_flag(c, IPPROTO_TCP, TCP_NODELAY);  // (streamed tokens go out at once)
+    bool local_peer = false;
+    std::string peer;  // (the client's address, for the log)
+    {
+      sockaddr_storage sa{};
+      if (plat::sock_peer(c, sa)) {
+        char pb[64] = "";
+        if (sa.ss_family == AF_INET) inet_ntop(AF_INET, &((sockaddr_in*)&sa)->sin_addr, pb, sizeof pb);
+        else if (sa.ss_family == AF_INET6) inet_ntop(AF_INET6, &((sockaddr_in6*)&sa)->sin6_addr, pb, sizeof pb);
+        peer = pb;
+        if (sa.ss_family == AF_INET) local_peer = (ntohl(((sockaddr_in*)&sa)->sin_addr.s_addr) >> 24) == 127;
+        else if (sa.ss_family == AF_INET6) {
+          const unsigned char* a6 = ((sockaddr_in6*)&sa)->sin6_addr.s6_addr;
+          static const unsigned char lo[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1},
+                                     v4map[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+          local_peer = memcmp(a6, lo, 16) == 0 || (memcmp(a6, v4map, 12) == 0 && a6[12] == 127);
+        }
+      }
+    }
+    std::string buf;
+    char tmp[65536];
+    while (true) {
+      // read headers. An idle keep-alive connection may wait 600 s for its next request; once a request has begun,
+      // each read gets 30 s and the headers 60 s in all (a client that trickles them in, slowloris, cannot hold one
+      // of the 64 connections for long)
+      size_t he;
+      plat::sock_recv_timeout(c, tmo);
+      auto t_head = std::chrono::steady_clock::now();
+      bool begun = !buf.empty();
+      if (begun) {
+        plat::sock_recv_timeout(c, 30000);
+      }
+      size_t searched = 0;  // (the end of the headers looked for from the new bytes on, not from 0 each read)
+      while ((he = buf.find("\r\n\r\n", searched)) == std::string::npos) {
+        searched = buf.size() > 3 ? buf.size() - 3 : 0;
+        const int n = plat::sock_recv(c, tmp, (int)sizeof tmp);
+        if (n <= 0) { plat::sock_close(c); return; }
+        buf.append(tmp, n);
+        if (buf.size() > kMaxHead) { plat::sock_close(c); return; }
+        if (!begun) {
+          begun = true;
+          t_head = std::chrono::steady_clock::now();
+          plat::sock_recv_timeout(c, 30000);
+        } else if (std::chrono::steady_clock::now() - t_head > std::chrono::seconds(60)) {
+          plat::sock_close(c);
+          return;
+        }
+      }
+      HttpRequest rq;
+      rq.local_peer = local_peer;
+      rq.peer = peer;
+      const std::string head = buf.substr(0, he);
+      size_t p = head.find("\r\n");
+      const std::string line = head.substr(0, p);
+      // (a control byte in the request line (a bare line feed, an escape) is refused: the method and the path go into
+      //  the log and the metrics, where it would write lines or console codes of its own; audit 2026-11-12b #2)
+      for (const char ch : line)
+        if (((unsigned char)ch < 0x20 && ch != ' ') || ch == 0x7f) return reply_close(c, 400, "control character in the request line");
+      const size_t s1 = line.find(' '), s2 = s1 == std::string::npos ? s1 : line.find(' ', s1 + 1);
+      if (s2 == std::string::npos) return reply_close(c, 400, "malformed request line");
+      rq.method = line.substr(0, s1);
+      const std::string version = line.substr(s2 + 1);
+      std::string target = line.substr(s1 + 1, s2 - s1 - 1);
+      const size_t q = target.find('?');
+      rq.path = target.substr(0, q);
+      if (q != std::string::npos) rq.query = target.substr(q + 1);
+      while (p != std::string::npos && p < head.size()) {
+        const size_t e = head.find("\r\n", p + 2);
+        const std::string hl = head.substr(p + 2, (e == std::string::npos ? head.size() : e) - p - 2);
+        const size_t colon = hl.find(':');
+        if (colon != std::string::npos) {
+          std::string k = hl.substr(0, colon), v = hl.substr(colon + 1);
+          std::transform(k.begin(), k.end(), k.begin(), [](unsigned char ch) { return (char)std::tolower(ch); });
+          v.erase(0, v.find_first_not_of(' '));
+          // (two lengths that differ: a proxy in front may have read the body by the other one, request smuggling)
+          if (k == "content-length" && rq.headers.count(k) && rq.headers[k] != v)
+            return reply_close(c, 400, "conflicting Content-Length headers");
+          rq.headers[k] = v;
+        }
+        p = e;
+      }
+      buf.erase(0, he + 4);
+      if (head_gate) {
+        std::string why;
+        try { why = head_gate(rq); } catch (...) { why = "server error"; }
+        if (!why.empty()) return reply_close(c, 401, why.c_str());
+      }
+      // body. The bodies of all connections together stay within kBodyBudget (64 connections x 256 MiB would be
+      // 16 GiB): a request past it gets 503; its share is given back once it is answered
+      struct BodyHold {
+        std::atomic<size_t>& total;
+        size_t n = 0;
+        bool add(size_t k) {
+          if (total.fetch_add(k) + k > kBodyBudget) {
+            total.fetch_sub(k);
+            return false;
+          }
+          n += k;
+          return true;
+        }
+        ~BodyHold() { total.fetch_sub(n); }
+      } hold{body_bytes_};
+      // (a total deadline for the body, as the headers have one: 60 s plus 10 s per MiB of it, at least 100 KB/s; each
+      //  read only had 30 s, re-armed every read, so a client sending a byte every 29 s held a connection, one of 64,
+      //  for hours (audit 2026-11-12 #14). An upload slower than 100 KB/s over its whole length is cut too)
+      const auto t_body = std::chrono::steady_clock::now();
+      auto body_late = [&](size_t bytes) {
+        return std::chrono::steady_clock::now() - t_body > std::chrono::seconds(60 + 10 * (long long)(bytes >> 20));
+      };
+      // (both framings: refused, as RFC 9112 advises, instead of taking one and reading the rest as another request)
+      if (rq.headers.count("transfer-encoding") && rq.headers.count("content-length"))
+        return reply_close(c, 400, "Transfer-Encoding and Content-Length together");
+      std::string coding = rq.header("transfer-encoding");  // (case-insensitive: "Chunked" is the same coding)
+      std::transform(coding.begin(), coding.end(), coding.begin(), [](unsigned char ch) { return (char)std::tolower(ch); });
+      while (!coding.empty() && (coding.back() == ' ' || coding.back() == '\t')) coding.pop_back();
+      // (another coding: a body this server cannot decode, or whose length it does not know; refused, as RFC 9112 says)
+      if (rq.headers.count("transfer-encoding") && coding != "chunked")
+        return reply_close(c, 400, "unsupported Transfer-Encoding (chunked only)");
+      if (!coding.empty()) {
+        // (p: the bytes of buf already taken; buf is cut only every 64 KB: an erase per chunk moved the rest of the
+        //  buffer each time, and a body of 1-byte chunks cost ~350 MB of copying per read, audit 2026-11-18)
+        size_t p = 0;
+        while (true) {
+          if (p > 65536) buf.erase(0, p), p = 0;
+          size_t le;
+          while ((le = buf.find("\r\n", p)) == std::string::npos) {
+            if (buf.size() - p > 4096) return reply_close(c, 400, "chunk size line too long");
+            const int n = plat::sock_recv(c, tmp, (int)sizeof tmp);
+            if (n <= 0) { plat::sock_close(c); return; }
+            buf.append(tmp, n);
+            if (body_late(rq.body.size())) return reply_close(c, 408, "request body too slow");
+          }
+          size_t len = 0;
+          if (!parse_size(buf.substr(p, le - p), 16, len)) return reply_close(c, 400, "malformed chunk size");
+          if (len > kMaxBody || rq.body.size() + len > kMaxBody) return reply_close(c, 413, "request body too large");
+          if (!hold.add(len)) return reply_close(c, 503, "the server is receiving too much at once; try again");
+          if (len == 0) {  // the last chunk: optional trailer lines (ignored), then an empty line
+            size_t te;
+            while ((te = buf.find("\r\n\r\n", le)) == std::string::npos) {
+              if (buf.size() > le + 65536) return reply_close(c, 400, "chunk trailers too long");
+              const int n = plat::sock_recv(c, tmp, (int)sizeof tmp);
+              if (n <= 0) { plat::sock_close(c); return; }
+              buf.append(tmp, n);
+              if (body_late(rq.body.size())) return reply_close(c, 408, "request body too slow");
+            }
+            buf.erase(0, te + 4);  // (what follows is the next request's)
+            break;
+          }
+          while (buf.size() < le + 2 + len + 2) {
+            const int n = plat::sock_recv(c, tmp, (int)sizeof tmp);
+            if (n <= 0) { plat::sock_close(c); return; }
+            buf.append(tmp, n);
+            if (body_late(rq.body.size() + len)) return reply_close(c, 408, "request body too slow");
+          }
+          if (buf.compare(le + 2 + len, 2, "\r\n") != 0) return reply_close(c, 400, "malformed chunk (no CRLF after its data)");
+          rq.body.append(buf, le + 2, len);
+          p = le + 2 + len + 2;
+        }
+      } else {
+        size_t len = 0;
+        if (rq.headers.count("content-length") && !parse_size(rq.header("content-length"), 10, len))
+          return reply_close(c, 400, "malformed Content-Length");
+        if (len > kMaxBody) return reply_close(c, 413, "request body too large");
+        if (!hold.add(len)) return reply_close(c, 503, "the server is receiving too much at once; try again");
+        while (buf.size() < len) {
+          const int n = plat::sock_recv(c, tmp, (int)sizeof tmp);
+          if (n <= 0) { plat::sock_close(c); return; }
+          buf.append(tmp, n);
+          if (body_late(len)) return reply_close(c, 408, "request body too slow");
+        }
+        rq.body = buf.substr(0, len);
+        buf.erase(0, len);
+      }
+      HttpResponse rs(c);
+      rs.no_body = rq.method == "HEAD";
+      // (the client asks for the connection to end after this reply: "Connection: close", or HTTP/1.0 without
+      //  "Connection: keep-alive" (RFC 9112 9.3). The reply says "Connection: close" and the connection is closed
+      //  after it, instead of waiting up to 600 s for a request that never comes)
+      {
+        std::string conn = rq.header("connection");
+        for (char& ch : conn) ch = (char)tolower((unsigned char)ch);
+        bool tok_close = false, tok_keep = false;
+        for (size_t i = 0; i <= conn.size();) {
+          size_t j = conn.find(',', i);
+          if (j == std::string::npos) j = conn.size();
+          size_t a = i, b = j;
+          while (a < b && (conn[a] == ' ' || conn[a] == '\t')) ++a;
+          while (b > a && (conn[b - 1] == ' ' || conn[b - 1] == '\t')) --b;
+          const std::string t = conn.substr(a, b - a);
+          tok_close = tok_close || t == "close";
+          tok_keep = tok_keep || t == "keep-alive";
+          i = j + 1;
+        }
+        rs.close_after = tok_close || (version == "HTTP/1.0" && !tok_keep);
+      }
+      // A browser page from another site must not drive this no-authentication server (CORS alone would still let a
+      // simple POST through). Local pages and the server's own web UI keep working; command-line clients send no Origin.
+      const std::string origin = rq.header("origin");
+      int g = 0;
+      try {
+        g = gate ? gate(rq, rs) : 0;
+      } catch (const std::exception& e) {  // (Windows' hashing or random numbers failed, or memory)
+        if (!rs.done()) rs.send(500, "application/json", "{\"error\":{\"message\":\"remote access check failed\"}}");
+        (void)e;
+        g = 1;
+      }
+      if (g == 1) {  // (answered by the gate: a login page, a sign-in, a refusal; logged too: a wrong password shows)
+        done_hook(rq, rs, 0);
+        if (rs.streaming() || !rs.alive() || rs.close_after) break;
+        continue;
+      }
+      if (g == 2) {  // (a remote session: its origin was checked by the gate)
+        rs.cors_origin = "";
+        if (rq.method == "OPTIONS") rs.send(204, "text/plain", ""), done_hook(rq, rs, 0);
+        else run_handler(rq, rs);
+        if (rs.streaming() || !rs.alive() || rs.close_after) break;
+        continue;
+      }
+      // (DNS rebinding: a page of another site whose name resolves to 127.0.0.1 sends its own name as Host and as
+      //  Origin; a server bound to this machine only answers requests that name this machine)
+      if (loopback_ && !rq.header("host").empty() && !local_host(rq.header("host")))
+        return reply_close(c, 403, "this server answers requests for localhost / 127.0.0.1 only");
+      if (!loopback_ && !rq.header("host").empty() && !address_host(rq.header("host")))
+        return reply_close(c, 403, "open this server by its address (http://<IP>:<port>/), not by a name (DNS rebinding)");
+      // (a page of another local server, http://localhost:<other port>: the model API only, see foreign_ok; before,
+      //  any local page could post to run_command, the slots, the chats and files)
+      if (!origin.empty() && !same_origin(origin, rq.header("host"))) {
+        if (!local_origin(origin)) return reply_close(c, 403, "cross-origin requests are only allowed from this machine");
+        if (!foreign_ok(rq))
+          return reply_close(c, 403, "this is only for the server's own page (or a client without an Origin), not for "
+                                     "pages of other local servers");
+        rq.foreign = true;  // (its chat requests may not name the user's saved files or chats either: server_chat.h)
+      }
+      rs.cors_origin = origin;
+      if (rq.method == "OPTIONS") rs.send(204, "text/plain", ""), done_hook(rq, rs, 0);
+      else run_handler(rq, rs);
+      if (rs.streaming() || !rs.alive() || rs.close_after) break;
+    }
+    plat::sock_shutdown(c);
+    plat::sock_close(c);
+  }
+  // the handler, its exception as a 500 (or an error event in a stream that broke off), 404 when it sent nothing
+  void run_handler(const HttpRequest& rq, HttpResponse& rs) {
+    const auto t0 = std::chrono::steady_clock::now();
+    struct Done {  // (also when the handler throws: after its 500 below)
+      HttpServer& s; const HttpRequest& rq; HttpResponse& rs; std::chrono::steady_clock::time_point t0;
+      ~Done() {
+        if (!s.on_done) return;
+        try {
+          s.on_done(rq, rs, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        } catch (const std::exception& ex_) { LOG_WRN("inferzero: the access line failed: %s\n", ex_.what()); } catch (...) { LOG_WRN("inferzero: the access line failed\n"); }
+      }
+    } done{*this, rq, rs, t0};
+    try {
+      handler(rq, rs);
+    } catch (const std::exception& e) {
+      std::string m;  // (the message as a JSON string)
+      for (const char* ep = e.what(); *ep; ++ep) {
+        const unsigned char ch = (unsigned char)*ep;
+        if (ch == '"' || ch == '\\') { m += '\\'; m += (char)ch; }
+        else if (ch < 0x20) { char u[8]; snprintf(u, sizeof u, "\\u%04x", ch); m += u; }
+        else m += (char)ch;
+      }
+      const std::string body = "{\"error\":{\"message\":\"" + m + "\",\"type\":\"server_error\"}}";
+      if (!rs.done() && !rs.streaming()) rs.send(500, "application/json", body);
+      else if (rs.streaming() && !rs.done()) {  // (a stream that broke off: an error event, as OpenAI sends one)
+        try { rs.sse_event(body); } catch (const std::exception&) {}  // (the client is gone)
+        rs.sse_end();
+      }
+    }
+    if (!rs.done() && !rs.streaming()) rs.send(404, "application/json", "{\"error\":{\"message\":\"not found\"}}");
+  }
+};

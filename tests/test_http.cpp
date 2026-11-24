@@ -1,0 +1,77 @@
+// CPU-only check of the HTTP server (src/http.h) against malformed requests: each must get its 400 / 413 (or a
+// closed connection) and the server must keep answering afterwards. usage: test_http [port] (default 8093)
+#include "../src/http.h"
+#include <cstdio>
+#include <string>
+
+static std::string exchange(int port, const std::string& req) {
+  plat::socket_t s = plat::sock_open(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  sockaddr_in a{};
+  a.sin_family = AF_INET;
+  a.sin_port = htons((uint16_t)port);
+  inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
+  if (!plat::sock_connect(s, (sockaddr*)&a, sizeof a)) { plat::sock_close(s); return "<no connection>"; }
+  plat::sock_recv_timeout(s, 5000);
+  plat::sock_send(s, req.data(), (int)req.size());
+  plat::sock_shutdown_send(s);
+  std::string out;
+  char buf[4096];
+  int n;
+  while ((n = plat::sock_recv(s, buf, sizeof buf)) > 0) out.append(buf, n);
+  plat::sock_close(s);
+  return out;
+}
+
+int main(int argc, char** argv) {
+  const int port = argc > 1 ? atoi(argv[1]) : 8093;
+  HttpServer srv;
+  srv.handler = [](const HttpRequest& rq, HttpResponse& rs) {
+    if (rq.path == "/throw") throw 42;  // (not a std::exception)
+    rs.send(200, "text/plain", "ok:" + std::to_string(rq.body.size()));
+  };
+  if (!srv.listen("127.0.0.1", port)) { fprintf(stderr, "cannot listen on %d\n", port); return 1; }
+  std::thread([&] { srv.run(); }).detach();
+
+  struct Case { const char* name; std::string req, expect; };
+  const std::string big = std::to_string((size_t)1 << 40);
+  const Case cases[] = {
+      {"plain POST", "POST /x HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc", "200 OK"},
+      {"Content-Length abc", "POST /x HTTP/1.1\r\nContent-Length: abc\r\n\r\n", "400"},
+      {"Content-Length -1", "POST /x HTTP/1.1\r\nContent-Length: -1\r\n\r\n", "400"},
+      {"Content-Length overflow", "POST /x HTTP/1.1\r\nContent-Length: 99999999999999999999999\r\n\r\n", "400"},
+      {"Content-Length 1 TB", "POST /x HTTP/1.1\r\nContent-Length: " + big + "\r\n\r\n", "413"},
+      {"chunked", "POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2;ext=1\r\nde\r\n0\r\n\r\n", "ok:5"},
+      {"chunked with a trailer", "POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nX-T: 1\r\n\r\n", "ok:3"},
+      {"chunk size line of 5000 bytes", "POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n" + std::string(5000, '1'), "400"},
+      {"chunk size zz","POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nabc\r\n0\r\n\r\n", "400"},
+      {"chunk 1 TB", "POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n10000000000\r\n", "413"},
+      {"chunked and a length (smuggling)", "POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 3\r\n\r\n3\r\nabc\r\n0\r\n\r\n", "400"},
+      {"two different lengths", "POST /x HTTP/1.1\r\nContent-Length: 3\r\nContent-Length: 5\r\n\r\nabcde", "400"},
+      {"the same length twice", "POST /x HTTP/1.1\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\nabc", "ok:3"},
+      {"request line without spaces", "GARBAGE\r\n\r\n", "400"},
+      {"handler throws a non-exception", "GET /throw HTTP/1.1\r\n\r\n", ""},
+      {"Origin of a local page", "GET /x HTTP/1.1\r\nOrigin: http://localhost:3000\r\n\r\n", "200 OK"},
+      {"Host 127.0.0.1 with its own Origin", "GET /x HTTP/1.1\r\nHost: 127.0.0.1:8093\r\nOrigin: http://127.0.0.1:8093\r\n\r\n", "200 OK"},
+      {"Host localhost", "GET /x HTTP/1.1\r\nHost: localhost:8093\r\n\r\n", "200 OK"},
+      {"Host [::1]", "GET /x HTTP/1.1\r\nHost: [::1]:8093\r\n\r\n", "200 OK"},
+      // (DNS rebinding: another site's name resolving to 127.0.0.1, sent as Host and Origin, on a loopback server)
+      {"rebinding: Origin = Host of another name", "GET /x HTTP/1.1\r\nHost: evil.example:8093\r\nOrigin: http://evil.example:8093\r\n\r\n", "403"},
+      {"Host of another machine on a loopback server", "GET /x HTTP/1.1\r\nHost: 192.168.1.5:8090\r\nOrigin: http://192.168.1.5:8090\r\n\r\n", "403"},
+      {"Origin of another site", "GET /x HTTP/1.1\r\nOrigin: https://evil.example\r\n\r\n", "403"},
+      {"Origin != Host", "GET /x HTTP/1.1\r\nHost: 127.0.0.1:8093\r\nOrigin: http://127.0.0.2:8093\r\n\r\n", "403"},
+      // (a name that only starts like this machine's address: another site's, whose DNS can point here)
+      {"rebinding: a name starting with 127.0.0.1.", "GET /x HTTP/1.1\r\nHost: 127.0.0.1.evil.example:8093\r\nOrigin: http://127.0.0.1.evil.example:8093\r\n\r\n", "403"},
+      {"Host 127.5.6.7 (all of 127/8 is this machine)", "GET /x HTTP/1.1\r\nHost: 127.5.6.7:8093\r\n\r\n", "200 OK"},
+      {"Host 127.0.0.256 (no address)", "GET /x HTTP/1.1\r\nHost: 127.0.0.256:8093\r\n\r\n", "403"},
+      {"still alive", "GET /x HTTP/1.1\r\n\r\n", "200 OK"},
+  };
+  int fails = 0;
+  for (const Case& c : cases) {
+    const std::string r = exchange(port, c.req);
+    const bool ok = c.expect.empty() ? r.find("200 OK") == std::string::npos : r.find(c.expect) != std::string::npos;
+    printf("%-34s %s\n", c.name, ok ? "ok" : ("FAIL: " + r.substr(0, 60)).c_str());
+    fails += !ok;
+  }
+  printf(fails ? "test_http: %d failed\n" : "test_http: all passed\n", fails);
+  return fails ? 1 : 0;
+}

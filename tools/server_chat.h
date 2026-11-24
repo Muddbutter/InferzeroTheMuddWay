@@ -1,0 +1,1121 @@
+// The chat endpoint (/v1/chat/completions): prompt, media, generation, streaming, tool calls.
+// A part of class Server (tools/server.cpp), included inside the class body at the place it was cut from:
+// not a header of its own. Split out of tools/server.cpp unchanged on 2026-10-24 (QUEUE item 11).
+
+  // Gemma 4: the messages as the template gets them: an assistant message with tool calls without its reasoning (see
+  // chat(); count_tokens renders the same)
+  static Json gemma_history(const Json& messages) {
+    Json out = Json::array();
+    for (const Json& m : messages.items()) {
+      if (m["role"].str() == "assistant" && m["tool_calls"].is_array() && m["tool_calls"].size() &&
+          (m.has("reasoning_content") || m.has("reasoning") || m.has("thinking"))) {
+        Json c = Json::object();
+        for (const auto& [k, v] : m.entries())
+          if (k != "reasoning_content" && k != "reasoning" && k != "thinking") c.set(k, v);
+        out.push(c);
+      } else {
+        out.push(m);
+      }
+    }
+    return out;
+  }
+  void chat(const HttpRequest& rq, HttpResponse& rs) {
+    const auto t_req = clk::now();  // (the request's arrival: time to first token, end to end)
+    Json body;
+    if (!Json::try_parse(rq.body, body)) return rs.send(400, "application/json", err("invalid JSON body").dump());
+    // (a page of another local server: no "file" parts (chat:<id>, transcript:<id>, a saved file) and no /files/
+    //  references, which would paste the user's chats and files into a prompt whose answer that page reads; the
+    //  foreign_ok rule says such pages never reach them, audit 2026-11-18)
+    if (rq.foreign)
+      for (const Json& m : body["messages"].items())
+        for (const Json& p : m["content"].items())
+          if (p["type"].str() == "file" || p["type"].str() == "input_file" || p.dump().find("\"/files/") != std::string::npos)
+            return rs.send(403, "application/json", err("saved files and chats are only for the server's own page").dump());
+    if (ocr_ && ocr_batch(rq, body, rs)) return;  // (several images / PDFs at once: file by file, tools/server_ocr.h)
+    if (ocr_ && ocr_pdf(rq, body, rs)) return;  // (an OCR model and a PDF: page by page, tools/server_ocr.h)
+    // (/metrics: in the server, waiting until past claim_slot; after the OCR batches, which call chat() per page: each
+    //  page is a request of its own, the batch not one more that would wait for ever, audit 2026-11-12)
+    const zmet::Inflight inflight_m;
+    {  // the web UI's saved files ("file" parts): as text, or as references to the image / audio (server_files.h)
+      bool any = false;
+      for (const Json& m : body["messages"].items())
+        for (const Json& p : m["content"].items()) any = any || p["type"].str() == "file" || p["type"].str() == "input_file";
+      bool tools = false;  // (the file tools offered: a long document goes in as its outline)
+      for (const Json& t : body["tools"].items()) tools = tools || t["function"]["name"].str() == "read_file";
+      if (any) body.set("messages", files::expand_files(body["messages"], tools, eng_.ctx));
+    }
+    // (special tokens written in user and tool contents, the files' text included: plain text, see defuse_contents)
+    if (!body["__raw_prompt"].is_string()) body.set("messages", defuse_contents(body["messages"]));
+    // (an OCR model: its own task prompt, tools/server_ocr.h; after the saved files became image parts: the web UI
+    //  sends its images as files)
+    if (ocr_) body = ocr_request(body);
+    const Json& messages = body["messages"];
+    if (!messages.is_array() || messages.size() == 0) return rs.send(400, "application/json", err("messages required").dump());
+    const std::string folder = prompt_folder(messages);  // Pi: the project folder (its system-prompt cache)
+    Json tools = body["tools"];
+    // tool_choice "none": the tools stay in the prompt (it is the same as the turns before, so the prompt cache holds:
+    // the web UI's last answer after its tool rounds processed the whole chat again without them), and the call's
+    // open marker is never drawn (no_call_tok, below)
+    const bool no_calls = body["tool_choice"].str() == "none";
+    int no_call_tok = -1, no_call_tok2 = -1;  // (no_call_tok2: Inkling 2's call as text, which parse() takes too)
+    if (no_calls && tools.is_array() && tools.size()) {
+      const std::vector<int> o = tok_.encode(gemma_ ? "<|tool_call>" : ink_ ? "<|content_invoke_tool_json|>" : "<tool_call>", true);
+      if (o.size() == 1) no_call_tok = o[0];
+      else tools = Json();  // (not one token: the tools left out, as before)
+      if (ink_) {
+        const int t2 = tok_.token("<|content_invoke_tool_text|>");
+        if (t2 >= 0) no_call_tok2 = t2;
+      }
+    } else if (no_calls) {
+      tools = Json();
+    }
+    // tool_choice "required" / a named function: the answer starts with a tool call (to that function)
+    std::string force_tool;
+    bool force_tool_on = false;
+    {
+      const Json& tc = body["tool_choice"];
+      std::string fname = tc["function"]["name"].str(tc["name"].str());
+      // (a name that is not one of the tools: no call to it can pass the constraint, and every token scanned the
+      //  whole vocabulary, the engine held, to the end of the context: audit 2026-11-18. Then any tool, as "required")
+      if (!fname.empty() && tools.is_array()) {
+        bool known = false;
+        for (const Json& t : tools.items()) known = known || t["function"]["name"].str(t["name"].str()) == fname;
+        if (!known) fname.clear();
+      }
+      // (Inkling 2: not forced yet; its call is a message of its own, src/chat_inkling.h)
+      if (!ink_ && tools.is_array() && tools.size() && (tc.str() == "required" || !fname.empty() ||
+                                              !tc["function"]["name"].str(tc["name"].str()).empty())) {
+        force_tool_on = true;
+        force_tool = gemma_ ? "<|tool_call>call:" + (fname.empty() ? std::string() : fname + "{")
+                            : "<tool_call>\n<function=" + (fname.empty() ? std::string() : fname + ">\n");
+      }
+    }
+    // response_format: the answer is JSON (an object; with json_schema one that fits the schema)
+    std::unique_ptr<jcon::Checker> jc;
+    {
+      const Json& rf = body["response_format"];
+      const std::string ty = rf["type"].str();
+      if (ty == "json_object") jc = std::make_unique<jcon::Checker>(Json::object(), true);
+      else if (ty == "json_schema") jc = std::make_unique<jcon::Checker>(rf["json_schema"]["schema"].is_object() ? rf["json_schema"]["schema"] : Json::object(), false);
+      if (jc) tools = Json();  // (structured answers, no tool calls)
+    }
+    // tool calls (Gemma 4 and Qwen formats): while a call is open, only tokens that keep it well formed and fitting
+    // its tool's schema (tools/tool_constraint.h; ARC_TOOL_CONSTRAINT=0 turns it off)
+    std::unique_ptr<tcon::ToolCon> tcc;
+    {
+      const char* e = getenv("ARC_TOOL_CONSTRAINT");
+      if (tools.is_array() && tools.size() && !no_calls && !(e && std::string(e) == "0")) {
+        if (gemma_) tcc = std::make_unique<tcon::GemmaCall>(tools);
+        else if (!ink_) tcc = std::make_unique<tcon::QwenCall>(tools);  // (Inkling 2: no constraint yet)
+        if (tcc && tcc->empty()) tcc.reset();
+      }
+    }
+    ChatOptions co;
+    if (body["enable_thinking"].is_bool()) co.enable_thinking = body["enable_thinking"].as_bool();
+    if (body["chat_template_kwargs"]["enable_thinking"].is_bool()) co.enable_thinking = body["chat_template_kwargs"]["enable_thinking"].as_bool();
+    const std::string effort = body["reasoning_effort"].str(body["chat_template_kwargs"]["reasoning_effort"].str());
+    if (effort == "none" || effort == "minimal" || effort == "off") co.enable_thinking = false;
+    else if (effort == "low") co.reasoning_effort = "low";
+    else if (effort == "medium") co.reasoning_effort = "medium";
+    else if (!effort.empty()) co.reasoning_effort = "xhigh";
+    // earlier turns keep their reasoning: only where the model's template offers it (Qwen3.6)
+    co.preserve_thinking = can_preserve_ && body["chat_template_kwargs"]["preserve_thinking"].as_bool(default_preserve_);
+    SamplingParams sp = defaults_;
+    if (body["temperature"].is_number()) sp.temperature = (float)body["temperature"].as_number();
+    if (body["top_p"].is_number()) sp.top_p = (float)body["top_p"].as_number();
+    // (a client's top_k 0 or less: no top-k, as in llama.cpp; the GGUF default stays as it was)
+    if (body["top_k"].is_number()) {
+      const int k = (int)body["top_k"].as_clamped(0, 0, INT_MAX);
+      sp.top_k = k > 0 ? k : -1;
+    }
+    if (body["min_p"].is_number()) sp.min_p = (float)body["min_p"].as_number();
+    if (body["presence_penalty"].is_number()) sp.presence_penalty = (float)body["presence_penalty"].as_number();
+    // Qwen's reasoning: presence_penalty 1.5 unless the request sets one (Qwen's recommendation for thinking, against
+    // endless reasoning: the 35B once circled "Let's run." for 7,000 tokens without closing </think>); the answer and
+    // its tool calls keep the request's value (0: code is not penalized for reusing its tokens)
+    const float think_pp = !gemma_ && !ink_ && !body["presence_penalty"].is_number() ? 1.5f : sp.presence_penalty;
+    if (body["frequency_penalty"].is_number()) sp.frequency_penalty = (float)body["frequency_penalty"].as_number();
+    if (body["repeat_penalty"].is_number()) sp.repeat_penalty = (float)body["repeat_penalty"].as_number();
+    if (body["repeat_last_n"].is_number()) sp.repeat_last_n = (int)body["repeat_last_n"].as_clamped(64, -1, INT_MAX);
+    for (const auto& [k, v] : body["logit_bias"].entries())  // {"token id": bias}
+      if (v.is_number()) {
+        char* end = nullptr;
+        const long long t = strtoll(k.c_str(), &end, 10);
+        // (an id outside int's range is ignored, not wrapped to another token: "4294967297" was token 1; audit
+        //  2026-11-14 L3. The sampler checks it against the vocabulary as before)
+        if (end && *end == 0 && !k.empty() && t >= 0 && t <= INT_MAX) sp.logit_bias.push_back({(int)t, (float)v.as_number()});
+      }
+    if (body["seed"].is_number()) sp.seed = (uint64_t)body["seed"].as_int(), sp.has_seed = true;
+    // (clamped before the cast to int: 1e308 or 2^32 + 5 wrapped to a small or negative count; at most 2^30, so that
+    //  the prompt's length + max_tokens below cannot overflow)
+    int max_tokens = (int)body["max_completion_tokens"].as_clamped(body["max_tokens"].as_clamped(-1, -1, 1 << 30), -1, 1 << 30);
+    // reasoning budget: after this many reasoning tokens the server closes the <think> block itself
+    int think_budget = (int)body["thinking_token_budget"].as_clamped(body["thinking_budget_tokens"].as_clamped(
+        body["reasoning_budget"].as_clamped(default_think_budget_, INT_MIN, INT_MAX), INT_MIN, INT_MAX), INT_MIN, INT_MAX);
+    std::vector<std::string> stops;
+    if (body["stop"].is_string()) stops.push_back(body["stop"].as_string());
+    for (const Json& s : body["stop"].items()) if (s.is_string()) stops.push_back(s.as_string());
+    const bool stream = body["stream"].as_bool(false);
+    // logprobs: the log probability of every generated token (from the model's distribution, before penalties and
+    // the logit bias) and of its top_logprobs most likely alternatives (0..20)
+    const bool want_lp = body["logprobs"].as_bool(false);
+    const int top_lp = (int)body["top_logprobs"].as_clamped(0, 0, 20);
+    const bool usage_in_stream = body["stream_options"]["include_usage"].as_bool(false);
+
+    // Gemma 4: an assistant message with tool calls goes in without its reasoning. The template keeps that reasoning
+    // while the turn's tool rounds go on and drops it once the user writes again, so the next turn's prompt differed
+    // right before the tool results: a 20K-token result processed again for a one-line question (E4B: 38 s). Without
+    // it every turn renders the same; a tool round only goes back over the reasoning just generated (rewind)
+    const Json gmsgs = gemma_ ? gemma_history(messages) : Json();
+    const Json& rmsgs = gemma_ ? gmsgs : messages;  // (the messages the template renders)
+    std::string prompt;
+    const bool raw_prompt = body["__raw_prompt"].is_string();  // (api_compat: the prompt text as it is)
+    if (raw_prompt) {
+      tools = Json();
+      co.enable_thinking = false;
+    }
+    // (Inkling 2: its effort message; thinking off is effort 0 ("none"), else the request's reasoning_effort, a name or
+    //  a number, and none given the template's default 0.9. A name the format does not know is a 400, as there)
+    Json ink_effort;
+    if (ink_) {
+      const Json& re = body["reasoning_effort"].is_null() ? body["chat_template_kwargs"]["reasoning_effort"] : body["reasoning_effort"];
+      if (!co.enable_thinking) ink_effort = Json("none");
+      else if (re.is_number() || (re.is_string() && !re.as_string().empty())) ink_effort = re;
+    }
+    try {
+      prompt = raw_prompt ? body["__raw_prompt"].str()
+               : ink_     ? inkling::render(messages, tools, ink_effort)
+               : jinja_   ? jinja_->render(rmsgs, tools, true, co.enable_thinking)
+                          : chat::render(messages, tools, co, q38_);
+    } catch (const std::exception& e) {
+      return rs.send(400, "application/json", err(e.what()).dump());
+    }
+    // ARC_DUMP_PROMPT=file: every rendered prompt appended to the file (to see where a turn's prompt differs from the
+    // last one, which decides how much of the cache is reused)
+    if (const char* df = getenv("ARC_DUMP_PROMPT")) {
+      static std::mutex dm;
+      std::lock_guard<std::mutex> lk(dm);
+      if (FILE* f = fopen(df, "ab")) {
+        fprintf(f, "\n===== prompt %zu bytes =====\n", prompt.size());
+        fwrite(prompt.data(), 1, prompt.size(), f);
+        fclose(f);
+      }
+    }
+    // Same wording and error type as llama-server, so that clients recognize a context overflow (Pi then compacts
+    // the conversation and retries). The hybrid DeltaNet state cannot drop old tokens, so there is no server-side
+    // context shift.
+    auto overflow = [&](size_t n, const char* at_least) {
+      Json e = Json::object();
+      e.set("code", 400);
+      e.set("message", std::string("the request exceeds the available context size (prompt ") + at_least + std::to_string(n) +
+                           " tokens, context " + std::to_string(eng_.ctx) + " tokens), try increasing it");
+      e.set("type", "exceed_context_size_error");
+      e.set("n_prompt_tokens", (int)std::min<size_t>(n, INT_MAX));
+      e.set("n_ctx", eng_.ctx);
+      Json r = Json::object();
+      r.set("error", e);
+      return rs.send(400, "application/json", r.dump());
+    };
+    // (no token holds more than max_token_bytes() bytes of text: a prompt longer than ctx such tokens cannot fit,
+    //  refused before the tokenizer allocates for it; every prompt that might fit is tokenized as before)
+    if (const size_t L = tok_.max_token_bytes(); L && prompt.size() / L > (size_t)eng_.ctx)
+      return overflow(prompt.size() / L, "at least ");
+    std::vector<int> P = tok_.encode(prompt, true);
+    // media: the template writes one <|image|> per image part and one <|audio|> per input_audio part; each becomes
+    // <|image> / <|audio> + n embedding rows + <image|> / <audio|>. Images are read non-causally, audio causally.
+    struct ImgSpan {
+      size_t start;
+      int n;
+      std::shared_ptr<std::vector<float>> embd;
+      bool causal = false;
+      int gw = 0, gh = 0;  // Qwen images: grid for the M-RoPE positions
+    };
+    std::vector<ImgSpan> spans;
+    // the engine lock, taken before the media are encoded: the media cache and the encoders (which share the GPU
+    // queue with the engine) must not run alongside another request (one thread per connection)
+    std::unique_lock<std::mutex> lock(mu_, std::defer_lock);
+    {
+      std::vector<std::string> urls;
+      std::vector<std::vector<uint8_t>> clips;
+      try {
+        for (const Json& m : messages.items())
+          for (const Json& part : m["content"].items()) {
+            const std::string ty = part["type"].str();
+            if (ty == "image_url") urls.push_back(part["image_url"].is_string() ? part["image_url"].str() : part["image_url"]["url"].str());
+            else if (ty == "image") urls.push_back(part["image"].is_string() ? part["image"].str() : part["image_url"]["url"].str());
+            else if (ty == "input_audio" || ty == "audio") {
+              // OpenAI: {"input_audio": {"data": <base64>, "format": "wav" | "mp3" ...}}; a data URL also works
+              const Json& a = part[ty == "audio" ? "audio" : "input_audio"];
+              const std::string d = a.is_string() ? a.str() : a["data"].str();
+              std::string f;  // (the web UI's saved file: "/files/<id>", tools/server_files.h)
+              if (files::store().resolve(d, f)) clips.emplace_back(f.begin(), f.end());
+              else clips.push_back(d.rfind("data:", 0) == 0 ? img::from_data_url(d) : img::base64_decode(d));
+            }
+          }
+      } catch (const std::exception& e) {
+        return rs.send(400, "application/json", err(std::string("media: ") + e.what()).dump());
+      }
+      if (!urls.empty() && (!has_vision() || img_tok_ < 0))
+        return rs.send(400, "application/json", err("this model was loaded without an image encoder (mmproj)").dump());
+      if (!clips.empty() && (!audio_ || aud_tok_ < 0))
+        return rs.send(400, "application/json", err("this model was loaded without an audio encoder (mmproj with audio)").dump());
+      if (!urls.empty() || !clips.empty()) {
+        acquire(lock);
+        std::vector<int> P2;
+        size_t ki = 0, ka = 0;
+        auto fnv = [](const std::vector<uint8_t>& bytes) {
+          uint64_t h = 1469598103934665603ull;  // FNV-1a of the file bytes
+          for (uint8_t b : bytes) h = (h ^ b) * 1099511628211ull;
+          return h;
+        };
+        try {
+          for (int t : P) {
+            const bool is_img = t == img_tok_ && ki < urls.size(), is_aud = t == aud_tok_ && ka < clips.size();
+            if (!is_img && !is_aud) { P2.push_back(t); continue; }
+            std::vector<uint8_t> bytes;
+            if (is_img) {
+              std::string f;
+              const std::string& u = urls[ki++];
+              bytes = files::store().resolve(u, f) ? std::vector<uint8_t>(f.begin(), f.end()) : img::from_data_url(u);
+            } else {
+              bytes = std::move(clips[ka++]);
+            }
+            const uint64_t h = fnv(bytes) ^ (is_img ? 0 : 0x5bd1e995ull);
+            auto it = img_cache_.find(h);
+            if (it == img_cache_.end()) {
+              const auto t0 = clk::now();
+              int n = 0, gw = 0, gh = 0;
+              std::shared_ptr<std::vector<float>> e;
+              if (is_img) {
+                const ImageRGB im = img::decode(bytes);
+                e = std::make_shared<std::vector<float>>(qvision_ ? qvision_->encode(im, n, gw, gh) : vision_->encode(im, n));
+                zlog::eprintf("image %dx%d -> %d tokens, encoded in %.0f ms\n", im.w, im.h, n, ms_since(t0));
+              } else {
+                const std::vector<float> s16 = audio::decode_16k(bytes);
+                e = std::make_shared<std::vector<float>>(audio_->encode(s16, n));
+                zlog::eprintf("audio %.1f s -> %d tokens, decoded and encoded in %.0f ms\n", s16.size() / 16000.0, n, ms_since(t0));
+              }
+              if (img_cache_.size() > 64 || img_cache_bytes_ + e->size() * 4 > (512u << 20)) {
+                img_cache_.clear();
+                img_cache_bytes_ = 0;
+              }
+              img_cache_bytes_ += e->size() * 4;
+              it = img_cache_.emplace(h, MediaEmb{e, gw, gh}).first;
+            }
+            const int width = is_img ? (qvision_ ? qvision_->n_out : vision_->out_dim()) : audio_->out_dim();
+            const int n = (int)(it->second.e->size() / width);
+            const int beg = is_img ? img_beg_ : aud_beg_, end = is_img ? img_end_ : aud_end_;
+            if (beg >= 0) P2.push_back(beg);
+            // causal: audio, Qwen images, and every token of E2B / E4B (llama.cpp: "always causal"); the 12B's images
+            // attend to themselves both ways
+            const bool causal = !is_img || qvision_ != nullptr || eng_.hp.n_ple != 0;
+            spans.push_back({P2.size(), n, it->second.e, causal, it->second.gw, it->second.gh});
+            // placeholder id: identical media (encoded to the same token count) match in the prefix cache
+            const int ph = -1 - (int)((h ^ ((uint64_t)n * 0x9e3779b97f4a7c15ull)) & 0x3fffffff);
+            P2.insert(P2.end(), n, ph);
+            if (end >= 0) P2.push_back(end);
+          }
+        } catch (const std::exception& e) {
+          return rs.send(400, "application/json", err(std::string("media: ") + e.what()).dump());
+        }
+        P.swap(P2);
+      }
+    }
+    if (P.empty()) return rs.send(400, "application/json", err("the prompt is empty (no tokens)").dump());
+    if ((int)P.size() + 64 > eng_.ctx) return overflow(P.size(), "");
+    if (max_tokens <= 0 || (int)P.size() + max_tokens > eng_.ctx) max_tokens = eng_.ctx - (int)P.size();
+
+    if (!lock.owns_lock()) acquire(lock);
+    const int my_slot = claim_slot(lock, P);
+    struct SlotFree {  // (the lock is still held when this runs: declared after it)
+      Server& s;
+      int k;
+      ~SlotFree() {
+        s.slots_[k].busy = false;
+        s.slot_cv_.notify_all();
+      }
+    } slot_free{*this, my_slot};
+    ++busy_;
+    struct Idle { std::atomic<int>& b; ~Idle() { --b; } } idle{busy_};
+    const zmet::Running running_m;
+    const std::string req_n = std::to_string(++counter_);  // (this request's number: its id and its tool calls' ids)
+    const std::string id = "chatcmpl-arc" + req_n;
+    const long long created = (long long)time(nullptr);
+    if (stream) rs.sse_begin();
+
+    // ---- prompt processing (with prefix reuse)
+    const auto t_prompt = clk::now();
+    // end of the system prompt (the start of the second turn; Gemma's first turn follows <bos>): every conversation
+    // of a client (Pi: its system prompt and tool list, ~4K tokens) shares it
+    const size_t sys_cut = system_end(P);
+    // ("cache_prompt": false, llama.cpp's request option, e.g. for benchmarks: the whole prompt evaluated; no cached
+    //  prefix, saved conversation or prefix file is used, and this slot's state and snapshots are dropped first.
+    //  Before, it was ignored and a repeated prompt came back from the cache: a user's report, 2026-11-11)
+    const bool cache_prompt = !body["cache_prompt"].is_bool() || body["cache_prompt"].as_bool(true);
+    size_t start = 0;
+    if (cache_prompt) {
+      switch_conversation(P);
+      load_prefix(P, sys_cut, folder);
+      start = prepare_prefix(P);
+    } else {
+      // (the held conversation is saved first, as switch_conversation would; and the host snapshot of its system
+      //  prompt goes too: a later request sharing this prompt's start would restore that other prompt's DeltaNet
+      //  states over this prompt's KV cache)
+      if (sess_cap_ && !cur_saved_ && cached_.size() >= 1024) save_current();
+      eng_.reset();
+      for (int s = 0; s < kSnaps; ++s) eng_.drop_snapshot(s);
+      eng_.drop_host_snapshot();
+      cached_.clear();
+    }
+    cur_saved_ = false;
+    // start of the last turn header "<|im_start|>assistant\n" (Gemma: "<|turn>model\n"). The next request of the
+    // conversation diverges after it (the reply as the template renders it) or, after an aborted or failed reply that
+    // the client drops (Pi does), right inside it: a snapshot here serves both.
+    // (Inkling 2: no generation prompt, the model writes its own <|message_model|>: the turn starts at the prompt's end,
+    //  whose snapshot (slot 1) serves both)
+    size_t gen_cut = ink_ ? P.size() : 0;
+    for (size_t i = P.size(); !ink_ && i-- > 0;)
+      if (P[i] == im_start_) { gen_cut = i; break; }
+    // Qwen: the start of the first assistant turn after the user's last message (tool results come as user messages
+    // starting with <tool_response>, which do not count); a snapshot there survives the turn's tool calls
+    size_t turn_cut = 0;
+    if (!jinja_ && !ink_ && im_start_ >= 0)
+      for (size_t i = gen_cut; i-- > 0;) {
+        if (P[i] != im_start_ || i + 1 >= P.size() || tok_.piece(P[i + 1]) != "user") continue;
+        std::string head;
+        for (size_t k = i + 2; k < std::min(P.size(), i + 8); ++k) head += tok_.piece(P[k]);
+        if (head.rfind("\n<tool_response>", 0) == 0) continue;
+        for (size_t j = i + 1; j <= gen_cut; ++j)
+          if (P[j] == im_start_) { turn_cut = j; break; }
+        break;
+      }
+    std::vector<float> logits;
+    size_t done = start;
+    // The client going away (Pi: Esc) cancels the prompt processing within a layer (Engine::cancel): the engine keeps
+    // the blocks it completed, so a request that continues the prompt goes on from there.
+    bool gone = false;
+    auto client_gone = [&] { return gone || (gone = rs.client_gone()); };
+    auto report = [&](size_t d) {
+      if (stream && !gone && !rs.sse_comment("prefill " + std::to_string(d) + "/" + std::to_string(P.size()))) gone = true;
+    };
+    struct Unhook {  // the engine's callbacks refer to this request
+      Engine& e;
+      ~Unhook() { e.cancel = nullptr; e.progress = nullptr; }
+    } unhook{eng_};
+    eng_.cancel = client_gone;
+    // --slots: before each piece of the prompt, a waiting request in another slot may take a step (then the engine is
+    // bound to this slot and its callbacks set again)
+    auto prompt_turn = [&] {
+      take_turns(lock, my_slot);
+      eng_.cancel = client_gone;
+    };
+    // runs P[done, upto); false when cancelled (cached_ then matches the engine again)
+    auto feed_tokens = [&](size_t upto) {
+      try {
+        if (!eng_.w8_resident && upto > done) {
+          // just-in-time weights: one call, so the engine runs the prompt layer by layer (each matrix decoded once);
+          // progress is reported per layer (--slots: calls of up to 8192 tokens, other slots' steps in between)
+          const size_t piece = slots_.size() > 1 ? std::max<size_t>(eng_.max_chunk, 8192) : upto - done;
+          while (done < upto) {
+            prompt_turn();
+            const size_t base = done, to = std::min(upto, done + piece);
+            eng_.progress = [&](int d, int) { report(base + d); };
+            logits = eng_.forward(P.data() + done, (int)(to - done));
+            eng_.progress = nullptr;
+            cached_.insert(cached_.end(), P.begin() + done, P.begin() + to);
+            done = to;
+            report(done);
+          }
+          return true;
+        }
+        while (done < upto) {
+          if (client_gone()) return false;
+          prompt_turn();
+          const size_t n = std::min<size_t>(upto - done, eng_.max_chunk);
+          logits = eng_.forward(P.data() + done, (int)n);
+          cached_.insert(cached_.end(), P.begin() + done, P.begin() + done + n);
+          done += n;
+          report(done);
+        }
+        return true;
+      } catch (const Engine::Cancelled&) {
+        eng_.progress = nullptr;
+        if (eng_.pos < (int)done) cached_.clear();  // (Gemma: reset)
+        else cached_.insert(cached_.end(), P.begin() + done, P.begin() + eng_.pos);
+        done = eng_.pos;
+        gone = true;
+        return false;
+      }
+    };
+    // text runs go through feed_tokens, media spans through the embedding path: an image as one non-causal chunk,
+    // audio causally in pieces of up to max_chunk rows
+    // Qwen M-RoPE: an image of gw x gh tokens advances the rotary position by max(gw, gh), so the text after it runs
+    // at cache position + shift; the engine's rope_shift follows the position processing is at (also for generation)
+    auto shift_at = [&](size_t p) {
+      int sh = 0;
+      for (const auto& s2 : spans)
+        if (s2.gw > 0 && s2.start + s2.n <= p) sh += std::max(s2.gw, s2.gh) - s2.n;
+      return sh;
+    };
+    eng_.rope_shift = shift_at(done);
+    // Qwen images inside the text (causal, M-RoPE): with the engine's set_media the text and the images go through
+    // the layers together, in the token path's chunks: Flash Next / the 35B read their streamed experts once, not once
+    // per text run and image (a 290-token prompt with a picture took 3-4 passes). ARC_MEDIA_PASSES=1: the old way
+    std::vector<const float*> media_rows;
+    std::vector<int> media_pos;
+    static const bool passes = getenv("ARC_MEDIA_PASSES") != nullptr;
+    const bool inline_media = !passes && !spans.empty() && eng_.media_inline_ok() && qvision_ &&
+                              std::all_of(spans.begin(), spans.end(), [&](const ImgSpan& s2) {
+                                return s2.causal && s2.gw > 0 && (int)(s2.embd->size() / s2.n) == eng_.hp.n_embd;
+                              });
+    if (inline_media) {
+      media_rows.assign(P.size(), nullptr);
+      media_pos.resize(P.size() * 3);
+      for (size_t i = 0; i < P.size(); ++i) {
+        const int t = (int)i + shift_at(i);  // (text: the three components alike, as the plain rotary position)
+        media_pos[3 * i] = media_pos[3 * i + 1] = media_pos[3 * i + 2] = t;
+      }
+      for (const auto& s2 : spans) {
+        const int t = (int)s2.start + shift_at(s2.start);
+        for (int r = 0; r < s2.n; ++r) {
+          const size_t i = s2.start + r;
+          media_rows[i] = s2.embd->data() + (size_t)r * eng_.hp.n_embd;
+          media_pos[3 * i] = t;
+          media_pos[3 * i + 1] = t + r / s2.gw;
+          media_pos[3 * i + 2] = t + r % s2.gw;
+        }
+      }
+    }
+    auto feed = [&](size_t upto) {
+      if (inline_media && done < upto) {
+        eng_.set_media(P.data(), P.size(), &media_rows, &media_pos);
+        struct Clear { Engine& e; ~Clear() { e.clear_media(); } } clear{eng_};
+        const bool ok = feed_tokens(upto);
+        eng_.rope_shift = shift_at(done);
+        return ok;
+      }
+      while (done < upto) {
+        const ImgSpan* sp = nullptr;
+        for (const auto& s2 : spans)
+          if (s2.start + s2.n > done && s2.start < upto) { sp = &s2; break; }
+        eng_.rope_shift = shift_at(done);
+        if (!sp) return feed_tokens(upto);
+        if (done < sp->start && !feed_tokens(sp->start)) return false;
+        if (client_gone()) return false;
+        const int width = (int)(sp->embd->size() / sp->n);
+        for (int o = 0; o < sp->n;) {
+          const int k = sp->causal ? std::min(eng_.max_chunk, sp->n - o) : sp->n;
+          std::vector<int> rp;
+          if (sp->gw > 0) {  // (t, h, w) = start + shift + (0, row, column) over the merged-token grid
+            const int t = (int)sp->start + shift_at(sp->start);
+            rp.resize((size_t)k * 3);
+            for (int i = 0; i < k; ++i) {
+              const int r = o + i;
+              rp[3 * i] = t;
+              rp[3 * i + 1] = t + r / sp->gw;
+              rp[3 * i + 2] = t + r % sp->gw;
+            }
+          }
+          logits = eng_.forward_embd(sp->embd->data() + (size_t)o * width, k, !sp->causal, sp->start + o + k >= P.size(),
+                                     rp.empty() ? nullptr : rp.data());
+          o += k;
+        }
+        cached_.insert(cached_.end(), P.begin() + sp->start, P.begin() + sp->start + sp->n);
+        done = sp->start + sp->n;
+        report(done);
+      }
+      eng_.rope_shift = shift_at(done);
+      return true;
+    };
+    bool ok = true;  // the prompt was processed up to where the stage aimed
+    if (sys_cut > done && sys_cut < gen_cut) {
+      ok = feed(sys_cut);
+      if (ok && !rings_) eng_.snapshot_host();  // (ring models resume anywhere in their cache: rewind())
+      if (ok) save_prefix(P, sys_cut, folder);
+    }
+    if (ok && !client_gone() && turn_cut > done && turn_cut < gen_cut) {
+      ok = feed(turn_cut);
+      if (ok) eng_.snapshot(2);
+    }
+    if (ok && !client_gone() && gen_cut > done && gen_cut < P.size()) {
+      ok = feed(gen_cut);
+      if (ok) eng_.snapshot(0);
+      if (ok && turn_cut == gen_cut) eng_.snapshot(2);
+    }
+    if (ok && !client_gone()) ok = feed(P.size());
+    if (ok && done == P.size()) eng_.snapshot(1);
+    eng_.cancel = nullptr;  // (generation: see Engine::cancel)
+    last_gen_cut_ = (int)gen_cut;
+    const double prompt_ms = ms_since(t_prompt);
+    if (!ok || client_gone()) {
+      zlog::eprintf("[%s] cancelled by the client after %.1f s: prompt %zu tok (cached %zu), processed up to %zu\n",
+              id.c_str(), prompt_ms / 1000, P.size(), start, done);
+      zmet::aborted(model_id_, P.size(), start, 0);
+      return;
+    }
+
+    // ---- generation
+    Sampler sampler(sp);
+    std::unique_ptr<chat::OutputParserBase> parser_p;
+    if (gemma_) {  // (the prompt may end with an opened thought block: Gemma 4 after a tool response, thinking on)
+      static const std::string opened = "<|channel>thought\n";
+      const bool in_thought = prompt.size() >= opened.size() && prompt.compare(prompt.size() - opened.size(), opened.size(), opened) == 0;
+      parser_p = std::make_unique<gemma4::OutputParser>(in_thought, tools);
+    }
+    else if (ink_) parser_p = std::make_unique<inkling::OutputParser>();  // (Inkling 2: src/chat_inkling.h)
+    else parser_p = std::make_unique<chat::OutputParser>(co.enable_thinking, tools);
+    chat::OutputParserBase& parser = *parser_p;
+    std::vector<int> gen;
+    std::string text, dr, dc;
+    std::string finish = "length";
+    if (getenv("ARC_PROF_REQ")) eng_.profile = true;  // (the generation's kernels; printed after the request)
+    const auto t_gen = clk::now();
+    Json lp_all = Json::array(), lp_pending = Json::array();  // logprobs entries: all, and not yet streamed
+    auto lp_json = [&](const Json& entries) {
+      Json l = Json::object();
+      l.set("content", entries);
+      return l;
+    };
+    auto send_delta = [&](const std::string& r, const std::string& c) {
+      if (r.empty() && c.empty()) return true;
+      Json delta = Json::object();
+      if (!r.empty()) delta.set("reasoning_content", r);
+      if (!c.empty()) delta.set("content", c);
+      Json ch = chunk(id, created, delta, Json());
+      if (want_lp && lp_pending.size()) {
+        Json cs = Json::array(), c0 = ch["choices"][0];
+        c0.set("logprobs", lp_json(lp_pending));
+        cs.push(c0);
+        ch.set("choices", cs);
+        lp_pending = Json::array();
+      }
+      return rs.sse_event(ch.dump());
+    };
+    // the token's entry: its log probability and the most likely alternatives, from the raw logits
+    auto lp_entry = [&](int tok, const std::vector<float>& lg) {
+      const float mx = *std::max_element(lg.begin(), lg.end());
+      double z = 0;
+      for (float v : lg) z += std::exp((double)v - mx);
+      const double lse = mx + std::log(z);
+      auto one = [&](int t) {
+        Json e = Json::object();
+        const std::string piece = tok_.piece(t);
+        e.set("token", utf8_safe(piece));  // (a token can be part of a character: "bytes" has it exactly)
+        e.set("logprob", (double)lg[t] - lse);
+        Json bytes = Json::array();
+        for (unsigned char b : piece) bytes.push((int)b);
+        e.set("bytes", bytes);
+        return e;
+      };
+      Json e = one(tok);
+      Json tops = Json::array();
+      const int ntop = std::min<int>(top_lp, (int)lg.size());  // (a vocabulary under 20 tokens: all of them)
+      if (ntop > 0) {
+        std::vector<int> idx(lg.size());
+        for (size_t i = 0; i < idx.size(); ++i) idx[i] = (int)i;
+        std::partial_sort(idx.begin(), idx.begin() + ntop, idx.end(), [&](int a, int b) { return lg[a] > lg[b]; });
+        for (int i = 0; i < ntop; ++i) tops.push(one(idx[i]));
+      }
+      e.set("top_logprobs", tops);
+      return e;
+    };
+    // Tool calls are streamed while they are generated, as OpenAI does: the first delta of a call carries its id and
+    // name, the following ones pieces of its arguments JSON (clients concatenate them per index).
+    // (the request's own number, not the counter now: two requests at once on --slots gave the same ids)
+    auto call_id = [&](size_t k) { return "call_" + req_n + "_" + std::to_string(k); };
+    std::vector<std::string> tc_sent;  // arguments sent so far, per call
+    auto send_tool_deltas = [&](const std::string& t, bool fin) {
+      const auto pcs = parser.partial_tool_calls(t, fin);
+      for (size_t k = 0; k < pcs.size(); ++k) {
+        const bool first = k >= tc_sent.size();
+        if (first) tc_sent.emplace_back();
+        const std::string& a = pcs[k].args;
+        if (!first && a.size() <= tc_sent[k].size()) continue;
+        if (a.compare(0, tc_sent[k].size(), tc_sent[k]) != 0) {  // cannot happen: the arguments only grow
+          zlog::eprintf("[%s] tool call %zu: streamed arguments diverged\n", id.c_str(), k);
+          continue;
+        }
+        Json fn = Json::object();
+        if (first) fn.set("name", pcs[k].name);
+        fn.set("arguments", a.substr(tc_sent[k].size()));
+        Json tc = Json::object();
+        tc.set("index", (int)k);
+        if (first) {
+          tc.set("id", call_id(k));
+          tc.set("type", "function");
+        }
+        tc.set("function", fn);
+        tc_sent[k] = a;
+        Json calls = Json::array();
+        calls.push(tc);
+        Json d = Json::object();
+        d.set("tool_calls", calls);
+        if (!rs.sse_event(chunk(id, created, d, Json()).dump())) return false;
+      }
+      return true;
+    };
+    // text up to a possible beginning of a stop string (it would be cut off, so it must not reach the tool calls)
+    auto before_stops = [&](const std::string& t) {
+      size_t cut = t.size();
+      for (const auto& s : stops) {
+        if (s.empty()) continue;
+        for (size_t k = std::min(s.size() - 1, t.size()); k > 0; --k)
+          if (t.compare(t.size() - k, k, s, 0, k) == 0) { cut = std::min(cut, t.size() - k); break; }
+      }
+      return t.substr(0, cut);
+    };
+    if (stream) {
+      Json d0 = Json::object();
+      d0.set("role", "assistant");
+      d0.set("content", "");
+      rs.sse_event(chunk(id, created, d0, Json()).dump());
+    }
+    const std::vector<int> close_think = tok_.encode(gemma_ ? "<channel|>" : ink_ ? "<|end_message|><|message_model|><|content_text|>"
+                                                                             : "\n</think>\n\n", true);
+    bool in_think = co.enable_thinking;
+    int think_n = 0;
+    std::vector<int> forced;  // tokens to emit instead of sampling (budget-forced end of reasoning)
+    // Speculative decoding with the MTP block: after a token is chosen, the block drafts the following one and the
+    // model processes both in one pass. The next token is still sampled from the model's own distribution; the
+    // draft is kept only if it is exactly that token, so the output distribution is unchanged.
+    // (Inkling 2's DSpark drafts greedily: for a sampled request (temperature > 0) few drafts would be the sampled
+    //  token, and each verification runs its rows through the experts, so it decodes without drafts unless
+    //  ARC_DSP_SAMPLED=1; the output is the model's own distribution either way)
+    static const bool dsp_sampled = getenv("ARC_DSP_SAMPLED") && atoi(getenv("ARC_DSP_SAMPLED")) != 0;
+    const bool dsp_off = eng_.dsp_on() && sp.temperature > 0.0f && !dsp_sampled;
+    if (dsp_off) {
+      static std::atomic<bool> said{false};
+      if (!said.exchange(true))
+        LOG_INF("DSpark drafts for greedy requests (temperature 0) only: a sampled request decodes without drafts "
+                "(ARC_DSP_SAMPLED=1: drafts anyway; said once)\n");
+    }
+    const bool spec = eng_.has_mtp && !dsp_off;
+    const size_t V = eng_.hp.n_vocab;
+    std::vector<int> drafts;  // drafts processed by the last verification, checked against the next sampled tokens
+    size_t acc = 0;           // how many of them matched so far
+    std::vector<float> vrows; // logits of the verification rows
+    int n_drafts = 0, n_accepted = 0;
+    // (per drafter for the log: [0] the MTP block / Gemma drafter, [1] DFlash2; steps, drafts, accepted)
+    int dr_steps[2] = {0, 0}, dr_drafts[2] = {0, 0}, dr_acc[2] = {0, 0}, dr_cur = 0;
+    size_t call_from = std::string::npos;  // where the open tool call's text starts (after <|tool_call>)
+    int n_tool_tok = 0, n_tool_fixed = 0;   // tokens drawn inside tool calls; of them, a refused first choice
+    int n_batched = 0;  // (--slots: steps run in one pass with other requests')
+    ++gen_active_;
+    struct GenLeave {  // (requests waiting for this one to lead their steps run them themselves)
+      Server& s;
+      ~GenLeave() {
+        --s.gen_active_;
+        s.gen_cv_.notify_all();
+      }
+    } gen_leave{*this};
+    for (int i = 0; i < max_tokens; ++i) {
+      int t;
+      // (every token the reasoning used, line breaks included. Sparing tokens of spaces / line breaks alone (against a
+      //  stray "ctlsc" before </think>: the model's 4.4% raised to ~17%) was undone the same day: the 35B then circled
+      //  in short lines ("(Done).", "<br>", indented) without closing its reasoning, twice in one chat)
+      sampler.set_presence_penalty(in_think ? think_pp : sp.presence_penalty);
+      if (!forced.empty()) {
+        t = forced.front();
+        forced.erase(forced.begin());
+      } else {
+        if (no_call_tok >= 0 && (size_t)no_call_tok < logits.size()) logits[(size_t)no_call_tok] = -1e30f;  // (tool_choice none; not -INFINITY: fast math)
+        if (no_call_tok2 >= 0 && (size_t)no_call_tok2 < logits.size()) logits[(size_t)no_call_tok2] = -1e30f;
+        // the answer has begun: no reasoning, or the reasoning block is closed
+        const size_t tclose = co.enable_thinking ? text.find(think_close_) : 0;
+        const bool answering = tclose != std::string::npos;
+        if (answering && force_tool_on) {
+          force_tool_on = false;
+          forced = tok_.encode(force_tool, true);
+        }
+        if (!forced.empty()) {
+          t = forced.front();
+          forced.erase(forced.begin());
+        } else if (tcc && call_from != std::string::npos && (gemma_ || answering)) {  // (Qwen calls only after reasoning)
+          // inside a tool call: the most likely tokens that keep the call valid (a refused first choice is counted)
+          const std::string call = text.substr(call_from);
+          bool first = true;
+          int refused = -1;  // (the first choice, when it was refused)
+          t = sampler.sample_allowed(logits, gen, [&](int tok) {
+            const std::string pc = tok_.piece(tok);
+            bool ok = !pc.empty() && (!tok_.is_special(tok) || tcc->special_ok(pc)) && tcc->check(call + pc) != jcon::FAIL;
+            if (first && !ok) { ++n_tool_fixed; refused = tok; }
+            first = false;
+            return ok;
+          });
+          // ARC_DEBUG_TOOLFIX=1: each refused first choice in the log, with the call's last characters and the token
+          // taken instead (to see what the constraint refuses)
+          static const bool dbg_fix = getenv("ARC_DEBUG_TOOLFIX") != nullptr;
+          if (dbg_fix && refused >= 0) {
+            auto vis = [](std::string x) {
+              std::string o;
+              for (char c : x) o += c == '\n' ? std::string("\\n") : std::string(1, c);
+              return o;
+            };
+            LOG_DBG("tool call fixed: ...%s | the model's token [%s] would have broken it, [%s] taken instead\n", vis(call.substr(call.size() > 60 ? call.size() - 60 : 0)).c_str(),
+                    vis(tok_.piece(refused)).c_str(), t >= 0 ? vis(tok_.piece(t)).c_str() : "-");
+          }
+          ++n_tool_tok;
+          if (t < 0) t = sampler.sample(logits, gen);
+        } else if (answering && jc) {
+          const std::string ans = text.substr(co.enable_thinking ? tclose + think_close_.size() : 0);
+          // (every check of this step starts with the answer so far: its completed values are kept, json_constraint.h
+          //  set_prefix; ARC_JSON_PREFIX=0 also turns that off)
+          static const bool memo_on = !getenv("ARC_JSON_PREFIX") || atoi(getenv("ARC_JSON_PREFIX")) != 0;
+          if (memo_on) jc->set_prefix(ans);
+          if (jc->check(ans) == jcon::DONE) {
+            t = stop_ids_.empty() ? tok_.eos : stop_ids_.front();  // the value is complete: end the answer
+          } else {
+            // (ARC_DEBUG_JSON=1: each refused first choice in the log, with the answer's last characters and the token
+            //  taken instead)
+            static const bool dbg_json = getenv("ARC_DEBUG_JSON") != nullptr;
+            int first = -1;
+            bool first_ok = true;
+            // (#80, 2026-11-22: every candidate was the whole answer parsed again against the whole schema, and where
+            //  few tokens fit (an enum, a key) the sampler goes far down the vocabulary: 13x slower with a 32K-character
+            //  schema. The checker is prefix-closed (a text that cannot become a value has no continuation that can),
+            //  so after the first few candidates of a step fail, the verdict on each candidate's first byte and first
+            //  two bytes is kept for the step and a token whose prefix failed is refused without a parse. The same
+            //  verdicts, so the same tokens)
+            int8_t pre1[256];
+            std::memset(pre1, -1, sizeof pre1);
+            std::unordered_map<uint16_t, bool> pre2;
+            int tried = 0;
+            std::string buf = ans;
+            const size_t base = buf.size();
+            auto fits = [&](const char* p, size_t n) {
+              buf.resize(base);
+              buf.append(p, n);
+              return jc->check(buf) != jcon::FAIL;
+            };
+            t = sampler.sample_allowed(logits, gen, [&](int tok) {
+              if (tok_.is_special(tok)) return false;  // (control tokens are never part of the JSON text)
+              const std::string& pc = tok_.piece(tok);
+              bool ok = !pc.empty();
+              static const bool prefix_on = !getenv("ARC_JSON_PREFIX") || atoi(getenv("ARC_JSON_PREFIX")) != 0;
+              if (ok && prefix_on && ++tried > 8) {  // (ARC_JSON_PREFIX=0: every candidate parsed, as before)
+                const uint8_t b0 = (uint8_t)pc[0];
+                if (pre1[b0] < 0) pre1[b0] = fits(pc.data(), 1) ? 1 : 0;
+                ok = pre1[b0] == 1;
+                if (ok && pc.size() >= 2) {
+                  const uint16_t k2 = (uint16_t)(b0 << 8 | (uint8_t)pc[1]);
+                  auto it = pre2.find(k2);
+                  if (it == pre2.end()) it = pre2.emplace(k2, fits(pc.data(), 2)).first;
+                  ok = it->second;
+                }
+                if (ok && pc.size() <= 2) {  // (the prefix is the whole piece: its verdict is the token's)
+                  if (first < 0) { first = tok; first_ok = ok; }
+                  return ok;
+                }
+              }
+              ok = ok && fits(pc.data(), pc.size());
+              if (first < 0) { first = tok; first_ok = ok; }
+              return ok;
+            });
+            if (dbg_json && first >= 0 && !first_ok)
+              LOG_DBG("json: ...%s | [%s] refused, [%s] taken\n", ans.substr(ans.size() > 40 ? ans.size() - 40 : 0).c_str(),
+                      tok_.piece(first).c_str(), t >= 0 ? tok_.piece(t).c_str() : "-");
+            if (t < 0) t = stop_ids_.empty() ? tok_.eos : stop_ids_.front();
+          }
+        } else {
+          t = sampler.sample(logits, gen);
+        }
+      }
+      if (want_lp && std::find(stop_ids_.begin(), stop_ids_.end(), t) == stop_ids_.end()) {
+        Json e = lp_entry(t, logits);
+        lp_all.push(e);
+        lp_pending.push(e);
+      }
+      if (in_think) {
+        // (Inkling 2: a thinking message may be followed by a call alone, no text message: its call ends the reasoning
+        //  too, else a thinking budget forced the text message's header into the call's JSON)
+        if (text.find(think_close_) != std::string::npos || (ink_ && text.find("<|content_invoke_tool") != std::string::npos))
+          in_think = false;
+        else if (think_budget >= 0 && ++think_n > think_budget && forced.empty()) {
+          forced = close_think;  // budget exhausted: close the reasoning block and let the model answer
+          t = forced.front();
+          forced.erase(forced.begin());
+          in_think = false;
+        }
+      }
+      bool draft_ok = false;  // t is an accepted draft: already processed by the model
+      if (!drafts.empty()) {
+        if (acc < drafts.size() && t == drafts[acc]) {
+          draft_ok = true;
+          ++acc;
+          ++n_accepted;
+          ++dr_acc[dr_cur];
+          cached_.push_back(t);
+        }
+        if (!draft_ok || acc == drafts.size()) {  // verification resolved
+          eng_.verify_done((int)acc);
+          drafts.clear();
+        }
+      }
+      if (std::find(stop_ids_.begin(), stop_ids_.end(), t) != stop_ids_.end()) { finish = "stop"; break; }
+      gen.push_back(t);
+      const size_t before = text.size();
+      text += tok_.piece(t);
+      if (tcc) {  // the open tool call, followed piece by piece (the markers are single tokens; a little slack anyway)
+        const size_t from = before > 16 ? before - 16 : 0;
+        // (Qwen: a <tool_call> its reasoning writes is no call: taken as one, the answer after </think> failed the
+        //  constraint at every token, each a scan of the whole vocabulary, and the real call went unchecked)
+        const bool thinking = !gemma_ && co.enable_thinking && text.find(think_close_) == std::string::npos;
+        if (call_from == std::string::npos && !thinking) {
+          const size_t o = text.find(tcc->open(), from);
+          if (o != std::string::npos) call_from = o + strlen(tcc->open());
+        }
+        if (call_from != std::string::npos && text.find(tcc->close(), std::max(from, call_from)) != std::string::npos)
+          call_from = std::string::npos;
+      }
+      bool hit_stop = false;
+      for (const auto& s : stops) {
+        // (cut at the match in the recent tail, not at an earlier copy of the stop string in the text)
+        const size_t at = s.empty() || text.size() < s.size()
+                              ? std::string::npos
+                              : text.find(s, before >= s.size() ? before - s.size() + 1 : 0);  // (a match this
+        //  token completes starts at most s.size() - 1 bytes before its piece, however long the piece: audit 2026-11-18,
+        //  the 16-byte window missed "\n" at the start of a long run of spaces)
+        if (at != std::string::npos) {
+          text = text.substr(0, at);
+          hit_stop = true;
+        }
+      }
+      if (stream) {  // (held back: a possible beginning of a stop string, which a later token may complete)
+        const std::string shown = hit_stop ? text : before_stops(text);
+        parser.update(shown, false, dr, dc);
+        if (!send_delta(dr, dc) || !send_tool_deltas(shown, false)) gone = true;
+      }
+      if (hit_stop) { finish = "stop"; break; }
+      // the client went away (also when nothing was sent for this token): stop before the next pass; the drafts in
+      // flight are settled below, so the engine holds exactly the tokens in cached_
+      if (client_gone()) { finish = "cancelled"; break; }
+      if ((int)cached_.size() + 1 >= eng_.ctx) break;
+      if (draft_ok) {  // the logits after an accepted draft are already known
+        logits.assign(vrows.begin() + acc * V, vrows.begin() + (acc + 1) * V);
+        continue;
+      }
+      take_turns(lock, my_slot);  // (--slots; the drafts are settled here)
+      eng_.cancel = nullptr;      // (another request's prompt may have set its own)
+      GenStep st;
+      st.slot = my_slot;
+      st.tok = t;
+      st.max_drafts = spec && (int)cached_.size() + 4 < eng_.ctx && i + 1 < max_tokens ? std::min(eng_.opt.mtp_drafts, max_tokens - i - 1) : 0;
+      gen_step(lock, st, my_slot);
+      n_batched += st.batched ? 1 : 0;
+      cached_.push_back(t);
+      if (st.max_drafts > 0) {
+        drafts = std::move(st.drafts);
+        vrows = std::move(st.rows);
+        logits.assign(vrows.begin(), vrows.begin() + V);
+        acc = 0;
+        n_drafts += (int)drafts.size();
+        dr_cur = st.dflash ? 1 : 0;
+        ++dr_steps[dr_cur];
+        dr_drafts[dr_cur] += (int)drafts.size();
+      } else {
+        logits = std::move(st.rows);
+      }
+    }
+    if (!drafts.empty()) eng_.verify_done((int)acc);  // the loop ended before all drafts were decided
+    const double gen_ms = ms_since(t_gen);
+    if (finish == "cancelled") {
+      zlog::eprintf("[%s] cancelled by the client after %zu generated tokens (%.1f s) | prompt %zu tok (cached %zu) %.1f s\n",
+              id.c_str(), gen.size(), gen_ms / 1000, P.size(), start, prompt_ms / 1000);
+      zmet::aborted(model_id_, P.size(), start, gen.size());
+      return;
+    }
+    if (stream) {
+      parser.update(text, true, dr, dc);
+      send_delta(dr, dc);
+      send_tool_deltas(text, true);
+    }
+    const auto calls = parser.tool_calls(text);
+    if (!calls.empty()) finish = "tool_calls";
+    // ARC_LOG_TOOLCALLS=file: every answer that writes a tool call, raw text and parsed calls (to see what a model
+    // wrote when a call fails), one JSON line each
+    if (const char* lf = getenv("ARC_LOG_TOOLCALLS")) {
+      if (text.find(gemma_ ? "<|tool_call>" : ink_ ? "<|content_invoke_tool" : "<tool_call>") != std::string::npos) {
+        Json j = Json::object(), pc = Json::array();
+        for (const auto& c : calls) {
+          Json o = Json::object();
+          o.set("name", c.name);
+          o.set("arguments", c.arguments);
+          pc.push(o);
+        }
+        j.set("time", (double)time(nullptr));
+        j.set("model", model_id_);
+        j.set("id", id);
+        j.set("raw", utf8_safe(text));
+        j.set("calls", pc);
+        j.set("constraint_fixed", n_tool_fixed);
+        static std::mutex lm;
+        std::lock_guard<std::mutex> g(lm);
+        if (FILE* f = fopen(lf, "ab")) {
+          const std::string line = j.dump() + "\n";
+          fwrite(line.data(), 1, line.size(), f);
+          fclose(f);
+        }
+      }
+    }
+
+    Json usage = Json::object();
+    usage.set("prompt_tokens", P.size());
+    usage.set("completion_tokens", gen.size());
+    usage.set("total_tokens", P.size() + gen.size());
+    Json ptd = Json::object();
+    ptd.set("cached_tokens", start);
+    usage.set("prompt_tokens_details", ptd);
+    Json timings = Json::object();
+    timings.set("cache_n", start);
+    timings.set("prompt_n", P.size() - start);
+    timings.set("prompt_ms", prompt_ms);
+    timings.set("prompt_per_second", (P.size() - start) / std::max(prompt_ms, 1e-3) * 1000.0);
+    timings.set("predicted_n", gen.size());
+    timings.set("predicted_ms", gen_ms);
+    timings.set("predicted_per_second", gen.size() / std::max(gen_ms, 1e-3) * 1000.0);
+    zlog::eprintf("[%s] prompt %zu tok (cached %zu) %.1f s (%.1f t/s) | gen %zu tok %.1f s (%.2f t/s) | %s", id.c_str(),
+            P.size(), start, prompt_ms / 1000, (P.size() - start) / std::max(prompt_ms, 1e-3) * 1000, gen.size(), gen_ms / 1000,
+            gen.size() / std::max(gen_ms, 1e-3) * 1000, finish.c_str());
+    if (n_drafts && !dr_steps[1]) zlog::eprintf(" | MTP %d/%d drafts accepted", n_accepted, n_drafts);
+    if (dr_steps[1])  // (DFlash2 drafted at least once: both drafters, each with its steps and accepted drafts)
+      zlog::eprintf(" | DFlash2 %d steps, %d/%d drafts accepted | MTP %d steps, %d/%d", dr_steps[1], dr_acc[1],
+              dr_drafts[1], dr_steps[0], dr_acc[0], dr_drafts[0]);
+    if (n_tool_fixed) zlog::eprintf(" | tool call: %d of %d tokens corrected", n_tool_fixed, n_tool_tok);
+    if (n_batched) zlog::eprintf(" | %d steps batched with other slots", n_batched);
+    const double ttft_s = std::chrono::duration<double>(t_gen - t_req).count();
+    zlog::eprintf(" | first token %.2f s | context %zu of %d | slot %d\n", ttft_s, P.size() + gen.size(), eng_.ctx, my_slot);
+    try {  // (/metrics, tools/server_metrics.h; never a reason the answer fails)
+      zmet::Done d;
+      d.model = model_id_, d.finish = finish;
+      d.prompt = P.size(), d.cached = start, d.gen = gen.size();
+      d.ttft_s = ttft_s, d.e2e_s = std::chrono::duration<double>(clk::now() - t_req).count();
+      d.prefill_s = prompt_ms / 1000, d.decode_s = gen_ms / 1000;
+      d.drafts = (uint64_t)std::max(n_drafts, dr_drafts[0] + dr_drafts[1]);
+      d.accepted = (uint64_t)std::max(n_accepted, dr_acc[0] + dr_acc[1]);
+      d.kv = eng_.ctx > 0 ? (double)(P.size() + gen.size()) / eng_.ctx : 0;
+      zmet::request_done(d);
+    } catch (const std::exception& ex_) { LOG_WRN("inferzero: the /metrics record failed: %s\n", ex_.what()); } catch (...) { LOG_WRN("inferzero: the /metrics record failed\n"); }
+    // (-lv 3: llama.cpp's form of the same numbers)
+    LOG_DBG("[%s] prompt eval time = %10.2f ms / %5zu tokens (%8.2f ms per token, %8.2f tokens per second)\n", id.c_str(),
+            prompt_ms, P.size() - start, prompt_ms / std::max<double>(1, (double)(P.size() - start)),
+            (P.size() - start) / std::max(prompt_ms, 1e-3) * 1000);
+    LOG_DBG("[%s]        eval time = %10.2f ms / %5zu tokens (%8.2f ms per token, %8.2f tokens per second)\n", id.c_str(),
+            gen_ms, gen.size(), gen_ms / std::max<double>(1, (double)gen.size()), gen.size() / std::max(gen_ms, 1e-3) * 1000);
+    LOG_DBG("[%s]       total time = %10.2f ms / %5zu tokens\n", id.c_str(),
+            std::chrono::duration<double, std::milli>(clk::now() - t_req).count(), P.size() - start + gen.size());
+    // (ARC_PROF_REQ=1: the GPU time by kernel of each request, for diagnosis; every kernel is timed, which costs time)
+    static const bool prof_req = getenv("ARC_PROF_REQ") != nullptr;
+    if (prof_req) {
+      double total = 0;
+      std::vector<std::pair<double, std::string>> rows;
+      for (auto& [n, ms] : eng_.prof_ms) total += ms, rows.push_back({ms, n});
+      std::sort(rows.rbegin(), rows.rend());
+      zlog::eprintf("  GPU time %.1f ms:", total);
+      for (size_t r = 0; r < rows.size() && r < 12; ++r)
+        zlog::eprintf(" %s %.0f (%d)", rows[r].second.c_str(), rows[r].first, eng_.prof_n[rows[r].second]);
+      zlog::eprintf("\n");
+      eng_.prof_ms.clear();
+      eng_.prof_n.clear();
+    }
+    // (streamed MoE: the expert reads so far, as runz prints them at its end: what each request read from the SSD and
+    //  the RAM tier shows as the difference to the line before; issue #47, a B65 whose later prompts were not faster)
+    if (const std::string xs = eng_.expert_stats(); !xs.empty())
+      for (size_t a = 0, b; a < xs.size(); a = b + 1) {  // (one log line each: the experts, the host times, ARC_XCPU's)
+        b = xs.find('\n', a);
+        if (b == std::string::npos) b = xs.size();
+        LOG_INF("[%s] since start, %s\n", id.c_str(), xs.substr(a, b - a).c_str());
+      }
+    if (n_drafts) {
+      timings.set("draft_n", n_drafts);
+      timings.set("draft_n_accepted", n_accepted);
+    }
+    {
+      std::lock_guard<std::mutex> lk(stats_mu_);
+      ++n_req_;
+      last_timings_ = timings;
+      last_timings_.set("finish", finish);
+      last_timings_.set("time", (double)time(nullptr));
+    }
+
+    if (stream) {
+      // (the last chunk carries usage and timings together, as llama-server's does: Unsloth Studio keeps the timings
+      //  only from a chunk that has usage, and showed no token statistics)
+      Json fin = chunk(id, created, Json::object(), Json(finish));
+      if (want_lp && lp_pending.size()) {  // (tokens no content delta carried: a stop token, a tool call's text)
+        Json cs = Json::array(), c0 = fin["choices"][0];
+        c0.set("logprobs", lp_json(lp_pending));
+        cs.push(c0);
+        fin.set("choices", cs);
+        lp_pending = Json::array();
+      }
+      fin.set("usage", usage);
+      fin.set("timings", timings);
+      rs.sse_event(fin.dump());
+      if (usage_in_stream) {
+        Json u = Json::object();
+        u.set("id", id);
+        u.set("object", "chat.completion.chunk");
+        u.set("created", (double)created);
+        u.set("model", model_id_);
+        u.set("choices", Json::array());
+        u.set("usage", usage);
+        u.set("timings", timings);
+        rs.sse_event(u.dump());
+      }
+      rs.sse_event("[DONE]");
+      rs.sse_end();
+      return;
+    }
+    Json tc_json = Json::array();
+    for (size_t k = 0; k < calls.size(); ++k) {
+      Json fn = Json::object();
+      fn.set("name", calls[k].name);
+      fn.set("arguments", calls[k].arguments.dump());
+      Json tc = Json::object();
+      tc.set("index", (int)k);
+      tc.set("id", call_id(k));
+      tc.set("type", "function");
+      tc.set("function", fn);
+      tc_json.push(tc);
+    }
+    Json msg = Json::object();
+    msg.set("role", "assistant");
+    const std::string reasoning = parser.reasoning_text(text);
+    // (an OCR model's OTSL tables as Markdown ones, tools/server_ocr.h)
+    const std::string content = ocr_ ? otsl_to_md(parser.content_text(text)) : parser.content_text(text);
+    msg.set("content", content.empty() && tc_json.size() ? Json() : Json(content));
+    if (!reasoning.empty()) msg.set("reasoning_content", reasoning);
+    if (tc_json.size()) msg.set("tool_calls", tc_json);
+    Json choice = Json::object();
+    choice.set("index", 0);
+    choice.set("message", msg);
+    if (want_lp) choice.set("logprobs", lp_json(lp_all));
+    choice.set("finish_reason", finish);
+    Json choices = Json::array();
+    choices.push(choice);
+    Json r = Json::object();
+    r.set("id", id);
+    r.set("object", "chat.completion");
+    r.set("created", (double)created);
+    r.set("model", model_id_);
+    r.set("choices", choices);
+    r.set("usage", usage);
+    r.set("timings", timings);
+    rs.send(200, "application/json", r.dump());
+  }
+
+  Json chunk(const std::string& id, long long created, const Json& delta, const Json& finish) {
+    Json c = Json::object();
+    c.set("index", 0);
+    c.set("delta", delta);
+    c.set("finish_reason", finish);
+    Json choices = Json::array();
+    choices.push(c);
+    Json r = Json::object();
+    r.set("id", id);
+    r.set("object", "chat.completion.chunk");
+    r.set("created", (double)created);
+    r.set("model", model_id_);
+    r.set("choices", choices);
+    return r;
+  }

@@ -1,0 +1,1257 @@
+// The model catalog (the Hugging Face cache and extra folders), DFlash2 drafters, --ctx auto, --list-models.
+#include <charconv>  // (std::from_chars: cached_ctx)
+// Included by tools/server.cpp only, at the place it was cut from (after class Server); not a header of its
+// own. Split out of tools/server.cpp unchanged on 2026-10-24 (QUEUE item 11).
+
+// ---------------------------------------------------------------- model catalog
+// The GGUF models in the Hugging Face cache and in inferzero's model folder: name (org/repo), file, path, size (a
+// split file: all its parts), architecture, trained context, whether an image projector (mmproj-*, with or without
+// a Gemma 4 audio encoder) or a Gemma drafter (mtp-*) sits next to it, Qwen MTP layers, and the model id clients use
+// (the alias; the six models inferzero was tuned on keep their short ids). Projectors, drafters and the later parts
+// of split files are not models.
+struct ModelInfo {
+  std::string name, file, path, arch, alias, shortcut;
+  uint64_t bytes = 0;
+  int64_t ctx_train = 0;
+  // vision / mtp: what this entry loads. A file with an MTP block or drafter and / or an image projector is listed
+  // once per combination (expand_variants): the full one under the file's id, the others with -mtp (MTP, no
+  // vision), -vision (vision, no MTP) and -std (neither). base: the file's id; tags: "MTP + vision", ...
+  bool supported = false, vision = false, mtp = false;
+  bool moe = false;  // routed experts (inferzero streams them from the SSD)
+  bool precise_only = false;  // (an AutoRound package: Flash Next's precise mode on by itself, Engine::fn_precise)
+  bool audio = false;  // the image projector also holds a Gemma 4 audio encoder (loaded with it: vision variants only)
+  bool flashnext = false, qsa = false;  // (Qwen3.8 Flash Next; a trained QSA attention indexer: the catalog's applies words)
+  std::string vopt, vval;  // (an option variant, with_variant: the catalog option and its value; empty: none)
+  // inferzero, a file with a DFlash2 drafter: 0 both drafters, picked per step (the file's id); 1 the MTP block
+  // only (-nodf); 2 DFlash2 only, the MTP block not loaded (-df)
+  int draft = 0;
+  std::string base, tags;
+  std::string note;  // (why it cannot load, when the file says: a package or GSQ conversion from before 2026-11-10)
+  // (the id this variant had until release 2026.11.22.24, for a file whose id ends in "-mtp": still accepted as a
+  //  name, not listed. The Researcher's review, 2026-11-22)
+  std::string old_alias;
+};
+// a requested name for this entry: its id, or its id of before 2026.11.22.25
+inline bool alias_is(const ModelInfo& m, const std::string& w) { return m.alias == w || (!m.old_alias.empty() && m.old_alias == w); }
+// Two spellings of one model file (separators, case, a path given on the command line vs one found by the scan).
+static std::string lower_ascii(std::string s) {
+  for (auto& c : s) c = (char)tolower((unsigned char)c);
+  return s;
+}
+static bool same_file(const std::string& a, const std::string& b) {
+  if (a == b) return true;
+  std::error_code ec;
+  const bool eq = std::filesystem::equivalent(a, b, ec);
+  return !ec && eq;
+}
+// (defined below) the auto context of a model file with / without its MTP block and image encoders
+static int auto_ctx_tokens(const std::string& model, bool mtp, bool vision);
+static std::string find_dflash(const std::string& model);  // (defined below) a DFlash2 drafter for the file
+
+// the Hugging Face cache (HF_HUB_CACHE, HF_HOME\hub or %USERPROFILE%\.cache\huggingface\hub)
+static std::string hf_hub_dir() {
+  if (const char* v = getenv("HF_HUB_CACHE")) return v;
+  if (const char* h = getenv("HF_HOME")) return std::string(h) + "/hub";
+#ifdef _WIN32
+  if (const char* u = getenv("USERPROFILE")) return std::string(u) + "/.cache/huggingface/hub";
+#else
+  if (const std::string h = plat::hf_home_hub(); !h.empty()) return h;  // ($XDG_CACHE_HOME or ~/.cache)
+#endif
+  return "";
+}
+// extra model folders (e.g. a second drive): ARC_MODEL_DIRS (';'-separated) and %USERPROFILE%\.inferzero\model-dirs.txt
+// (one folder per line, '#' comments); each in the Hugging Face cache layout or with .gguf files directly in it
+static std::vector<std::string> extra_model_dirs() {
+  std::vector<std::string> extra;
+  auto add = [&](std::string d) {
+    // (a UTF-8 BOM in front: a file written by PowerShell 5.1's Set-Content / Add-Content -Encoding UTF8 or Notepad's
+    //  "UTF-8 with BOM" made the first folder "\xEF\xBB\xBFD:\..." and it was never found)
+    if (d.size() >= 3 && (unsigned char)d[0] == 0xEF && (unsigned char)d[1] == 0xBB && (unsigned char)d[2] == 0xBF) d.erase(0, 3);
+    while (!d.empty() && (d.back() == '\r' || d.back() == ' ' || d.back() == '\t')) d.pop_back();
+    while (!d.empty() && (d.front() == ' ' || d.front() == '\t')) d.erase(d.begin());
+    if (!d.empty() && d[0] != '#') extra.push_back(d);
+  };
+  if (const char* v = getenv("ARC_MODEL_DIRS")) {
+    std::string all = v;
+    for (size_t a = 0, b; a <= all.size(); a = b + 1) {
+      b = all.find(';', a);
+      if (b == std::string::npos) b = all.size();
+      add(all.substr(a, b - a));
+    }
+  }
+  {
+    std::ifstream f(std::filesystem::path(app_dir()) / "model-dirs.txt");
+    for (std::string line; std::getline(f, line);) add(line);
+  }
+  return extra;
+}
+// (a folder on a drive that hangs, e.g. a USB stick after the laptop slept, would stall every model list and so
+//  every server start: each folder is first listed by a detached thread and skipped if that takes over 2 s)
+// 1: listed, 2: not a readable folder, 0: no answer within 2 s
+static int folder_reachable(const std::filesystem::path& d) {
+  // (a folder whose last check still hangs: skipped at once, not another thread left hanging on it per model list.
+  //  One that hung or could not be read is remembered for 60 s, so a dead drive costs at most one 2-s wait a
+  //  minute instead of one per model list; the map is swept when it grows. Audit 2026-11-12 #10)
+  struct Seen {
+    std::shared_ptr<std::atomic<int>> st;
+    std::chrono::steady_clock::time_point at;
+  };
+  static std::mutex mu;
+  static std::map<std::string, Seen> pending;
+  const auto now = std::chrono::steady_clock::now();
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    auto it = pending.find(d.string());
+    if (it != pending.end()) {
+      const int v = it->second.st->load();
+      if (v == 0) return 0;
+      if (v == 2 && now - it->second.at < std::chrono::seconds(60)) return 2;
+      pending.erase(it);
+    }
+    if (pending.size() > 64)
+      for (auto i = pending.begin(); i != pending.end();)
+        i = i->second.st->load() != 0 && now - i->second.at >= std::chrono::seconds(60) ? pending.erase(i) : std::next(i);
+  }
+  auto st = std::make_shared<std::atomic<int>>(0);
+  try {  // (no thread to be had: the folder is skipped this time, the model list still answers)
+    std::thread([d, st] {
+      std::error_code e;
+      const bool ok = std::filesystem::is_directory(d, e);
+      if (ok) std::filesystem::directory_iterator it(d, e);
+      st->store(ok && !e ? 1 : 2);
+    }).detach();
+  } catch (const std::system_error&) {
+    return 0;
+  }
+  for (int i = 0; i < 100 && st->load() == 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  const int r = st->load();
+  if (r != 1) {  // (still hanging: remembered until its thread answers; not readable: for 60 s)
+    std::lock_guard<std::mutex> lk(mu);
+    pending[d.string()] = Seen{st, std::chrono::steady_clock::now()};
+  }
+  return r;
+}
+
+// The entries of a folder (recursive: of its whole tree). A folder that cannot be read gives none; an error partway
+// ends the list (a range-for over a directory_iterator throws from ++ even when it was opened with an error_code);
+// a name the ANSI code page cannot spell is left out (path::string(), used on every entry here, throws for it).
+static std::vector<std::filesystem::directory_entry> dir_list(const std::filesystem::path& dir, bool recursive = false) {
+  namespace fs = std::filesystem;
+  std::vector<fs::directory_entry> v;
+  std::error_code ec;
+  auto add = [&](const fs::directory_entry& e) {
+    try {
+      (void)e.path().string();
+    } catch (const std::exception&) {
+      return;
+    }
+    v.push_back(e);
+  };
+  if (recursive)
+    for (fs::recursive_directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) add(*it);
+  else
+    for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) add(*it);
+  return v;
+}
+
+// The name a model file and its projector share: lower case, without .gguf, "mmproj" and the quantization or split
+// part's suffix (from the first "-q4...", "-iq3...", "-f16", "-bf16", "-f32", "-ud-", "-0000...")
+static std::string mmproj_key(std::string f) {
+  f = lower_ascii(f);
+  if (f.size() > 5 && f.compare(f.size() - 5, 5, ".gguf") == 0) f.resize(f.size() - 5);
+  for (const char* m : {"mmproj-", "mmproj_", "-mmproj", "_mmproj", "mmproj"})
+    if (const size_t p = f.find(m); p != std::string::npos) {
+      f.erase(p, strlen(m));
+      break;
+    }
+  size_t cut = f.size();
+  for (size_t i = 1; i < f.size() && cut == f.size(); ++i) {
+    if (f[i - 1] != '-' && f[i - 1] != '_' && f[i - 1] != '.') continue;
+    auto at = [&](const char* s) { return f.compare(i, strlen(s), s) == 0; };
+    const auto dg = [&](size_t k) { return k < f.size() && f[k] >= '0' && f[k] <= '9'; };
+    if ((f[i] == 'q' && dg(i + 1)) || (at("iq") && dg(i + 2)) || at("f16") || at("bf16") || at("f32") || at("fp16") ||
+        at("ud-") || at("ud_") || at("0000") || at("mxfp4"))
+      cut = i - 1;
+  }
+  f.resize(cut);
+  while (!f.empty() && (f.back() == '-' || f.back() == '_' || f.back() == '.')) f.pop_back();
+  return f;
+}
+// The mmproj-*.gguf files next to a model that are its own, in the folder's order. In a Hugging Face snapshot
+// folder (one repository) and in a folder with this model alone, every one; in a folder of several models (a
+// user's D:\models) only those named after it, "mmproj-<its name>", quantizations aside. Before, a folder's first
+// projector went with every model in it: a Qwen3.8 27B fine-tune took an unrelated one of the same width (a
+// user's report, 2026-11-11). --mmproj FILE still takes any.
+static std::vector<std::filesystem::path> model_mmprojs(const std::filesystem::path& model) {
+  namespace fs = std::filesystem;
+  std::vector<fs::path> mm;
+  int models = 0;
+  for (const auto& de : dir_list(model.parent_path())) {
+    const fs::path& p = de.path();
+    const std::string f = lower_ascii(p.filename().string());
+    if (f.size() < 5 || f.compare(f.size() - 5, 5, ".gguf") != 0) continue;
+    if (f.find("mmproj") != std::string::npos) {
+      mm.push_back(p);
+    } else if (f.rfind("mtp-", 0) != 0) {  // (a model: a split one counted once, by its first part)
+      // (a part is "-NNNNN-of-NNNNN.gguf" at the end: "Mixture-of-Experts-Q4_K_M.gguf" is a model; as zero-server's pack)
+      const auto dig = [&](size_t a, size_t n) {
+        for (size_t i = a; i < a + n; ++i) if (f[i] < '0' || f[i] > '9') return false;
+        return true;
+      };
+      const size_t L = f.size();  // ("-00002-of-00003.gguf": 20 characters)
+      const bool part = L >= 20 && f[L - 20] == '-' && dig(L - 19, 5) && f.compare(L - 14, 4, "-of-") == 0 && dig(L - 10, 5);
+      if (!part || f.compare(L - 19, 5, "00001") == 0) ++models;
+    }
+  }
+  const std::string ml = lower_ascii(model.string());
+  if (mm.empty() || models <= 1 || ml.find("\\snapshots\\") != std::string::npos || ml.find("/snapshots/") != std::string::npos)
+    return mm;
+  const std::string mk = mmproj_key(model.filename().string());
+  std::vector<fs::path> own;
+  for (const fs::path& p : mm) {
+    const std::string k = mmproj_key(p.filename().string());
+    // (the same name, or one the other's start followed by '-' / '_': "qwen3" is not "qwen3.5-4b"'s, "gemma-4-26b-it"
+    //  is "gemma-4-26b"'s)
+    const std::string& lo = k.size() >= mk.size() ? k : mk;
+    const std::string& sh = k.size() >= mk.size() ? mk : k;
+    if (!sh.empty() && lo.compare(0, sh.size(), sh) == 0 &&
+        (lo.size() == sh.size() || lo[sh.size()] == '-' || lo[sh.size()] == '_'))
+      own.push_back(p);
+  }
+  return own;
+}
+
+// What scan_models would find, cheaply: every .gguf's path and size in the folders it reads (no GGUF opened). The
+// server rescans only when this changed (a download, a file deleted or added), not for every request naming a model
+// the list lacks: each rescan parsed every model's header, tokenizer arrays included (~1.3 s for a few models), and
+// the request waited for it (issue #39)
+static std::string models_fingerprint() {
+  namespace fs = std::filesystem;
+  std::string fp;
+  std::error_code ec;
+  auto add = [&](const fs::path& p) {
+    if (p.extension() == ".gguf") fp += p.string() + "|" + std::to_string(fs::file_size(p, ec)) + "\n";
+  };
+  // (the folders as deep as scan_models reads them: loose files, plain folders one level, models--*\snapshots all
+  //  the way; not a whole tree walked under the server's lock for an extra folder such as a drive's root; and the
+  //  packages folder, whose new package was not seen until a restart; self audit 2026-11-19)
+  auto walk = [&](const fs::path& dir) {
+    if (dir.empty()) return;
+    for (const auto& d : dir_list(dir)) {
+      if (!d.is_directory(ec)) {
+        add(d.path());
+        continue;
+      }
+      if (d.path().filename().string().rfind("models--", 0) != 0) {
+        for (const auto& e : dir_list(d.path())) add(e.path());
+        continue;
+      }
+      for (const auto& e : dir_list(d.path() / "snapshots", true)) add(e.path());
+    }
+  };
+  if (const std::string hub = hf_hub_dir(); !hub.empty()) walk(hub);
+  for (const auto& d : extra_model_dirs())
+    if (folder_reachable(fs::path(d)) == 1) walk(fs::path(d));
+  for (const auto& e : dir_list(fs::path(app_dir()) / "models")) add(e.path());
+  for (const auto& d : dir_list(zpack::packages_dir()))
+    if (d.is_directory(ec)) add(d.path() / (d.path().filename().string() + ".gguf"));
+  return fp;
+}
+
+static std::vector<ModelInfo> scan_models() {
+  namespace fs = std::filesystem;
+  const std::string hub = hf_hub_dir();
+  // (prio: 0 the Hugging Face cache and inferzero's own folders, 1+ the extra model folders in their order, so a model
+  //  kept in both places loads from the first)
+  struct Cand { std::string name, file; fs::path path; fs::file_time_type t; int prio = 0; };
+  std::vector<Cand> cands;
+  auto lower = [](std::string s) { for (auto& c : s) c = (char)tolower((unsigned char)c); return s; };
+  auto is_model = [&](const fs::path& p) {
+    const std::string f = lower(p.filename().string());
+    // (projectors: mmproj-*.gguf, or *-mmproj.gguf as Google names them)
+    if (p.extension() != ".gguf" || f.find("mmproj") != std::string::npos || f.rfind("mtp-", 0) == 0) return false;
+    const size_t k = f.find("-of-");  // split files: only part 1
+    return k == std::string::npos || k < 6 || f.compare(k - 5, 5, "00001") == 0;
+  };
+  std::error_code ec;
+  // a Hugging Face cache layout (models--org--repo\snapshots\<rev>\...), plain folders of .gguf files beside it (a
+  // copied model); in extra folders also loose .gguf files
+  auto scan_hub = [&](const fs::path& dir, int prio) {
+    for (const auto& d : dir_list(dir)) {
+      const std::string dn = d.path().filename().string();
+      if (prio > 0 && is_model(d.path()) && d.is_regular_file(ec)) {
+        cands.push_back({"local/" + d.path().stem().string(), dn, d.path(), d.last_write_time(ec), prio});
+        continue;
+      }
+      if (!d.is_directory(ec)) continue;
+      if (dn.rfind("models--", 0) != 0) {  // a plain folder of .gguf files (a copy, a manual download): one level deep
+        for (const auto& e : dir_list(d.path()))
+          if (is_model(e.path()) && e.is_regular_file(ec))
+            cands.push_back({"local/" + dn, e.path().filename().string(), e.path(), e.last_write_time(ec), prio});
+        continue;
+      }
+      std::string name = dn.substr(8);
+      const size_t sep = name.find("--");
+      if (sep != std::string::npos) name.replace(sep, 2, "/");
+      for (const auto& e : dir_list(d.path() / "snapshots", true))
+        if (is_model(e.path())) cands.push_back({name, e.path().filename().string(), e.path(), e.last_write_time(ec), prio});
+    }
+  };
+  if (!hub.empty()) scan_hub(hub, 0);
+  {
+    int prio = 1;
+    for (const auto& d : extra_model_dirs()) {
+      const int r = folder_reachable(fs::path(d));
+      if (r == 1) scan_hub(fs::path(d), prio);
+      else if (r == 0) zlog::eprintf("model folder %s did not answer within 2 s (drive asleep or hung?): skipped\n", d.c_str());
+      ++prio;
+    }
+  }
+  for (const auto& e : dir_list(fs::path(app_dir()) / "models"))
+    if (is_model(e.path())) cands.push_back({"inferzero/" + e.path().stem().string(), e.path().filename().string(), e.path(), e.last_write_time(ec)});
+  // inferzero packages (zero/gguf_pack.h): %USERPROFILE%\.inferzero\zero\models\<name>\<name>.gguf
+  for (const auto& d : dir_list(zpack::packages_dir())) {
+    const fs::path g = d.path() / (d.path().filename().string() + ".gguf");
+    if (d.is_directory(ec) && fs::exists(g, ec))
+      cands.push_back({"inferzero/" + d.path().filename().string(), g.filename().string(), g, fs::last_write_time(g, ec)});
+  }
+  // the same file in several snapshots (revisions) or folders: the first folder, then the newest
+  std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) {
+    return a.name != b.name ? a.name < b.name : a.file != b.file ? a.file < b.file : a.prio != b.prio ? a.prio < b.prio : a.t > b.t;
+  });
+  // A copy of a file listed elsewhere too (the same name and size, e.g. a backup of the C: model on an external drive):
+  // listed once, from the place that keeps the id below (a package, then the Hugging Face cache, then the extra
+  // folders), within one place from the Windows drive first; a file of the same name with another size stays. The
+  // GGUF a package was made from (its inferzero.source) is not listed either: the package is the same model with
+  // its expert file already written (loading the source would write that file again).
+  {
+    std::error_code e2;
+    const std::string hub_c = lower_ascii(fs::weakly_canonical(hf_hub_dir(), e2).string()),
+                      pk_c = lower_ascii(fs::weakly_canonical(zpack::packages_dir(), e2).string());
+    const char* sd = getenv("SystemDrive");
+    const std::string sys = lower_ascii(sd && *sd ? std::string(sd) : std::string("C:"));
+    std::map<std::string, std::tuple<int, int, int, size_t>> best;  // file|bytes -> (place, not Windows drive, prio, index)
+    std::vector<std::string> keys(cands.size());
+    for (size_t i = 0; i < cands.size(); ++i) {
+      std::error_code e3;
+      const std::string pc = lower_ascii(fs::weakly_canonical(cands[i].path, e3).string());
+      const int place = pc.rfind(pk_c, 0) == 0 ? 0 : !hub_c.empty() && pc.rfind(hub_c, 0) == 0 ? 1 : 2;
+      keys[i] = lower(cands[i].file) + "|" + std::to_string(gguf_bytes(cands[i].path.string()));
+      const auto r = std::make_tuple(place, pc.rfind(sys, 0) == 0 ? 0 : 1, cands[i].prio, i);  // (i: the sorted order)
+      auto it = best.find(keys[i]);
+      if (it == best.end() || r < it->second) best[keys[i]] = r;
+    }
+    std::set<std::string> packed;  // the source file names of the packages
+    std::vector<bool> is_pack(cands.size(), false);
+    for (size_t i = 0; i < cands.size(); ++i) {
+      std::error_code e3;
+      if (lower_ascii(fs::weakly_canonical(cands[i].path, e3).string()).rfind(pk_c, 0) != 0) continue;
+      is_pack[i] = true;
+      try {
+        const GgufFile g(cands[i].path.string());
+        const std::string src = g.get_str("inferzero.source", "");
+        // (an AutoRound package, tools/import_autoround_pack: other expert weights than its source, so another model;
+        //  the UD-Q4_K_XL it took the rest from stays listed)
+        if (!src.empty() && g.get_str("inferzero.autoround.model", "").empty()) packed.insert(lower(src));
+      } catch (const std::exception&) {
+      }
+    }
+    std::vector<Cand> kept;
+    for (size_t i = 0; i < cands.size(); ++i)
+      if (std::get<3>(best[keys[i]]) == i && (is_pack[i] || !packed.count(lower(cands[i].file)))) kept.push_back(cands[i]);
+    cands.swap(kept);
+  }
+  static const std::map<std::string, std::pair<std::string, std::string>> known = {
+      {"Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf", {"qwen3.8-27b", "27b"}},
+      {"Qwen3.6-35B-A3B-GSQ2-arc.gguf", {"qwen3.6-35b-a3b", "35b"}},
+      // Unsloth's standard GGUFs: 35b = UD-Q3_K_M (IQ4_XS down experts), 35b-s = UD-Q3_K_S (smaller: longer context)
+      {"Qwen3.6-35B-A3B-UD-Q3_K_M.gguf", {"qwen3.6-35b-a3b", "35b"}},
+      {"Qwen3.6-35B-A3B-UD-Q3_K_S.gguf", {"qwen3.6-35b-a3b-s", "35b-s"}},
+      // UD-IQ4_XS from the MTP repository (the tested 35B file since 18 Oct; it keeps the id it had): 35b as well (with
+      // a UD-Q3_K_M or GSQ file also downloaded, the first one found keeps the shortcut)
+      {"Qwen3.6-35B-A3B-UD-IQ4_XS.gguf", {"qwen3.6-35b-a3b-mtp", "35b"}},
+      {"Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf", {"qwen3.8-flash-next-gsq-rco", "flash"}},
+      // (its inferzero package keeps the id and the shortcut; with both on disk the GGUF's entry comes first)
+      {"Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S.gguf", {"qwen3.8-flash-next-gsq-rco", "flash"}},
+      // (Intel's AutoRound INT4 experts in a package, setup -Models flash-ar4: precise mode on by itself)
+      {"Qwen3.8-Flash-Next-AutoRound-INT4.gguf", {"qwen3.8-flash-next-autoround", "flash-ar4"}},
+      {"Qwen3.5-9B-UD-Q4_K_XL.gguf", {"qwen3.5-9b", "9b"}},
+      {"Qwen3.5-4B-UD-Q4_K_XL.gguf", {"qwen3.5-4b", "4b"}},
+      {"gemma-4-12b-it-qat-q4_0.gguf", {"gemma4-12b", "g12"}},
+      {"gemma-4-E4B_q4_0-it.gguf", {"gemma4-e4b", "e4b"}},
+      {"gemma-4-26B_q4_0-it.gguf", {"gemma4-26b", "g26"}},
+      {"gemma-4-31B_q4_0-it.gguf", {"gemma4-31b", "g31"}},
+      // (Unsloth's Inkling 2 Mini, the mainline file; supported since its KL, docs/inkling2.md)
+      {"Inkling-2-Mini-UD-Q8_K_XL.gguf", {"inkling-2-mini", "inkling"}}};
+  std::vector<ModelInfo> out;
+  for (size_t i = 0; i < cands.size(); ++i) {
+    const Cand& c = cands[i];
+    if (i > 0 && cands[i - 1].name == c.name && cands[i - 1].file == c.file) continue;
+    ModelInfo m;
+    m.name = c.name;
+    m.file = c.file;
+    m.path = c.path.lexically_normal().string();  // (HF_HOME and the cache folder joined: one kind of separator)
+    m.bytes = gguf_bytes(c.path.string());  // (a split file: all its parts)
+    m.arch = "?";
+    int64_t nextn = 0;
+    bool gsq = false;  // qwen35moe: only GSQ 2-bit experts (tools/convert_gsq.cpp) have kernels
+    try {
+      GgufFile g(m.path);
+      m.arch = g.get_str("general.architecture", "?");
+      gsq = g.get_str("inferzero.expert_format", "") == "gsq2-v1";
+      m.ctx_train = g.get_int(m.arch + ".context_length", 0);
+      nextn = g.get_int(m.arch + ".nextn_predict_layers", 0);
+      m.moe = g.get_int(m.arch + ".expert_count", 0) > 0;
+      m.precise_only = !g.get_str("inferzero.autoround.model", "").empty();
+      m.flashnext = m.arch == "qwen4exp";
+      m.qsa = g.get_int(m.arch + ".attention.indexer.head_count", 0) > 0;  // (a trained attention indexer: the QSA 27B, Flash Next)
+    } catch (const std::exception& e) {
+      // (a file from before the rename, keyed arcinferzero.*: listed as unsupported, and the log says why)
+      static std::mutex told_mu;
+      static std::set<std::string> told;
+      if (std::string(e.what()).find("arcinferzero") != std::string::npos) {
+        m.note = "made before 2026-11-10 (its keys are arcinferzero.*): a package: delete its folder, then load the original "
+                 "GGUF or pack it again (the launcher: More > Pack; or zero-server pack -Model <it>); a GSQ conversion: convert it again (setup -Models 35b-gsq)";
+        std::lock_guard<std::mutex> lk(told_mu);
+        if (told.insert(m.path).second) zlog::eprintf("inferzero: %s\n", e.what());
+      }
+    }
+    bool mmproj = false, drafter = false, audio = false;
+    const std::vector<std::filesystem::path> own_mm = model_mmprojs(c.path);  // (the projectors that are this model's)
+    for (const auto& s : dir_list(c.path.parent_path())) {
+      const std::string f = lower(s.path().filename().string());
+      if (s.path().extension() != ".gguf") continue;
+      if (f.find("mmproj") != std::string::npos && !mmproj &&
+          std::find(own_mm.begin(), own_mm.end(), s.path()) != own_mm.end()) {  // images: a projector inferzero reads
+        try {
+          const GgufFile g(s.path().string());
+          const std::string pt = g.get_str("clip.vision.projector_type", "");
+          // (gemma4v: the head sizes the GPU encoder takes, 64 and 72 (26B-A4B))
+          const int64_t ve = g.get_int("clip.vision.embedding_length", 0), vh = g.get_int("clip.vision.attention.head_count", 0);
+          const bool g4v_ok = vh > 0 && ve % vh == 0 && VisionGemma4V::head_ok((int)(ve / vh));
+          mmproj = m.arch == "gemma4" ? pt == "gemma4uv" || (pt == "gemma4v" && g4v_ok)
+                                      : (m.arch == "qwen35" || m.arch == "qwen35moe" || m.arch == "qwen4exp") &&  // (qwen4exp:
+                                            VisionQwen3VL::usable(g);  //  Flash Next, its projector found since 2026-10-29)
+          // (audio: the encoders load_model loads, AudioGemma4A for gemma4a, AudioGemma4 for gemma4ua)
+          const std::string at = g.get_str("clip.audio.projector_type", "");
+          audio = mmproj && m.arch == "gemma4" && (at == "gemma4a" || at == "gemma4ua");
+        } catch (const std::exception&) {
+        }
+      }
+      drafter = drafter || f.rfind("mtp-", 0) == 0;
+    }
+    m.supported = m.arch == "qwen35" || m.arch == "qwen35moe" || m.arch == "gemma4";  // (MoE: GSQ or standard experts)
+    // (Inkling 2, since the real file's KL against ref_forward, 2026-11-24: 0.0048 prompt / 0.0043 decode, docs/inkling2.md)
+    m.supported = m.supported || m.arch == "inkling2" || m.arch == "inkling2_loop";
+    m.supported = m.supported || m.arch == "qwen4exp";  // (Qwen3.8 Flash Next: inferzero only, experts streamed)
+    (void)gsq;
+    m.vision = mmproj;  // (Gemma 4 12B: gemma4uv; E2B / E4B: gemma4v)
+    m.audio = audio;
+    // (Qwen3.8 Flash Next: its MTP head in an mtp-*.gguf next to it, QUEUE F34; the engine checks the file)
+    m.mtp = ((m.arch == "gemma4" || m.arch == "qwen4exp") && drafter) || nextn > 0;
+    const auto k = known.find(m.file);
+    if (k != known.end()) {
+      m.alias = k->second.first;
+      m.shortcut = k->second.second;
+      // the same file name in a repository that keeps the MTP block (Unsloth's *-MTP-GGUF next to *-GGUF): its own id
+      bool twin = false;  // (only then: Qwen3.5 4B / 9B come from *-MTP-GGUF repositories alone and keep their ids)
+      for (const Cand& o : cands) twin = twin || (o.file == c.file && o.name != c.name);
+      if (twin && nextn > 0 && m.alias.find("-mtp") == std::string::npos) {
+        m.alias += "-mtp";
+        if (!m.shortcut.empty()) m.shortcut += "-mtp";
+      }
+    } else {
+      bool several = false;
+      for (const Cand& o : cands) several = several || (o.name == c.name && o.file != c.file);
+      std::string a = several ? fs::path(m.file).stem().string() : m.name.substr(m.name.rfind('/') + 1);
+      a = lower(a);
+      if (a.size() > 5 && a.compare(a.size() - 5, 5, "-gguf") == 0) a.resize(a.size() - 5);
+      m.alias = a;
+    }
+    out.push_back(m);
+  }
+  // which copy of a model keeps its id and shortcut: a package first (--pack moved the GGUF's expert file into it, so
+  // loading the GGUF it was made from would write that file again), then the Hugging Face cache, then the extra
+  // folders (a backup on another drive); the others get -2, -3, ...
+  {
+    std::error_code e2;
+    const std::string hub_c = lower_ascii(fs::weakly_canonical(hf_hub_dir(), e2).string()),
+                      pk_c = lower_ascii(fs::weakly_canonical(zpack::packages_dir(), e2).string());
+    std::vector<std::pair<int, ModelInfo>> ranked;  // (each path looked at once)
+    for (ModelInfo& m : out) {
+      std::error_code e3;
+      const std::string p = lower_ascii(fs::weakly_canonical(m.path, e3).string());
+      const int r = p.rfind(pk_c, 0) == 0 ? 0 : !hub_c.empty() && p.rfind(hub_c, 0) == 0 ? 1 : 2;
+      ranked.push_back({r, std::move(m)});
+    }
+    std::stable_sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    for (size_t i = 0; i < out.size(); ++i) out[i] = std::move(ranked[i].second);
+  }
+  // every downloaded file selectable on its own: a repeated id gets -2, -3, ..., a repeated shortcut is dropped
+  for (size_t i = 0; i < out.size(); ++i) {
+    const std::string base = out[i].alias;
+    for (int n = 2;; ++n) {
+      bool clash = false;
+      for (size_t j = 0; j < i; ++j) clash = clash || out[j].alias == out[i].alias;
+      if (!clash) break;
+      out[i].alias = base + "-" + std::to_string(n);
+    }
+    for (size_t j = 0; j < i; ++j)
+      if (!out[i].shortcut.empty() && out[j].shortcut == out[i].shortcut) out[i].shortcut.clear();
+  }
+  // the variants: the full one first (the file's id and shortcut, as before), then MTP / vision / neither
+  std::vector<ModelInfo> all;
+  for (const ModelInfo& m : out) {
+    struct V { bool mtp, vision; const char* suffix; };
+    // A projector that leaves the model little context (Qwen3.6 35B: 4,096 tokens with it, 40,960 without at 18.3 GiB)
+    // is not loaded by default: the file's id is the variant without images, "-vision" the one with them.
+    bool vision_default = true;
+    if (m.supported && m.vision) {
+      const int cv = auto_ctx_tokens(m.path, m.mtp, true), ct = auto_ctx_tokens(m.path, m.mtp, false);
+      // (cv 0: with the projector nothing fits now, while without it a context does: not the default either)
+      vision_default = !(cv < 16384 && ct >= std::max(2 * cv, 4096));
+    }
+    std::vector<V> vs;
+    if (vision_default) {
+      vs.push_back({m.mtp, m.vision, ""});
+      if (m.supported && m.mtp && m.vision) vs.push_back({true, false, "-mtp"}), vs.push_back({false, true, "-vision"});
+      if (m.supported && (m.mtp || m.vision)) vs.push_back({false, false, "-std"});
+    } else {
+      vs.push_back({m.mtp, false, ""});
+      vs.push_back({false, true, "-vision"});
+      if (m.mtp) vs.push_back({false, false, "-std"});
+    }
+    for (const V& v : vs) {
+      ModelInfo e = m;
+      e.base = m.alias;
+      e.mtp = v.mtp;
+      e.vision = v.vision;
+      e.audio = v.vision && m.audio;  // (the audio encoder comes with the projector)
+      // (a file whose id already ends in "-mtp" (a repository's MTP GGUF, Unsloth's): the variants' suffixes go on
+      //  the id without it, so "-vision" / "-std" do not read as MTP ones, and the MTP one without images is
+      //  "-mtp-novision" instead of "-mtp-mtp"; the main id and the shortcuts as before. n005, #81, 2026-11-22)
+      const bool ends_mtp = m.alias.size() > 4 && m.alias.compare(m.alias.size() - 4, 4, "-mtp") == 0;
+      const std::string stem = ends_mtp ? m.alias.substr(0, m.alias.size() - 4) : m.alias;
+      e.alias = !*v.suffix || !ends_mtp ? m.alias + v.suffix
+                : std::string(v.suffix) == "-mtp" ? m.alias + "-novision" : stem + v.suffix;
+      if (*v.suffix && ends_mtp) e.old_alias = m.alias + v.suffix;
+      if (!m.shortcut.empty()) e.shortcut = m.shortcut + v.suffix;
+      e.tags = v.mtp && v.vision ? "MTP + vision" : v.mtp ? "MTP" : v.vision ? "vision" : "standard";
+      all.push_back(e);
+    }
+    // a file with a DFlash2 drafter: its main variant also with one drafter only (to pick in Pi's /model)
+    if (m.supported && all.back().base == m.alias && all[all.size() - vs.size()].mtp && !find_dflash(m.path).empty()) {
+      const ModelInfo main = all[all.size() - vs.size()];
+      for (int d = 1; d <= 2; ++d) {
+        ModelInfo e = main;
+        e.draft = d;
+        const char* suf = d == 1 ? "-nodf" : "-df";
+        e.alias = main.alias + suf;
+        if (!main.shortcut.empty()) e.shortcut = main.shortcut + suf;
+        e.tags = main.tags + (d == 1 ? " (MTP block only)" : " (DFlash2 only)");
+        all.push_back(e);
+      }
+    }
+  }
+  return all;
+}
+
+// A DFlash2 block drafter for a model file: a *DFlash2* repository (z-lab, incoai: config.json + model.safetensors)
+// in the Hugging Face cache or an extra model folder whose config is a DFlash2DraftModel of the model's width
+// (hidden_size = <arch>.embedding_length) and depth (num_target_layers = <arch>.block_count without the MTP layers);
+// the newest snapshot of the first folder that has one. Empty if none.
+// a DFlash2 drafter found next to a model is used only when the automatic context with it is at least this long (27B
+// with images, MTP and the drafter: 8,192 tokens; without the drafter 45,056)
+constexpr int kDflashMinCtx = 32768;
+static std::string find_dflash(const std::string& model) {
+  namespace fs = std::filesystem;
+  int64_t n_embd = 0, n_layer = 0;
+  try {
+    const GgufFile g(model);
+    const std::string arch = g.get_str("general.architecture", "");
+    n_embd = g.get_int(arch + ".embedding_length", 0);
+    n_layer = g.get_int(arch + ".block_count", 0) - g.get_int(arch + ".nextn_predict_layers", 0);
+  } catch (const std::exception&) {
+    return "";
+  }
+  if (n_embd <= 0 || n_layer <= 0) return "";
+  std::vector<std::string> dirs;
+  if (!hf_hub_dir().empty()) dirs.push_back(hf_hub_dir());
+  for (const auto& d : extra_model_dirs())
+    if (folder_reachable(fs::path(d)) == 1) dirs.push_back(d);
+  std::error_code ec;
+  for (const auto& dir : dirs) {
+    fs::path best;
+    fs::file_time_type best_t{};
+    for (const auto& d : dir_list(fs::path(dir))) {
+      const std::string dn = lower_ascii(d.path().filename().string());
+      if (!d.is_directory(ec) || dn.rfind("models--", 0) != 0 || dn.find("dflash") == std::string::npos) continue;
+      for (const auto& s : dir_list(d.path() / "snapshots")) {
+        if (!fs::exists(s.path() / "model.safetensors", ec)) continue;
+        std::ifstream f(s.path() / "config.json", std::ios::binary);
+        Json cfg;
+        if (!f || !Json::try_parse(std::string(std::istreambuf_iterator<char>(f), {}), cfg) || !cfg.is_object()) continue;
+        bool arch = false;
+        for (const auto& a : cfg["architectures"].items()) arch = arch || a.str() == "DFlash2DraftModel";
+        if (!arch || cfg["hidden_size"].as_int() != n_embd || cfg["num_target_layers"].as_int() != n_layer ||
+            !cfg["dflash_config"].is_object())
+          continue;
+        const fs::file_time_type t = fs::last_write_time(s.path(), ec);
+        if (best.empty() || t > best_t) best = s.path(), best_t = t;
+      }
+    }
+    if (!best.empty()) return best.lexically_normal().string();
+  }
+  return "";
+}
+
+// ---------------------------------------------------------------- --ctx auto
+// The largest context (a multiple of 4096, at most the trained one) for which the server's GPU memory, the ~0.22 GiB
+// the driver adds and ~0.95 GiB for the desktop and other apps fit the device's global memory. A dry load (the
+// engine adds up its allocations without making them: seconds, no GPU memory) gives what does not depend on the
+// context; the result is remembered per model file, chunk size, MTP setting and device memory in %USERPROFILE%\.inferzero\ctx-auto.txt.
+// (and GPU 0's kind for the catalog's copies of the engine's per-GPU defaults: 8-lane sub-groups, XMX)
+static bool g_dev_sg8 = false, g_dev_xmx = false;
+static uint64_t device_global_mem() {
+  static uint64_t dev = 0;
+  if (!dev) {
+    ClRt rt;
+    if (rt.init(false)) {
+      clGetDeviceInfo(rt.device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(dev), &dev, nullptr);
+      g_dev_sg8 = rt.sg8, g_dev_xmx = rt.xmx;
+    }
+    if (rt.queue) clReleaseCommandQueue(rt.queue);
+    if (rt.ctx) clReleaseContext(rt.ctx);
+    // (ARC_GPU_MEM_GB: as Engine::device_mem counts it, so a capped figure is remembered apart)
+    const double cap = getenv("ARC_GPU_MEM_GB") ? atof(getenv("ARC_GPU_MEM_GB")) : 0;
+    if (cap > 0) dev = std::min<uint64_t>(dev, (uint64_t)(cap * 1073741824.0));
+  }
+  return dev;
+}
+// whether GPU 0 is an integrated GPU (after device_global_mem's start of the runtime), for the catalog's copy of the
+// engine's chunk rules
+static bool device_integrated() {
+  static const int v = [] {
+    device_global_mem();
+    return zrt::integrated() ? 1 : 0;
+  }();
+  return v == 1;
+}
+static std::string ctx_cache_file() {
+  return app_dir() + ARC_DATA "ctx-auto.txt";
+}
+// (Flash Next's precise mode, whose f16 K/V rows take about twice the bytes of int8 ones: its default since 2026-11-22
+//  (ARC_FN_PRECISE=0 / --fast: the fast mode), and always for an AutoRound package; in the context key, so a size
+//  worked out in one mode is not reused in the other. Audit 2026-11-14. Only Flash Next files: the mode is theirs, and
+//  the other models' keys stay as they were now that it is on by default)
+static bool precise_model(const std::string& model, int opt_precise = -1) {  // (opt_precise: EngineOptions::fn_precise)
+  static const bool env = !getenv("ARC_FN_PRECISE") || atoi(getenv("ARC_FN_PRECISE")) != 0;
+  try {
+    const GgufFile g(model);
+    if (!g.get_str("inferzero.autoround.model", "").empty()) return true;
+    if (g.get_str("general.architecture", "") != "qwen4exp") return false;
+  } catch (const std::exception&) {
+    return false;
+  }
+  return opt_precise >= 0 ? opt_precise != 0 : env;
+}
+// (Flash Next's HC mixer rows, BF16 by default since 2026-11-19 (0.73 GiB more than the Q8_0 rows of before): in its
+//  context key, so a size worked out with the smaller rows is not reused; the other models' keys are unchanged)
+static std::string hc_rows_tag(const std::string& model) {
+  try {
+    const GgufFile g(model);
+    if (g.get_str("general.architecture", "") != "qwen4exp") return std::string();
+  } catch (const std::exception&) {
+    return std::string();
+  }
+  return Engine::hc_bf16_env() ? "|hcb" : "|hcq";
+}
+static std::string ctx_key(const std::string& model, const EngineOptions& eo) {
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  std::string p = fs::absolute(model, ec).lexically_normal().make_preferred().string();  // one spelling per file
+  for (auto& c : p) c = (char)tolower((unsigned char)c);
+  return p + "|" + std::to_string(fs::file_size(model, ec)) + "|" + std::to_string(eo.chunk) +
+         "|z" + std::string(eo.stream_experts ? "s" : "n") +
+         (eo.dflash.empty() ? std::string() : eo.mtp_block ? "|dflash" : "|dflash-only") + 
+         (eo.slots > 1 ? "|slots" + std::to_string(eo.slots) + "/" + std::to_string(Engine::kSlotCtxFloor) : std::string()) +
+         "|md" + std::to_string(eo.mtp_drafts) + "|" +  // (DFlash2 drafter: its weights and buffers; 4-bit V)
+         // (a model-list variant's options, only when set: the keys of before stay as they were)
+         (eo.qsa >= -1 ? "qsa" + std::to_string(eo.qsa) + "|" : std::string()) +
+         (eo.mtp_vocab >= 0 ? "mv" + std::to_string(eo.mtp_vocab) + "|" : std::string()) +
+         (eo.h8_q2 >= 0 ? "q2" + std::to_string(eo.h8_q2) + "|" : std::string()) +
+         // (--mtp-model: its head's experts are pinned on the GPU, a Q8_0 head about twice a Q4_0 one; audit 2026-11-17)
+         (eo.mtp_model.empty() ? std::string() : "mm" + std::filesystem::path(eo.mtp_model).filename().string() + "|") +
+         (eo.min_chunk ? "/" + std::to_string(eo.min_chunk) : std::string()) + "|" + (eo.mtp ? "mtp" : "-") + "|" + (!eo.attn_int8 ? "f32" : precise_model(model, eo.fn_precise) ? "p16" : "i8") + "|" + std::to_string(device_global_mem()) +
+         (eo.tp_size > 1 ? "|tp" + std::to_string(eo.tp_size) + (getenv("ARC_TP_SIM") ? "sim" : "") : std::string()) +  // (a split model: shard 0's memory)
+         (eo.pp_size > 1 ? "|pp" + std::to_string(eo.pp_begin) + "-" + std::to_string(eo.pp_end) + "/" + std::to_string(eo.pp_size) + (getenv("ARC_TP_SIM") ? "sim" : "") : std::string()) +  // (a layer split: one stage's layers)
+         "|kf" + std::string(getenv("ARC_G4_KF16") ? getenv("ARC_G4_KF16") : "") + "/" +
+         std::string(getenv("ARC_Q3_KF32") ? getenv("ARC_Q3_KF32") : "") +  // (the float K rows' size)
+         hc_rows_tag(model) + "|m26";  // engine memory layout version (m26: a dense model larger than a discrete card keeps weights in RAM,
+                  // 2026-11-16: a cached 0 from before must not keep it refused; m25: Gemma 4's K rows in f16, 2026-11-11; m24: 0 when nothing fits, not raised to 4096) (m2: Q8_0 not stored twice, m4: MoE stacked router, m5: 3 MTP drafts
+                 // for 27B, m6: MoE prompt GEMM staging, m7: MoE buffers shared, m8: MoE MTP 1 draft, Q3_K experts, m9: memory parts in the cache,
+                 // m12: streamed MoE reserves 128K of context before the expert cache, m13: streamed MoE chunk 8192, m14: slot_bytes with every
+                 // slot buffer, f16 K / V with --attn-f32, m15: --q2 Gemma MoE chunk 2048, m16: Gemma 4 always two-pass, m17: shared-KV Gemma
+                 // sliding rings, m18: Gemma int8 KV copies only for the drafter's layers,
+                 // m19: GPU share - 1.2 GB, no Windows reserve, m20: Gemma streamed experts' cache floor 0.6,
+                 // m21: a dense model over 70 % of an iGPU's share: weights in host memory, chunk 1024, smaller rings, m22: those bounded by the free RAM, not remembered, m23: over 85 %, was 70 %);
+                 // bump on changes
+}
+// "ctx\tresident" lines (older lines without the second field are computed again)
+// The largest context that fits, whether decoded weights stay resident, and how the GPU memory was counted (bytes):
+// device total, kept free for Windows / other apps, the server's state snapshots, the encoders' reserve, the model's
+// weights, MTP block / drafter, working buffers, the context (KV caches) at ctx, and the context per 1024 tokens.
+struct AutoCtx {
+  int ctx = 4096;
+  bool resident = false;
+  double dev = 0, keep = 0, snap = 0, reserve = 0, weights = 0, mtp = 0, buffers = 0, context = 0, per_1k = 0;
+  double host_gb = 0;  // (weights the probe put in host memory, Engine::plan_tight: the load puts the same; not cached)
+  int chunk = 0;  // (the prompt chunk a choice below took, mtp_trade_chunk / moe_grow_chunk; 0: the engine's default)
+};
+static bool cached_ctx(const std::string& key, AutoCtx& r) {
+  std::ifstream f(ctx_cache_file());
+  std::string line;
+  while (std::getline(f, line)) {
+    const size_t t = line.find('\t');
+    if (t == std::string::npos || line.substr(0, t) != key) continue;
+    std::vector<std::string> c;
+    for (size_t a = t + 1;;) {
+      const size_t b = line.find('\t', a);
+      c.push_back(line.substr(a, b == std::string::npos ? std::string::npos : b - a));
+      if (b == std::string::npos) break;
+      a = b + 1;
+    }
+    if (c.size() < 2) continue;
+    // (a damaged row, a crash during the append or two servers appending at once, is skipped and the context computed
+    //  again: std::stoi threw "invalid stoi argument" out of the load, and a row cut inside its digits gave a 12-token
+    //  context. A real row holds 0 (nothing fits), a model's trained context when it is shorter than 4096 (bge: 512), or
+    //  4096 tokens or more; audit 2026-11-13 #4)
+    int v = -1;
+    const auto pr = std::from_chars(c[0].data(), c[0].data() + c[0].size(), v);
+    if (pr.ec != std::errc() || pr.ptr != c[0].data() + c[0].size() || (v != 0 && (v < 256 || v > (1 << 24)))) continue;
+    r.ctx = v;
+    r.resident = c[1] == "1";
+    double* mem[] = {&r.dev, &r.keep, &r.snap, &r.reserve, &r.weights, &r.mtp, &r.buffers, &r.context, &r.per_1k};
+    for (size_t i = 0; i < 9 && i + 2 < c.size(); ++i) *mem[i] = atof(c[i + 2].c_str());
+    return true;
+  }
+  return false;
+}
+// The largest context that fits next to the weights, and whether the decoded W8 weights stay resident. They do
+// when that still leaves at least min(128K, trained) tokens of context (a resident model processes a short prompt
+// ~4x sooner: Qwen3.5 9B, 83 tokens: 1.05 -> 0.27 s; otherwise every request decodes every matrix again), else
+// just in time with the largest context. An explicit --budget (budget_given) keeps the old rule.
+// GPU bytes of the model's image / audio encoders (uploaded on the first image or clip, so the engine's own
+// accounting misses them): --ctx auto keeps them free. 0 without a GPU encoder (Gemma 4 12B's run on the CPU).
+static size_t encoder_reserve(const std::string& model, const std::string& mmproj_opt, int img_max) {
+  if (mmproj_opt == "-") return 0;
+  namespace fs = std::filesystem;
+  std::string mp = mmproj_opt;
+  std::error_code ec;
+  if (mp.empty())
+    if (const auto own = model_mmprojs(fs::path(model)); !own.empty()) mp = own[0].string();
+  if (mp.empty()) return 0;
+  try {
+    const GgufFile m(model), g(mp);
+    const std::string arch = m.get_str("general.architecture", "");
+    size_t b = 0;
+    if ((arch == "qwen35" || arch == "qwen35moe") && VisionQwen3VL::usable(g)) b += VisionQwen3VL::gpu_bytes(g, img_max > 0 ? img_max : 2048);
+    if (arch == "gemma4") {
+      if (g.get_str("clip.vision.projector_type", "") == "gemma4v") b += VisionGemma4V::gpu_bytes(g, img_max > 0 ? img_max : 1120);
+      if (g.get_str("clip.audio.projector_type", "") == "gemma4a") b += AudioGemma4A::gpu_bytes(g);
+    }
+    return b ? b + ((size_t)64 << 20) : 0;  // (+ kernels and slack)
+  } catch (const std::exception&) {
+    return 0;
+  }
+}
+// (set while the model list sizes its rows: its "--ctx auto:" lines are only the picker's figures, at debug level.
+//  At the info level they read as the loaded model's context being changed, while it kept its --ctx: issue #39)
+inline thread_local bool g_ctx_listing = false;
+struct CtxListing {
+  bool was = g_ctx_listing;
+  CtxListing() { g_ctx_listing = true; }
+  ~CtxListing() { g_ctx_listing = was; }
+};
+static AutoCtx auto_ctx(const std::string& model, EngineOptions eo, bool budget_given = false, size_t reserve = 0) {
+  namespace fs = std::filesystem;
+  const std::string key = ctx_key(model, eo) + (budget_given ? "|b" + std::to_string(eo.w8_budget_gb) : "|auto") +
+                          (reserve ? "|r" + std::to_string(reserve >> 20) : std::string());
+  AutoCtx r;
+  if (cached_ctx(key, r)) return r;
+  // (the model list's figures kept for the process too, the ones ctx-auto.txt does not remember included (a model
+  //  that nearly fills the card): a rescan, run by a request naming a model the list does not have, repeated their dry
+  //  loads each time, and the request waited for them; a benchmark saw tens of seconds of "prompt" now and then,
+  //  issue #39. A real load still works its context out afresh)
+  static std::mutex list_mu;
+  static std::map<std::string, AutoCtx> list_memo;
+  if (g_ctx_listing) {
+    std::lock_guard<std::mutex> g(list_mu);
+    if (auto it = list_memo.find(key); it != list_memo.end()) return it->second;
+  }
+  struct Memo {
+    const std::string& k;
+    AutoCtx& r;
+    bool on;
+    ~Memo() {
+      if (!on || std::uncaught_exceptions()) return;
+      std::lock_guard<std::mutex> g(list_mu);
+      list_memo[k] = r;
+    }
+  } memo{key, r, g_ctx_listing};
+  int trained = 0;
+  {
+    GgufFile g(model);
+    trained = (int)g.get_int(g.get_str("general.architecture") + ".context_length", 32768);
+  }
+  AutoCtx m1, m2;  // (memory counts of each probe)
+  // (a model that nearly fills the share, Engine::plan_tight: contexts under 4096 too, in steps of 1024, and the result
+  //  not remembered, as its weights in host memory follow the RAM free at each start)
+  bool tight = false, host = false;
+  auto fit = [&](double budget_gb, bool& res, AutoCtx& mo) {
+    EngineOptions e2 = eo;
+    e2.ctx = std::min(16384, trained);
+    e2.dry = true;
+    e2.stream_reserve = std::max(e2.stream_reserve, reserve);  // (streamed experts: the cache leaves room for the encoders)
+    e2.w8_budget_gb = budget_gb;
+    Engine probe(model, e2);
+    res = probe.w8_resident;
+    const double gib = 1073741824.0,
+                 budget = probe.device_mem() / (e2.tp_size > 1 && getenv("ARC_TP_SIM") ? e2.tp_size : e2.pp_size > 1 && getenv("ARC_TP_SIM") ? e2.pp_size : 1) -
+                          Engine::driver_slack() - probe.snapshot_bytes() - (double)reserve;  // (ARC_TP_SIM: every shard on GPU 0)
+    const double base = (double)probe.gpu_bytes - (double)probe.ctx_bytes(e2.ctx);
+    // (--slots N: N - 1 more KV caches, states and snapshots of the same context)
+    auto need = [&](int c) { return base + probe.ctx_bytes(c) + (double)(std::max(eo.slots, 1) - 1) * probe.slot_bytes(c); };
+    int ctx = 0;
+    tight = tight || probe.tight();
+    host = host || probe.host_weight_bytes() > 0;
+    if (probe.tight())
+      for (int c = 1024; c < 4096; c += 1024)
+        if (need(c) <= budget) ctx = c;
+    for (int c = 4096; c <= trained; c += 4096)
+      if (need(c) <= budget) ctx = c;
+    if (trained % 4096 && need(trained) <= budget) ctx = trained;
+    const int cc = std::max(ctx, probe.tight() ? 1024 : 4096);  // (the numbers shown: the context chosen)
+    {
+      mo.host_gb = (double)probe.host_weight_bytes() / gib;
+      const Engine::MemParts mp = probe.mem_parts(cc);
+      mo.dev = (double)probe.device_mem();
+      mo.keep = Engine::driver_slack();  // (what budget above keeps free; it said 1.17 GiB, a figure of an old plan, so the
+                                         //  log line's "left" read 0.67 GiB too low: -0.65 on a B580, tenken, issue #40)
+      mo.snap = (double)probe.snapshot_bytes();
+      mo.reserve = (double)reserve;
+      mo.weights = mp.weights;
+      mo.mtp = mp.mtp;
+      mo.buffers = mp.buffers;
+      mo.context = mp.context;
+      mo.per_1k = ((double)probe.ctx_bytes(cc + 4096) - (double)probe.ctx_bytes(cc)) / 4.0;
+    }
+    if (g_ctx_listing)
+      LOG_DBG("model list: %s would get %d tokens with --ctx auto (%s weights; the loaded model keeps its own)\n",
+              fs::path(model).filename().string().c_str(), ctx, res ? "resident" : "just-in-time");
+    else
+      zlog::eprintf("--ctx auto: %d tokens with %s weights (trained %d; %.2f GiB of GPU memory without the context, "
+                      "%.2f GiB with it, device %.2f GiB)\n", ctx, res ? "resident" : "just-in-time", trained, base / gib,
+              (base + probe.ctx_bytes(cc)) / gib, probe.device_mem() / gib);
+    return ctx;
+  };
+  bool res = false;
+  // (0 when not even the smallest context fits: the caller refuses the model. It was raised to the floor and loaded
+  //  anyway: Gemma 4 12B next to Whisper and Qwen3-ASR on a 16.55-GiB share ran out of GPU memory halfway through
+  //  its load and ended the server, 2026-11-04)
+  auto floor_of = [&](int c) { return c > 0 ? std::max(tight ? 1024 : 4096, c) : 0; };
+  if (budget_given) {
+    const int c = fit(eo.w8_budget_gb, res, m1);
+    r = m1;
+    r.ctx = floor_of(c);
+    r.resident = res;
+  } else {
+    const int c_res = fit(1e9, res, m1);  // everything resident
+    if (res && c_res >= std::min(131072, trained)) {
+      r = m1;
+      r.ctx = c_res;
+      r.resident = true;
+    } else {
+      bool r2 = false;
+      const int c = fit(eo.w8_budget_gb, r2, m2);
+      r = m2;
+      r.ctx = floor_of(c);
+      r.resident = r2;
+    }
+  }
+  if (host || tight) return r;  // (not remembered: see tight above)
+  std::error_code ec;
+  fs::create_directories(fs::path(ctx_cache_file()).parent_path(), ec);
+  {
+    // (rows are only ever added: past 512 KB the file is rewritten with its newest 1,000 rows, so it cannot grow with
+    //  every settings change; a row lost this way is computed again when it is next needed)
+    if (fs::file_size(ctx_cache_file(), ec) > (512u << 10) && !ec) {
+      std::vector<std::string> rows;
+      {
+        std::ifstream in(ctx_cache_file());
+        for (std::string l; std::getline(in, l);) rows.push_back(l);
+      }
+      const size_t from = rows.size() > 1000 ? rows.size() - 1000 : 0;
+      const std::string tmp = ctx_cache_file() + ".tmp";
+      {
+        std::ofstream w(tmp, std::ios::trunc);
+        for (size_t i = from; i < rows.size(); ++i) w << rows[i] << "\n";
+      }
+      fs::rename(tmp, ctx_cache_file(), ec);
+      if (ec) fs::remove(tmp, ec);
+    }
+    std::ofstream o(ctx_cache_file(), std::ios::app);
+    o << key << "\t" << r.ctx << "\t" << (r.resident ? 1 : 0);
+    for (double v : {r.dev, r.keep, r.snap, r.reserve, r.weights, r.mtp, r.buffers, r.context, r.per_1k}) o << "\t" << (long long)v;
+    o << "\n";
+  }
+  return r;
+}
+
+// --ctx auto with MTP drafting (skipzx-lab, #45, 2026-11-21): the MTP head and the default prompt chunk's buffers
+// (4,096 tokens) can leave a 16 GB card little context (the 27B on an A770: 8,192 tokens with --mtp, 28,672 without).
+// A smaller chunk costs a prompt little (--ctx 32768 --chunk 1024 --mtp: a 20K prompt in 17.7 s against 16.6 s plain
+// at 4,096) and frees its buffers for the KV cache. So when the context would be below kMtpCtxWant (or none fits), chunks of 2,048
+// and then 1,024 tokens are tried, and the one with the most context is kept (the larger chunk on a tie). Only with
+// --mtp, an automatic chunk (no --chunk) and a chunk no smaller than what the model needs (min_chunk: Gemma's
+// images). Buffers only: the results are the same. probe(EngineOptions) returns the AutoCtx of those options.
+static constexpr int kMtpCtxWant = 32768;
+template <class Probe>
+static AutoCtx mtp_trade_chunk(EngineOptions& eo, AutoCtx a, Probe probe, bool say) {
+  if (!eo.mtp || eo.chunk != 0 || a.ctx >= kMtpCtxWant) return a;  // (0: not even the floor fits: tried too)
+  const int from = a.ctx;
+  for (int ch : {2048, 1024}) {
+    if (eo.min_chunk > ch) break;
+    EngineOptions e2 = eo;
+    e2.chunk = ch;
+    AutoCtx b;
+    try {
+      b = probe(e2);
+    } catch (const std::exception&) {
+      break;
+    }
+    if (b.ctx > a.ctx) {
+      a = b;
+      eo.chunk = a.chunk = ch;
+    }
+    if (a.ctx >= kMtpCtxWant) break;
+  }
+  if (say && eo.chunk)
+    zlog::eprintf("--ctx auto: with --mtp, prompt chunks of %d tokens instead of the default, for %d tokens of context "
+                  "instead of %s (--chunk N keeps a chunk of your choice)\n", eo.chunk, a.ctx,
+                  from > 0 ? std::to_string(from).c_str() : "none");
+  return a;
+}
+// A standard MoE model (qwen35moe, its experts in GGUF types, not GSQ) under --ctx auto: prompt chunks of 8,192
+// tokens instead of the engine's 4,096 where they cost nothing, so its prompt decodes every expert to W8 half as often
+// (decode + the XMX GEMM from 1,152 tokens a chunk: at 4,096 the decode was 36 % of a B390's 16K prompt). The default
+// since 2026-11-22 (the user: "set --chunk of 35B to 8192"): the 35B's logits byte for byte the same at 4,096 / 8,192
+// / 16,384 (the laptop, 10,752 tokens, 4604C1913CE17557); a B390 with every expert on the GPU, 16K prompt 1,362-1,411
+// -> 1,659 tok/s (kludged, #74); the laptop's 35B IQ4_XS, 10,752 tokens, 664.5 / 669.8 -> 695.8 / 698.2. "Cost
+// nothing": the same context as 4,096 gave and the same weights on the GPU: 16,384 kept the laptop's 131,072 tokens
+// but took 2.5 GB of its expert cache. ARC_MOE_BIG_CHUNK=1: 16,384 first (cjm801's B390, #75: 1,166 -> 1,714 tok/s at
+// 16K), =0: off (4,096)
+static int moe_big_chunk_env() {
+  static const int v = getenv("ARC_MOE_BIG_CHUNK") ? atoi(getenv("ARC_MOE_BIG_CHUNK")) : -1;
+  return v;
+}
+static bool moe_big_chunk_model(const std::string& model) {
+  if (moe_big_chunk_env() == 0) return false;
+  try {
+    const GgufFile g(model);
+    return g.get_str("general.architecture", "") == "qwen35moe" && g.get_str("inferzero.expert_format", "") != "gsq2-v1";
+  } catch (const std::exception&) {
+    return false;
+  }
+}
+template <class Probe>
+static AutoCtx moe_grow_chunk(const std::string& model, EngineOptions& eo, AutoCtx a, Probe probe, bool say) {
+  if (eo.chunk != 0 || a.ctx <= 0 || !moe_big_chunk_model(model)) return a;
+  for (int ch : {16384, 8192}) {
+    if (ch == 16384 && moe_big_chunk_env() != 1) continue;
+    EngineOptions e2 = eo;
+    e2.chunk = ch;
+    AutoCtx b;
+    try {
+      b = probe(e2);
+    } catch (const std::exception&) {
+      continue;
+    }
+    // (no context and no GPU weights given up for it: before 2026-11-22 a context down to 32K was accepted, so a
+    //  200K one could fall that far without a word; the repair list, B5)
+    if (b.ctx < a.ctx || b.weights + 1.0 < a.weights) continue;
+    if (say)
+      zlog::eprintf("--ctx auto: a MoE model, prompt chunks of %d tokens instead of 4,096 (the same %d tokens of context "
+                    "and weights on the GPU; ARC_MOE_BIG_CHUNK=0: 4,096)\n", ch, b.ctx);
+    eo.chunk = b.chunk = ch;
+    return b;
+  }
+  return a;
+}
+
+static int auto_ctx_tokens(const std::string& model, bool mtp, bool vision) {
+  EngineOptions eo;
+  eo.mtp = mtp;
+  const CtxListing listing;
+  try {
+    const size_t enc = vision ? encoder_reserve(model, "", 0) : 0;
+    auto probe = [&](const EngineOptions& o) { return auto_ctx(model, o, false, enc); };
+    const AutoCtx a = mtp_trade_chunk(eo, probe(eo), probe, false);  // (as the server's load: mtp_trade_chunk)
+    return moe_grow_chunk(model, eo, a, probe, false).ctx;
+  } catch (const std::exception&) {
+    return 0;
+  }
+}
+
+// (a model's ctx for the list: as a split over gpus GPUs where it can be split, counted as server_load.h's split load
+//  counts it (no MTP block or drafter, no image encoder: a split runs without them yet; the speech reserve kept), so
+//  the list's row and the server's are one; else as on one GPU, which is what the server then loads)
+static AutoCtx list_ctx(const std::string& path, const EngineOptions& eo, size_t enc, size_t speech, int gpus) {
+  const CtxListing listing;
+  if (gpus > 1) {
+    EngineOptions s = eo;
+    s.tp_size = gpus, s.tp_rank = 0;
+    s.mtp = false, s.dflash.clear(), s.mtp_block = EngineOptions().mtp_block;
+    try {
+      AutoCtx a = auto_ctx(path, s, false, speech);
+      if (a.ctx <= 0) a.ctx = 4096;  // (as server_load.h: the floor, the split's own load decides)
+      return a;
+    } catch (const std::exception&) {}
+  }
+  EngineOptions e1 = eo;
+  auto probe = [&](const EngineOptions& o) { return auto_ctx(path, o, false, enc); };
+  const AutoCtx a1 = mtp_trade_chunk(e1, probe(e1), probe, false);  // (as the server's load: mtp_trade_chunk)
+  return moe_grow_chunk(path, e1, a1, probe, false);
+}
+// --list-models: the catalog as JSON (scripts\zero-server.ps1 and zero-pi read it). ctx: the context --ctx auto chose
+// for this GPU memory (with --mtp when the model has a drafter, default chunk), computed now if not known yet.
+// speech: GPU bytes a running server keeps for speech to text (its /props speech_reserve_bytes, given by
+// --speech-reserve N): kept free as a load does (server_load.h), so each model's ctx is what a switch would give.
+// (QUEUE row 15, 2026-11-22) A model's option variants: the option catalog's (scripts/options.tsv) "suffix:value"
+// entries of its variant column, for each option whose applies column names model words, one of them this entry's
+// (dense / moe / qsa / flashnext / mtp; its PC words are the launchers' to check, they know the PC). Not the one whose
+// value is the model's own default (the QSA 27B attends fully unless ARC_QSA=1, Flash Next sparsely unless ARC_QSA=0:
+// -sparse for the one, -full for the other), nor precise mode for an AutoRound package (precise already). A variant
+// is loaded by its alias, the entry's with the suffix (qwen3.8-27b-mtp-fastdraft): apply_variant sets its option
+struct ModelVariant {
+  std::string suffix, option, value;
+};
+static std::map<std::string, bool> model_words(const ModelInfo& m) {
+  // (h8: the prompt GEMMs can run H8 on this model, as Engine::h8_auto_wanted's model half: a dense Qwen3.5 / 3.8,
+  //  not MoE, Gemma, Flash Next or Qwen3; whether the GPU takes H8 is the launchers' PC words)
+  // (moe_std, 2026-11-22: a standard Qwen MoE (qwen35moe: the 35B-A3B), not Flash Next or Gemma 4's: the layer
+  //  split's model word, which Flash Next's "moe" would wrongly let in)
+  return {{"dense", !m.moe}, {"moe", m.moe}, {"moe_std", m.moe && m.arch == "qwen35moe"}, {"qsa", m.qsa},
+          {"flashnext", m.flashnext}, {"mtp", m.mtp}, {"h8", !m.moe && m.arch == "qwen35"}};
+}
+static std::vector<ModelVariant> variants_of(const ModelInfo& m, const srvstart::OptionCatalog& cat) {
+  std::vector<ModelVariant> out;
+  if (!m.supported || !m.vopt.empty() || !cat.has("id") || !cat.has("applies") || !cat.has("variant")) return out;
+  const std::map<std::string, bool> words = model_words(m);
+  auto list = [](const std::string& s) {
+    std::vector<std::string> v;
+    std::string cur;
+    for (char c : s + ";") {
+      if (c == ';') {
+        while (!cur.empty() && cur.front() == ' ') cur.erase(cur.begin());
+        while (!cur.empty() && cur.back() == ' ') cur.pop_back();
+        if (!cur.empty()) v.push_back(cur);
+        cur.clear();
+      } else {
+        cur += c;
+      }
+    }
+    return v;
+  };
+  for (const auto& r : cat.rows) {
+    const std::vector<std::string> vv = list(r.at("variant"));
+    if (vv.empty()) continue;
+    bool named = false, fits = false;
+    for (const std::string& w : list(r.at("applies"))) {
+      const auto it = words.find(w);
+      if (it == words.end()) continue;  // (a PC's word)
+      named = true;
+      fits = fits || it->second;
+    }
+    if (named && !fits) continue;
+    for (const std::string& e : vv) {
+      const size_t c = e.find(':');
+      if (c == std::string::npos || c == 0) continue;
+      ModelVariant v{e.substr(0, c), r.at("id"), e.substr(c + 1)};
+      if (v.option == "qsa" && v.value == (m.flashnext ? "1" : "0")) continue;  // (the model's own attention)
+      if (v.option == "fn_precise" && m.precise_only) continue;
+      out.push_back(v);
+    }
+  }
+  return out;
+}
+// A variant's option into the engine's options (EngineOptions' fields for them, zero/engine.h): false for an option
+// that has no such field (its variant then cannot be loaded by name)
+static bool apply_variant(EngineOptions& eo, const std::string& option, const std::string& value) {
+  const int v = atoi(value.c_str());
+  if (option == "qsa") eo.qsa = v != 0 ? 1 : 0;
+  else if (option == "mtp_vocab") eo.mtp_vocab = std::max(0, v);
+  else if (option == "h8_q2") eo.h8_q2 = v != 0 ? 1 : 0;
+  else if (option == "fn_precise") eo.fn_precise = value == "0" || value == "off" ? 0 : 1;  // (-fast:0, the fast mode)
+  else return false;
+  return true;
+}
+// A catalog entry with a variant applied: its alias / short / name with the suffix, the option kept (vopt / vval)
+static ModelInfo with_variant(const ModelInfo& m, const ModelVariant& v) {
+  ModelInfo x = m;
+  x.alias = m.alias + v.suffix;
+  if (!m.shortcut.empty()) x.shortcut = m.shortcut + v.suffix;
+  x.name = m.name + v.suffix;
+  x.vopt = v.option, x.vval = v.value;
+  x.tags = (m.tags.empty() ? std::string() : m.tags + ", ") + v.option + "=" + v.value;
+  return x;
+}
+// --list-models' "opts" of an entry: its model words
+static void model_options(Json& j, const ModelInfo& m) {
+  Json o = Json::object();
+  for (const auto& w : model_words(m)) o.set(w.first, w.second);
+  j.set("opts", o);
+}
+static int list_models(size_t speech = 0, int gpus = 1, const std::filesystem::path& exe_dir = {}) {
+  const srvstart::OptionCatalog cat = srvstart::option_catalog(exe_dir);
+  Json out = Json::array();
+  std::map<std::string, std::string> dflash;  // model file -> its DFlash2 drafter (one search per file, not per variant)
+  for (const ModelInfo& m : scan_models()) {
+    Json j = Json::object();
+    j.set("name", m.name);
+    j.set("file", m.file);
+    j.set("path", m.path);
+    j.set("bytes", (double)m.bytes);
+    j.set("arch", m.arch);
+    j.set("supported", m.supported);
+    if (!m.note.empty()) j.set("note", m.note);
+    j.set("ctx_train", (double)m.ctx_train);
+    j.set("vision", m.vision);
+    j.set("mtp", m.mtp);
+    j.set("moe", m.moe);
+    j.set("precise_only", m.precise_only);
+    j.set("alias", m.alias);
+    j.set("short", m.shortcut);
+    j.set("base", m.base);
+    j.set("tags", m.tags);
+    model_options(j, m);
+    EngineOptions eo;
+    eo.mtp = m.mtp;
+    // dflash: a DFlash2 drafter for this model was found (dflash_path); variants with MTP draft with it as well (the
+    // server picks it up with --mtp, see load_model), so their context and defaults count it
+    std::string dfl;
+    if (m.supported) {
+      if (!dflash.count(m.path)) dflash[m.path] = find_dflash(m.path);
+      dfl = dflash[m.path];
+    }
+    if (m.draft == 1) dfl.clear();
+    j.set("dflash", !dfl.empty());
+    j.set("dflash_path", dfl);
+    j.set("draft", m.draft == 1 ? "mtp" : m.draft == 2 ? "dflash" : "auto");
+    if (m.mtp) eo.dflash = dfl;
+    eo.mtp_block = m.draft != 2;
+    AutoCtx a;  // computed now (dry load) if not known yet; per variant (MTP block, encoders' memory)
+    a.ctx = 0;
+    if (m.supported)
+      try {
+        const size_t enc = (m.vision ? encoder_reserve(m.path, "", 0) : 0) + speech;
+        a = list_ctx(m.path, eo, enc, speech, gpus);
+        // (the drafter only where it leaves kDflashMinCtx tokens of context: the server drops it there too)
+        if (!eo.dflash.empty() && eo.mtp_block && a.ctx < kDflashMinCtx) {
+          eo.dflash.clear();
+          a = list_ctx(m.path, eo, enc, speech, gpus);
+          j.set("dflash", false);
+        }
+      } catch (const std::exception&) {}
+    j.set("ctx", a.ctx);
+    // (the entry's option variants, each with its own --ctx auto: the same options as the entry with the variant's
+    //  applied. Inside the entry, not entries of their own: the launchers show them as switches of one model; the
+    //  server loads one by its alias. QUEUE row 15)
+    Json vs = Json::array();
+    for (const ModelVariant& v : variants_of(m, cat)) {
+      EngineOptions ve = eo;
+      if (!apply_variant(ve, v.option, v.value)) continue;
+      Json x = Json::object();
+      x.set("suffix", v.suffix);
+      x.set("option", v.option);
+      x.set("value", v.value);
+      x.set("alias", m.alias + v.suffix);
+      if (!m.shortcut.empty()) x.set("short", m.shortcut + v.suffix);
+      int vc = 0;
+      try {
+        vc = list_ctx(m.path, ve, (m.vision ? encoder_reserve(m.path, "", 0) : 0) + speech, speech, gpus).ctx;
+      } catch (const std::exception&) {}
+      x.set("ctx", vc);
+      vs.push(x);
+    }
+    j.set("variants", vs);
+    if (m.supported) {  // the values the server picks for this variant when not given (the launcher fills them in)
+      Json d = Json::object();
+      bool moe = m.arch == "qwen35moe" || m.arch == "qwen4exp";
+      const bool gemma = m.arch == "gemma4";
+      int64_t n_embd = 0;
+      std::string pt;  // image projector type
+      try {
+        const GgufFile g(m.path);
+        n_embd = g.get_int(m.arch + ".embedding_length", 0);
+        moe = moe || g.get_int(m.arch + ".expert_count", 0) > 0;  // (Gemma 4 26B-A4B)
+      } catch (const std::exception&) {}
+      if (m.vision) {
+        std::error_code ec;
+        for (const auto& p : model_mmprojs(std::filesystem::path(m.path))) {
+          try { pt = GgufFile(p.string()).get_str("clip.vision.projector_type", ""); } catch (const std::exception&) {}
+          break;
+        }
+      }
+      // (what the server runs: the chunk --ctx auto chose (a smaller one for --mtp's context, a MoE model's 8,192),
+      //  else the engine's default (zero/engine.h max_chunk): DeepSeek-V4.1 1,024 (not in this list yet); Gemma 4's MoE 2,048; Flash Next 4,096 on a split or a
+      //  GPU of 20 GiB or more (an iGPU's 15), else 2,048; MoE 4,096; a dense model with weights in host memory 1,024;
+      //  resident decoded weights 512 on an iGPU or a card below 11 GiB, else 4,096. The repair list A1, 2026-11-22:
+      //  this said "MoE 8192" while the server ran 4,096)
+      const uint64_t gm = device_global_mem();
+      const bool igpu = device_integrated();
+      const bool fn_4k = gpus > 1 || gm >= (igpu ? (15ull << 30) : (20ull << 30)), res_long = !igpu && gm >= (11ull << 30);
+      int chunk = a.chunk > 0 ? a.chunk : m.arch == "deepseek41" ? 1024
+                  : m.arch == "inkling2" || m.arch == "inkling2_loop" ? 512 : gemma && moe ? 2048 : m.arch == "qwen4exp" ? (fn_4k ? 4096 : 2048) : moe ? 4096
+                  : a.host_gb > 0 ? 1024 : a.resident && !res_long ? 512 : 4096;
+      if (gemma && m.vision) chunk = std::max(chunk, 2048);  // (an image is one chunk)
+      d.set("chunk", chunk);
+      // (the engine's: zero/engine_drafters.h mtp_block_drafts, Flash Next 3; zero/xe2/engine_xe2.h xe2_mtp_drafts, a
+      //  7 on a discrete XMX card: 4 on Alchemist and cards of 1,280 threads or fewer (B60 / B65 / B580), 3 on the
+      //  others (the B70); a DFlash2 drafter 7. The repair list A2, 2026-11-22: Flash Next was counted as MoE (5) and
+      //  the 27B's 7 shown on every card)
+      int drafts = !m.mtp ? 0 : !eo.dflash.empty() ? 7 : gemma ? (moe ? 3 : 2) : m.flashnext ? 3 : moe ? 5
+                   : n_embd >= 5120 ? 7 : n_embd <= 2560 ? 3 : 2;
+      if (drafts == 7 && eo.dflash.empty() && !igpu && g_dev_xmx)
+        drafts = g_dev_sg8 || (zrt::hw_threads() > 0 && zrt::hw_threads() <= 1280) ? 4 : 3;
+      d.set("mtp_drafts", drafts);
+      d.set("image_min", !m.vision ? 0 : gemma ? 1120 : 256);
+      d.set("image_max", !m.vision ? 0 : pt == "gemma4v" ? 1120 : 2048);
+      d.set("think_budget", 8192);
+      d.set("prefix_cache_gb", 8);
+      d.set("prompt_cache_gb", 0);
+      d.set("resident_weights", a.resident);
+      j.set("defaults", d);
+    }
+    if (a.dev > 0) {  // how --ctx auto counted the GPU memory (bytes)
+      Json mem = Json::object();
+      mem.set("device", a.dev);
+      mem.set("keep_free", a.keep);
+      mem.set("snapshots", a.snap);
+      mem.set("encoders", a.reserve);
+      mem.set("weights", a.weights);
+      mem.set("mtp", a.mtp);
+      mem.set("buffers", a.buffers);
+      mem.set("context", a.context);
+      mem.set("context_per_1k", a.per_1k);
+      mem.set("resident", a.resident);
+      // (bytes of the weights kept in host memory, Engine::plan_tight: an iGPU's tight share, or a discrete card the
+      //  model does not fit, read over PCIe; not in "weights", which is GPU memory)
+      mem.set("host_weights", a.host_gb * 1073741824.0);
+      j.set("memory", mem);
+    }
+    out.push(j);
+  }
+  printf("%s\n", out.dump().c_str());
+  return 0;
+}

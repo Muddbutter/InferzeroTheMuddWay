@@ -1,0 +1,414 @@
+// GGUF v3 reader: memory-maps the file and exposes metadata + tensor views. A split model (name-00001-of-0000N.gguf,
+// "split.count" > 1) is opened from its first part: the other parts are mapped too and their tensors added.
+// A tensor listed under "inferzero.virtual.*" (an inferzero package: the routed experts live in its own
+// expert file) has its name, type and shape but no data (data == nullptr).
+#pragma once
+// (see enc_weight_bytes below: the encoders' GPU footprint for --ctx auto)
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <string>
+#include <vector>
+#include <initializer_list>
+#include <unordered_map>
+#include <variant>
+#include <stdexcept>
+#include "platform.h"  // (windows.h on Windows; plat::FileMap)
+
+enum GgmlType : uint32_t {
+  GGML_F32 = 0, GGML_F16 = 1, GGML_Q4_0 = 2, GGML_Q4_1 = 3, GGML_Q5_0 = 6, GGML_Q5_1 = 7, GGML_Q8_0 = 8,
+  GGML_Q8_1 = 9, GGML_Q2_K = 10, GGML_Q3_K = 11, GGML_Q4_K = 12, GGML_Q5_K = 13, GGML_Q6_K = 14,
+  GGML_Q8_K = 15, GGML_IQ2_XXS = 16, GGML_IQ2_XS = 17, GGML_IQ3_XXS = 18, GGML_IQ1_S = 19, GGML_IQ4_NL = 20,
+  GGML_IQ3_S = 21, GGML_IQ2_S = 22, GGML_IQ4_XS = 23, GGML_I8 = 24, GGML_I16 = 25, GGML_I32 = 26, GGML_IQ1_M = 29,
+  GGML_BF16 = 30, GGML_TQ1_0 = 34, GGML_TQ2_0 = 35, GGML_MXFP4 = 39,
+  // blocks of 64: 4 UE4M3 scales (one per 16 values), then 32 bytes of E2M1 codes (Inkling 2 Mini's experts)
+  GGML_NVFP4 = 40,
+  // Unsloth's llama.cpp fork for DeepSeek-V4.1 (its Engram table): 32 E4M3 (fn) values sharing one E8M0 scale, 33
+  // bytes. Upstream ggml gives 43 to plain F8_E4M3 (1 byte a value, no scale), which no model this engine runs uses.
+  GGML_MXFP8 = 43,
+  // Private inferzero package type, not a standard GGML/GGUF quant identifier.
+  // 128 values: source F16 scale + four Q4_0-order nibble blocks; zero point is 8.
+  GGML_AR4_128 = 0x41523447u,
+  GGML_Q2_0 = 42,  // blocks of 64: f16 scale + 2-bit codes, value (q - 1) * d (Qwen3.8 Flash Next down projections)
+};
+
+inline const char* ggml_type_name(uint32_t t) {
+  switch (t) {
+    case GGML_F32: return "F32"; case GGML_F16: return "F16"; case GGML_Q4_0: return "Q4_0";
+    case GGML_Q4_1: return "Q4_1"; case GGML_Q5_0: return "Q5_0"; case GGML_Q5_1: return "Q5_1";
+    case GGML_Q8_0: return "Q8_0"; case GGML_Q2_K: return "Q2_K"; case GGML_Q3_K: return "Q3_K";
+    case GGML_Q4_K: return "Q4_K"; case GGML_Q5_K: return "Q5_K"; case GGML_Q6_K: return "Q6_K";
+    case GGML_IQ4_NL: return "IQ4_NL"; case GGML_IQ4_XS: return "IQ4_XS"; case GGML_BF16: return "BF16";
+    case GGML_IQ2_XXS: return "IQ2_XXS"; case GGML_IQ2_XS: return "IQ2_XS"; case GGML_IQ3_XXS: return "IQ3_XXS";
+    case GGML_IQ1_S: return "IQ1_S"; case GGML_IQ3_S: return "IQ3_S"; case GGML_IQ2_S: return "IQ2_S"; case GGML_IQ1_M: return "IQ1_M";
+    case GGML_AR4_128: return "AR4_128";
+    case GGML_MXFP4: return "MXFP4"; case GGML_MXFP8: return "MXFP8"; case GGML_Q2_0: return "Q2_0";
+    case GGML_NVFP4: return "NVFP4";
+    case GGML_Q8_1: return "Q8_1"; case GGML_Q8_K: return "Q8_K"; case GGML_TQ1_0: return "TQ1_0"; case GGML_TQ2_0: return "TQ2_0";
+    default: return "?";
+  }
+}
+
+// (elements per block, bytes per block)
+inline void ggml_block_info(uint32_t t, int& blk, int& bytes) {
+  switch (t) {
+    case GGML_F32: blk = 1; bytes = 4; return;
+    case GGML_F16: case GGML_BF16: case GGML_I16: blk = 1; bytes = 2; return;
+    case GGML_I8: blk = 1; bytes = 1; return;
+    case GGML_I32: blk = 1; bytes = 4; return;
+    case GGML_Q4_0: blk = 32; bytes = 18; return;
+    case GGML_AR4_128: blk = 128; bytes = 66; return;
+    case GGML_Q4_1: blk = 32; bytes = 20; return;
+    case GGML_Q5_0: blk = 32; bytes = 22; return;
+    case GGML_Q5_1: blk = 32; bytes = 24; return;
+    case GGML_Q8_0: blk = 32; bytes = 34; return;
+    case GGML_Q2_K: blk = 256; bytes = 84; return;
+    case GGML_Q3_K: blk = 256; bytes = 110; return;
+    case GGML_Q4_K: blk = 256; bytes = 144; return;
+    case GGML_Q5_K: blk = 256; bytes = 176; return;
+    case GGML_Q6_K: blk = 256; bytes = 210; return;
+    case GGML_IQ4_NL: blk = 32; bytes = 18; return;
+    case GGML_IQ4_XS: blk = 256; bytes = 136; return;
+    case GGML_IQ2_XXS: blk = 256; bytes = 66; return;
+    case GGML_IQ2_XS: blk = 256; bytes = 74; return;
+    case GGML_IQ2_S: blk = 256; bytes = 82; return;
+    case GGML_IQ3_XXS: blk = 256; bytes = 98; return;
+    case GGML_IQ3_S: blk = 256; bytes = 110; return;
+    case GGML_IQ1_S: blk = 256; bytes = 50; return;
+    case GGML_IQ1_M: blk = 256; bytes = 56; return;
+    case GGML_MXFP4: blk = 32; bytes = 17; return;
+    case GGML_NVFP4: blk = 64; bytes = 36; return;
+    case GGML_MXFP8: blk = 32; bytes = 33; return;
+    case GGML_Q2_0: blk = 64; bytes = 18; return;
+    // (known so a file holding them opens; Q8_1 decodes on the CPU at load, Q8_K / TQ1_0 / TQ2_0 are named in the error
+    //  when a weight of theirs is used: QUEUE Q2 / Q4, 2026-11-21)
+    case GGML_Q8_1: blk = 32; bytes = 36; return;
+    case GGML_Q8_K: blk = 256; bytes = 292; return;
+    case GGML_TQ1_0: blk = 256; bytes = 54; return;
+    case GGML_TQ2_0: blk = 256; bytes = 66; return;
+    default: throw std::runtime_error("unsupported ggml type " + std::to_string(t));
+  }
+}
+
+struct GgufTensor {
+  std::string name;
+  uint32_t type = 0;
+  std::vector<uint64_t> dims;  // dims[0] is the contiguous (innermost) dimension
+  const uint8_t* data = nullptr;
+  uint64_t nbytes = 0;
+  uint64_t nelements() const { uint64_t n = 1; for (auto d : dims) n *= d; return n; }
+};
+
+using GgufValue = std::variant<int64_t, uint64_t, double, bool, std::string, std::vector<int64_t>, std::vector<double>,
+                               std::vector<std::string>>;
+
+class GgufFile {
+ public:
+  std::unordered_map<std::string, GgufValue> kv;
+  std::vector<std::string> kv_order;
+  // the stored GGUF type of every key (and of its elements, for arrays): kept for writing the metadata again
+  std::unordered_map<std::string, std::pair<uint32_t, uint32_t>> kv_types;
+  std::string path;
+  std::vector<GgufTensor> tensors;
+  std::unordered_map<std::string, size_t> tensor_index;
+
+  explicit GgufFile(const std::string& path_) : path(path_) {
+    if (!fm_.open(path.c_str())) throw std::runtime_error("cannot open " + path);
+    try {  // (a file that fails to parse: no handle or mapping left open; the destructor does not run here)
+      if (!fm_.size(size_)) throw std::runtime_error("cannot read the size of " + path);
+      const int mr = fm_.map();
+      if (mr == 1) throw std::runtime_error("CreateFileMapping failed");
+      if (mr == 2) throw std::runtime_error("MapViewOfFile failed");
+      base_ = fm_.data();
+      parse();
+      open_parts();
+      add_virtual();
+      // (a package or a GSQ conversion from before 2026-11-10, keyed arcinferzero.*: refused with the way out,
+      //  not loaded without its experts' format or with experts that are not there)
+      if (has("arcinferzero.package") || has("arcinferzero.expert_format") || has("arcinfer.expert_format"))
+        throw std::runtime_error("gguf: " + path + " was made before the project's rename (2026-11-10): its arcinferzero.* keys are no longer read. A package: delete its folder under %USERPROFILE%\\.inferzero\\zero\\models, then load the original GGUF, or make the package again with serverz --pack <the original GGUF>. A GSQ model: convert it again with bin\\convert_gsq.exe (setup -Models 35b-gsq does)");
+    } catch (...) {
+      close();
+      throw;
+    }
+  }
+  ~GgufFile() { close(); }
+  GgufFile(const GgufFile&) = delete;
+  GgufFile& operator=(const GgufFile&) = delete;
+
+  const GgufTensor* find(const std::string& name) const {
+    auto it = tensor_index.find(name);
+    return it == tensor_index.end() ? nullptr : &tensors[it->second];
+  }
+  const GgufTensor& get(const std::string& name) const {
+    auto t = find(name);
+    if (!t) throw std::runtime_error("missing tensor " + name);
+    return *t;
+  }
+  // The tensors of `o` whose names start with `prefix` and that this file lacks, added to this file's list (their data
+  // stays in o's mapping: o must outlive this file's use of them). For an MTP block in a file of its own (Qwen3.8
+  // Flash Next, mtp-*.gguf): the loaders then read blk.N.* as if the model's file had them. Call it before any pointer
+  // to a tensor of this file is kept (the list may move). Returns how many were added.
+  int adopt(const GgufFile& o, const std::string& prefix) {
+    int n = 0;
+    for (const GgufTensor& t : o.tensors)
+      if (t.name.rfind(prefix, 0) == 0 && !find(t.name)) {
+        tensor_index[t.name] = tensors.size();
+        tensors.push_back(t);
+        ++n;
+      }
+    return n;
+  }
+  bool has(const std::string& key) const { return kv.count(key) > 0; }
+  int64_t get_int(const std::string& key, int64_t def = -1) const {
+    auto it = kv.find(key);
+    if (it == kv.end()) return def;
+    if (auto p = std::get_if<int64_t>(&it->second)) return *p;
+    if (auto p = std::get_if<uint64_t>(&it->second)) return (int64_t)*p;
+    if (auto p = std::get_if<bool>(&it->second)) return *p;
+    return def;
+  }
+  double get_float(const std::string& key, double def = 0) const {
+    auto it = kv.find(key);
+    if (it == kv.end()) return def;
+    if (auto p = std::get_if<double>(&it->second)) return *p;
+    if (auto p = std::get_if<int64_t>(&it->second)) return (double)*p;
+    if (auto p = std::get_if<uint64_t>(&it->second)) return (double)*p;
+    return def;
+  }
+  std::string get_str(const std::string& key, const std::string& def = "") const {
+    auto it = kv.find(key);
+    if (it == kv.end()) return def;
+    if (auto p = std::get_if<std::string>(&it->second)) return *p;
+    return def;
+  }
+  const std::vector<std::string>* get_strs(const std::string& key) const {
+    auto it = kv.find(key);
+    return it == kv.end() ? nullptr : std::get_if<std::vector<std::string>>(&it->second);
+  }
+  const std::vector<int64_t>* get_ints(const std::string& key) const {
+    auto it = kv.find(key);
+    return it == kv.end() ? nullptr : std::get_if<std::vector<int64_t>>(&it->second);
+  }
+  const std::vector<double>* get_floats(const std::string& key) const {
+    auto it = kv.find(key);
+    return it == kv.end() ? nullptr : std::get_if<std::vector<double>>(&it->second);
+  }
+
+  // (whether [p, p + n) lies in this file's mapping or one of its parts': zero/xe2/engine_hostcpu.h reads such rows
+  //  for as long as the file is open)
+  bool maps(const void* p, size_t n) const {
+    const uint8_t* q = (const uint8_t*)p;
+    if (base_ && q >= base_ && n <= size_ && (uint64_t)(q - base_) <= size_ - n) return true;
+    for (const auto& f : parts_)
+      if (f && f->maps(p, n)) return true;
+    return false;
+  }
+
+  // (the file and the byte offset in it of mapped bytes [p, p + n), this file's or a part's: S4's read again, without
+  //  the mapping, after a page could not be read)
+  bool locate(const void* p, size_t n, std::string& file, uint64_t& off) const {
+    const uint8_t* q = (const uint8_t*)p;
+    if (base_ && q >= base_ && n <= size_ && (uint64_t)(q - base_) <= size_ - n) {
+      file = path;
+      off = (uint64_t)(q - base_);
+      return true;
+    }
+    for (const auto& f : parts_)
+      if (f && f->locate(p, n, file, off)) return true;
+    return false;
+  }
+
+ private:
+  plat::FileMap fm_;  // (the file and its read-only mapping, src/platform.h)
+  const uint8_t* base_ = nullptr;
+  uint64_t size_ = 0, pos_ = 0;
+
+  std::vector<std::unique_ptr<GgufFile>> parts_;  // the other parts of a split model
+  void close() {
+    fm_.close();
+    base_ = nullptr;
+  }
+
+  // name-00001-of-0000N.gguf: the parts 2..N, their tensors added to this one's index
+  void open_parts() {
+    const int64_t n = get_int("split.count", 1);
+    if (n <= 1) return;
+    // (no real model has more than a few dozen parts; the part number is written with 5 digits)
+    if (n > 1024) throw std::runtime_error("gguf: " + path + ": split.count " + std::to_string(n) + " is not a real model's (at most 1,024 parts)");
+    const size_t at = path.rfind("-00001-of-");
+    if (at == std::string::npos) return;  // (a later part opened on its own: only its own tensors)
+    for (int64_t k = 2; k <= n; ++k) {
+      char num[8];
+      snprintf(num, sizeof num, "%05d", (int)k);
+      std::string pp = path;
+      pp.replace(at + 1, 5, num);
+      parts_.push_back(std::make_unique<GgufFile>(pp));
+      for (const GgufTensor& t : parts_.back()->tensors) {
+        if (tensor_index.count(t.name)) continue;
+        tensor_index[t.name] = tensors.size();
+        tensors.push_back(t);
+      }
+    }
+  }
+  // tensors without data (inferzero packages): names, types and shapes from the metadata
+  // bytes of tensor t of a type with blk values per bytes-byte block: its shape must not overflow and must hold whole
+  // blocks (a count that is not a multiple would undercount the bytes the kernels read)
+  static uint64_t tensor_bytes(const GgufTensor& t, int blk, int bytes) {
+    uint64_t ne = 1;
+    for (uint64_t d : t.dims) {
+      if (d && ne > UINT64_MAX / d) throw std::runtime_error("gguf: bad shape for " + t.name);
+      ne *= d;
+    }
+    if (blk <= 0 || bytes <= 0 || ne / (uint64_t)blk > UINT64_MAX / (uint64_t)bytes)
+      throw std::runtime_error("gguf: bad tensor type for " + t.name);
+    // (per row, as ggml requires: a Q4_K [384, 2] was whole blocks as a tensor, and dequant_row decoded one superblock
+    //  of each 384-value row and left 128 values unwritten, audit 2026-11-18)
+    if (ne % (uint64_t)blk || (!t.dims.empty() && t.dims[0] % (uint64_t)blk))
+      throw std::runtime_error("gguf: " + t.name + " is not a whole number of blocks a row");
+    return ne / blk * bytes;
+  }
+  void add_virtual() {
+    const auto* names = get_strs("inferzero.virtual.names");
+    const auto* types = get_ints("inferzero.virtual.types");
+    const auto* dims = get_ints("inferzero.virtual.dims");  // 4 per tensor (unused trailing dims = 0)
+    if (!names || !types || !dims || types->size() != names->size() || dims->size() != names->size() * 4) return;
+    // (only a package's experts, which the expert file holds: any other tensor without data would be read at
+    //  address 0 by a loader that expects bytes)
+    if (!has("inferzero.package")) return;
+    for (size_t i = 0; i < names->size(); ++i) {
+      if (tensor_index.count((*names)[i]) || (*names)[i].find("_exps.weight") == std::string::npos) continue;
+      GgufTensor t;
+      t.name = (*names)[i];
+      t.type = (uint32_t)(*types)[i];
+      for (int d = 0; d < 4; ++d)
+        if ((*dims)[i * 4 + d] > 0) t.dims.push_back((uint64_t)(*dims)[i * 4 + d]);
+      int blk = 0, bytes = 0;
+      ggml_block_info(t.type, blk, bytes);
+      t.nbytes = tensor_bytes(t, blk, bytes);
+      tensor_index[t.name] = tensors.size();
+      tensors.push_back(t);
+    }
+  }
+
+  // (bounds as `n > size_ - pos_`: pos_ never passes size_, so no sum can wrap around on a hostile file)
+  template <typename T> T rd() {
+    if (sizeof(T) > size_ - pos_) throw std::runtime_error("gguf: truncated");
+    T v;
+    memcpy(&v, base_ + pos_, sizeof(T));
+    pos_ += sizeof(T);
+    return v;
+  }
+  std::string rd_str() {
+    uint64_t n = rd<uint64_t>();
+    if (n > size_ - pos_) throw std::runtime_error("gguf: truncated string");
+    std::string s((const char*)base_ + pos_, n);
+    pos_ += n;
+    return s;
+  }
+  int64_t rd_int(uint32_t t) {
+    switch (t) {
+      case 0: return rd<uint8_t>(); case 1: return rd<int8_t>(); case 2: return rd<uint16_t>();
+      case 3: return rd<int16_t>(); case 4: return rd<uint32_t>(); case 5: return rd<int32_t>();
+      case 7: return rd<uint8_t>(); case 10: return (int64_t)rd<uint64_t>(); case 11: return rd<int64_t>();
+      default: throw std::runtime_error("gguf: not an int type");
+    }
+  }
+  GgufValue rd_value(uint32_t t) {
+    switch (t) {
+      case 6: return (double)rd<float>();
+      case 12: return rd<double>();
+      case 7: return rd<uint8_t>() != 0;
+      case 8: return rd_str();
+      case 10: return rd<uint64_t>();
+      case 9: {
+        uint32_t et = rd<uint32_t>();
+        uint64_t n = rd<uint64_t>();
+        // (every element takes its width in the file, a string at least its 8-byte length: a count past what is left is
+        //  a damaged file, not a vector of gigabytes in memory)
+        const uint64_t w = et == 8 ? 8 : et == 0 || et == 1 || et == 7 ? 1 : et == 2 || et == 3 ? 2 : et == 10 || et == 11 || et == 12 ? 8 : 4;
+        if (n > (size_ - pos_) / w) throw std::runtime_error("gguf: truncated array");
+        // (each element is kept in 8 bytes or a string: 64 M elements at most, far past any vocabulary (262 K) or merge
+        //  list, so a crafted array cannot make the loader ask for gigabytes; audit 2026-11-13 #2)
+        // (strings: 16 M at most, each at least 32 bytes in memory for its 8 in the file)
+        if (n > (et == 8 ? (16ull << 20) : (64ull << 20)))
+          throw std::runtime_error("gguf: " + path + ": an array of " + std::to_string(n) + " elements (at most " + (et == 8 ? "16" : "64") + " M)");
+        if (et == 8) { std::vector<std::string> v(n); for (auto& s : v) s = rd_str(); return v; }
+        if (et == 6 || et == 12) { std::vector<double> v(n); for (auto& x : v) x = et == 6 ? rd<float>() : rd<double>(); return v; }
+        std::vector<int64_t> v(n);
+        for (auto& x : v) x = rd_int(et);
+        return v;
+      }
+      default: return rd_int(t);
+    }
+  }
+  void parse() {
+    if (rd<uint32_t>() != 0x46554747) throw std::runtime_error("not a GGUF file");
+    uint32_t ver = rd<uint32_t>();
+    if (ver < 2) throw std::runtime_error("unsupported GGUF version");
+    uint64_t nt = rd<uint64_t>(), nkv = rd<uint64_t>();
+    // (a key-value pair takes 12 bytes or more, a tensor entry 24: counts the file cannot hold are refused before
+    //  anything is allocated for them)
+    if (nkv > (size_ - pos_) / 12 || nt > (size_ - pos_) / 24) throw std::runtime_error("gguf: bad tensor / key count");
+    // (and no more than a real model has: each entry takes ~130-140 bytes in memory against 12 / 24 in the file, so a
+    //  crafted 1-2 GB file could ask for 10+ GB before failing; a large model has a few thousand tensors and keys.
+    //  Audit 2026-11-13 #2)
+    if (nkv > 1000000 || nt > 1000000) throw std::runtime_error("gguf: " + path + ": " + std::to_string(nt) + " tensors / " +
+                                                                 std::to_string(nkv) + " keys is not a real model's (at most 1,000,000)");
+    for (uint64_t i = 0; i < nkv; ++i) {
+      std::string key = rd_str();
+      uint32_t t = rd<uint32_t>();
+      uint32_t et = 0;
+      if (t == 9) {  // (an array: its element type comes next)
+        if (size_ - pos_ < 4) throw std::runtime_error("gguf: truncated");
+        memcpy(&et, base_ + pos_, 4);
+      }
+      kv[key] = rd_value(t);
+      kv_types[key] = {t, et};
+      kv_order.push_back(key);
+    }
+    tensors.resize(nt);
+    std::vector<uint64_t> offs(nt);
+    for (uint64_t i = 0; i < nt; ++i) {
+      auto& t = tensors[i];
+      t.name = rd_str();
+      uint32_t nd = rd<uint32_t>();
+      if (nd > 8) throw std::runtime_error("gguf: bad dimension count for " + t.name);
+      t.dims.resize(nd);
+      for (auto& d : t.dims) d = rd<uint64_t>();
+      t.type = rd<uint32_t>();
+      offs[i] = rd<uint64_t>();
+      tensor_index[t.name] = i;
+    }
+    const int64_t a64 = get_int("general.alignment", 32);
+    if (a64 <= 0 || a64 > (1 << 20) || (a64 & (a64 - 1))) throw std::runtime_error("gguf: bad alignment");
+    const uint64_t align = (uint64_t)a64;
+    const uint64_t data_start = (pos_ + align - 1) / align * align;
+    // (a part with no tensors, a split model's first part of metadata only, may end right after its header, without
+    //  the padding to the alignment: Unsloth's DeepSeek-V4.1 UD-Q8_K_XL part 1, issue #4)
+    if (nt > 0 && data_start > size_) throw std::runtime_error("gguf: truncated");
+    for (uint64_t i = 0; i < nt; ++i) {
+      auto& t = tensors[i];
+      int blk = 0, bytes = 0;
+      ggml_block_info(t.type, blk, bytes);
+      t.nbytes = tensor_bytes(t, blk, bytes);
+      if (offs[i] > size_ - data_start || t.nbytes > size_ - data_start - offs[i])
+        throw std::runtime_error("gguf: tensor out of range " + t.name);
+      t.data = base_ + data_start + offs[i];
+    }
+  }
+};
+
+// GPU bytes of the tensors whose names start with one of `prefixes`, as the GPU encoders upload them: matrices
+// (2+ dims) as f16, vectors as f32; `skip` names stay on the host. (--ctx auto reserves the encoders' memory.)
+inline size_t enc_weight_bytes(const GgufFile& g, std::initializer_list<const char*> prefixes,
+                               std::initializer_list<const char*> skip = {}) {
+  size_t b = 0;
+  for (const auto& t : g.tensors) {
+    bool in = false;
+    for (const char* p : prefixes) in = in || t.name.rfind(p, 0) == 0;
+    for (const char* s : skip) in = in && t.name != s;
+    if (in) b += t.nelements() * (t.dims.size() >= 2 ? 2 : 4);
+  }
+  return b;
+}

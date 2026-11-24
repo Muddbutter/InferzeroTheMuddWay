@@ -1,0 +1,754 @@
+# Using inferzero
+
+inferzero is an LLM inference engine built specifically for this laptop (Intel Core Ultra 5 125H, integrated Intel
+Arc GPU). Its focus is processing long prompts quickly, for example when an agent such as Pi reads many code files.
+It runs GGUF models directly from the Hugging Face cache and serves an OpenAI-compatible API, so it can be used by
+Pi, by other apps, or through its built-in web UI.
+
+## 1. Setup (once)
+
+Open PowerShell or Terminal in the inferzero folder, then run:
+
+```powershell
+.\setup.cmd
+```
+
+The setup is safe to run again (steps that are already done are skipped): it checks the requirements, builds the
+programs (a ready-to-use package keeps its own: no compiler needed), asks which models to download (no Python:
+`curl.exe`, resumed after a cut, SHA256 checked) and connects Pi (the `zero-pi` and `zero-server` commands, callable
+from any folder). What it does and its options: [docs/install.md, "Ready-to-use package"](docs/install.md#ready-to-use-package-no-compiler-no-python-no-terminal)
+and ["Quick setup"](docs/install.md#quick-setup). One model's files by hand, the same way:
+`powershell -File scripts\hf-get.ps1 unsloth/Qwen3.5-4B-MTP-GGUF Qwen3.5-4B-UD-Q4_K_XL.gguf mmproj-F16.gguf`.
+
+Download a model by hand: see [docs/install.md, section 6](docs/install.md#6-download-models) (every model, its shortcut and the
+`hf download` command). `35b` in `setup.cmd` and `zero-pi 35b` is Qwen3.6 35B-A3B UD-IQ4_XS from Unsloth's MTP
+repository (MTP and images, 19 GB); `35b-gsq` downloads ISTA-DASLab's GSQ 2-bit version instead and converts it once
+with `bin\convert_gsq.exe` (no Python; no MTP; [docs/install.md, section 7](docs/install.md#7-qwen36-35b-a3b-optional-convert-the-gsq-checkpoint)). Qwen3.8
+Flash Next (`flash`) and the DFlash2 drafters are not downloaded by setup.
+
+## 2. Using Pi
+
+1. Open a terminal in the project folder you want to work on. In File Explorer: open the folder, right-click an
+   empty area, then choose **Open in Terminal**.
+2. Run `zero-pi`. On first use, the server is started in the background first (5–40 s until "Ready" appears), then
+   Pi opens.
+3. Type your requests in Pi as usual.
+
+| Command | What it does |
+|---|---|
+| `zero-pi` | The model that is running or was used last (the first time: choose from a list) |
+| `zero-pi --pick` | Choose a model from the list of every downloaded model, by full name |
+| `zero-pi 27b` | Qwen3.8 27B: very smart, slowest |
+| `zero-pi 35b` | Qwen3.6 35B-A3B: smart and fast (mixture of experts, only ~3B active parameters per token) |
+| `zero-pi flash` | Qwen3.8 Flash Next: large mixture of experts, slower (~6-7 tokens/s) |
+| `zero-pi g12` | Gemma 4 12B: reads images (attach an image in Pi or the web UI) |
+| `zero-pi e4b` | Gemma 4 E4B: small and fast (~32 tokens/s with its drafter); hears audio: the voice model for Talk in the web UI |
+| `zero-pi g26` | Gemma 4 26B-A4B (Google QAT Q4_0): mixture of experts (~4B active), ~25 tokens/s with its drafter, reads images; 90K context with images, 118K with `--vision off` |
+| `zero-pi 9b` | Qwen3.5 9B: faster, medium quality |
+| `zero-pi 4b` | Qwen3.5 4B: fastest |
+| `zero-pi --think off` | No thinking (reasoning) phase: much faster answers |
+| `zero-pi --think medium` | Thinks longer for hard tasks (`off` / `minimal` / `low` / `medium` / `high`; default `low`) |
+| `zero-pi 9b --think off` | A fast combination for everyday questions |
+| `zero-pi -c` | Continue the last session in this folder (`zero-pi -r`: choose a session) |
+| `zero-pi -p "explain app/auth.py"` | Other Pi arguments still work, written after the zero-pi options |
+| `zero-pi --ctx 32768` | A different context size (default = the largest that fits, see section 5); `zero-pi --ctx auto` goes back to automatic |
+| `zero-pi --no-mtp` | No speculative decoding (MTP / drafter) |
+| `zero-pi --help` | Every zero-pi option, the server and the files it uses |
+
+Without a model name, `zero-pi` takes the one the server runs, else the one used last, else asks from a numbered list
+(`zero-pi -Model swift` also chooses by part of a name). Inside Pi, `/model` shows every model; choosing one makes the
+server switch to that model (5–40 s), with its own context. The next `zero-pi` uses the model chosen last. The list
+is rescanned on every `zero-pi` and `zero-server start` / `restart`: a model deleted from the Hugging Face cache
+disappears from it.
+
+The server keeps running after Pi is closed. The next session is ready right away without loading the model again,
+and a repeated prompt (for example Pi's system prompt) comes from the cache. If `zero-pi` is called with another
+model, the server switches models automatically.
+
+**Thinking.** Pi sends the effort and a thinking budget per level (`zero-pi --think`, or Pi's `/thinking`), so the
+server's `--think-budget` does not apply to it:
+
+| Pi level | budget Pi sends | server |
+|---|---|---|
+| off | - | no reasoning |
+| minimal | 1,024 | reasoning off (minimal counts as off) |
+| low (default) | 2,048 | effort low, `<think>` closed after 2,048 tokens |
+| medium | 8,192 | effort medium, closed after 8,192 |
+| high / xhigh | 16,384 | effort xhigh, closed after 16,384 (Pi treats xhigh as high) |
+
+The effort reaches the chat template only where it uses one (Qwen3.8 27B); the budget applies to every model.
+
+**Sessions.** A new session always starts empty: Pi only sends its system prompt and your message, so the model does
+not see the conversation of an earlier session. To continue a conversation, use `zero-pi -c` or `zero-pi -r`. What the
+server processes (times on the 27B; how the caches work: [docs/server.md, "Run the server by hand"](docs/server.md#run-the-server-by-hand)):
+
+| You | The server processes |
+|---|---|
+| keep working in a session (agent loop) | only what is new: 5–7 s before the model starts writing, even 27K tokens into a session |
+| open a new session (`zero-pi`, `/new`) in a project used before | only your message: the project's ~4K-token system prompt comes from memory or disk (~4–5 s instead of ~40 s), also after a server restart or a model switch |
+| open the first session in a new project folder | its system prompt once (~40 s); it is then kept for that folder (`%USERPROFILE%\.inferzero\zero\prefix`, its 2 latest versions, all models together at most 8 GB: `--prefix-cache-gb`) |
+| continue a session (`zero-pi -c`, `zero-pi -r`, `/resume`) right after closing it | only your new message (the server still holds that conversation) |
+| ... after another session or project used the server | only the new message: the session cache (on by default, 8 GB for all models together: the launcher's "Session cache" field or `-SessionCacheGb N`; `zero-pi --session-cache 0` turns it off) loads it from disk in seconds |
+| ... after `zero-server restart` / `stop` or a model switch | only the new message: the held conversation is saved first and loaded from disk (lost only if the server process is killed) |
+| press Esc | nothing more: the server stops within ~1 s while reading the prompt, before the next token while writing; your next message only processes what is new |
+
+## 3. Managing the server
+
+**Through the window:** double-click `zero-launcher.cmd` in the project folder. The window shows:
+- every model and its variants in the Hugging Face cache (MTP, images, auto context, GPU memory at that context,
+  file size, its id for Pi's `/model`, compatible or not); the running one is green;
+- for the selected model: what it supports and how the auto context is counted (GPU memory minus 0.5 GiB for the
+  driver, snapshots, encoders, weights, MTP block and buffers, then the rest divided by the memory needed per 1,000
+  tokens, at most the model's max context length);
+- the server option fields: the main ones are shown directly (context, MTP drafts, thinking budget, prompt cache,
+  access from other computers); the rest (port, chunk, image tokens, W8 weights, cache folders and sizes,
+  `--no-swap`, f32 attention) appear after ticking "Show advanced options";
+- under the context field, **GPU memory**: whether the options as set fit (green) or may not (red): the model's
+  weights, buffers and encoders plus the context asked (per conversation slot) plus speech to text, against the GPU
+  memory less the driver's share. An estimate (the same as `zero-server start ... -DryRun`); with `auto` the server
+  makes it fit itself;
+- three tabs: **Running server** (model, filled context, a GPU memory bar and the memory per part, number of
+  requests, the last prompt and answer speed, the share of MTP drafts accepted, the `serverz.exe` command line),
+  **Selected model**, and **Log** (the server's log, live, with Copy);
+- Start / Stop, Get models and the web UI; the rest is in **More**: Download models, speech to text only, Copy the start
+  command, Set as default, Reset options, Refresh the model list, Record a meeting, the log and data folders, a doctor
+  report, and the update check;
+- **Get models** (or More > Download models): the models of setup's list, several at once (the ones already here are
+  marked), or a **Hugging Face link** pasted in: a model's page, a folder of it, or one file (`.../blob/main/x.gguf`,
+  `.../resolve/main/x.gguf`). Look up lists the repository's GGUF files with their sizes; the linked one is ticked with
+  the other parts of a split file and an image projector (`mmproj`). **Pause / Continue** (the download goes on where
+  it stopped, also after the window was closed: Download again), a **speed limit** (1-50 MB/s, changed while it runs),
+  and a cut connection is **tried again without end** (5 s, then up to 60 s between tries; Pause stops it). A repository
+  that asks you to accept its terms (Gemma) needs a read token in `HF_TOKEN` or `hf auth login`. The files go into the
+  Hugging Face cache, where the server finds them. Which models fit is counted from the RAM, and on a PC with a
+  discrete Arc card from the card's own memory too ("This PC has 16 GB of RAM and a GPU with 16 GB of its own");
+- **Speech to text only** (More): the server with Qwen3-ASR and no chat model (`zero-server start -Model none`;
+  Whisper too when the Speech field says `auto`), for transcripts. Pick a model in the web UI later and the first chat
+  loads it.
+
+All fields are filled in automatically with the best values for the selected model (what the server picks itself),
+so just choose a model and press Start. Fields you change turn yellow and only those are sent to the server. "Set
+as default" saves the changed fields (`%USERPROFILE%\.inferzero\launcher.json`) and makes the selected model the
+default one (also for `zero-pi` without a model name); "Reset options" goes back to the best values. The Start / Stop
+buttons use `zero-server`, so the server keeps running after the window is closed. "Copy the start command" puts the
+command that starts the server that way (the selected model, the options as set) on the clipboard, for a script
+or shortcut of your own (`powershell -NoProfile -ExecutionPolicy Bypass -File "...\scripts\zero-server.ps1" start
+-Model ...`); the "Running server" tab and `zero-server status` show the `serverz.exe` command line it ran. (The window text is in English:
+prompt cache = saved conversations, prefix cache = saved system prompt.) The same numbers come from
+`serverz.exe --list-models` ("memory", "defaults") and the server's `/props` ("memory", "stats").
+
+**Presets.** The Preset row at the top of the options keeps named sets: choose the model and the options, then "Save
+as...". Picking a preset selects its model and fills in its options; Delete removes it. They are files in
+`%USERPROFILE%\.inferzero\presets\<name>.json`, written with `zero-server`'s own option names (`{"Model": "35b",
+"Ctx": "65536", "Npu": "on"}`), so `zero-server start -Preset <name>` starts the same from a terminal or a script.
+
+**Messages, tray, updates.** Errors and notices appear in a bar under the title (with "Copy details" and, for a
+failed start, "Show log") instead of boxes that stop the window. Minimized, the window waits in the tray (right-click:
+Start the default model, Stop, the web UI). Once a day the window asks GitHub whether a newer package is out and then
+shows a link; nothing is downloaded by itself (More > "Check for updates when the window opens" turns it off). The
+window follows Windows' light or dark mode and accent colour (`-Theme light|dark` overrides it).
+
+The thinking budget in the launcher only applies to clients that do not send their own budget (web UI, other
+apps). Pi sends its own budget according to its `/thinking` level (section 2).
+
+**Through the terminal:** `zero-server` is installed with Pi (`~\.pi\agent\bin`); without Pi it is `zero-server.cmd`
+in the inferzero folder, which setup offers to put on your PATH.
+
+```powershell
+zero-server list                # the models on this PC: id, shortcut, size, auto context, MTP, images
+zero-server pull 4b             # download a model of the catalog (pull alone lists them: 4b 9b 35b 27b g12 g31 e4b asr whisper)
+zero-server status              # whether the server is running, which model is loaded, size of the conversation cache
+zero-server status -Json        # the same as JSON, for scripts (also list, presets, doctor, version)
+zero-server logs -Follow        # the server's log, new lines as they come (Ctrl+C ends it)
+zero-server doctor              # checks the exes, driver, GPU, NPU, disk, port and other GPU programs: paste it into an issue
+zero-server version -Check      # this package's version, and whether a newer one is out
+zero-server start -Model 27b -Ctx 65536 -DryRun   # check the options, print the serverz.exe command and the memory estimate
+zero-server save-preset -Preset long -Model 27b -Ctx 65536 -Npu on   # save options under a name
+zero-server start -Preset long  # start with them (an option given here wins over the preset's)
+zero-server start -Model 27b -Drafter off   # speculative decoding: auto, mtp, dflash, off, or a DFlash2 folder
+zero-server start -Model 27b -Port 8091     # another port (default 8090; also --port 8091, --port=8091)
+zero-server start -Model 27b -Host 0.0.0.0  # reachable from other computers (default 127.0.0.1, this PC only; also
+                                            # --host 0.0.0.0, --host=0.0.0.0, -ListenHost); open it by IP address
+zero-server stop                # stop the server and free the GPU memory (12–16 GB depending on the model)
+zero-server clear-cache         # delete every saved conversation (session cache; on by default, turn off with zero-pi --session-cache 0)
+zero-server start -Model 9b     # start with a particular model without opening Pi
+zero-server start -Model 27b -Ctx 32768 -NoMtp
+zero-server start -Model 27b -Ctx auto   # back to the automatic context (restarts a server with a fixed context)
+zero-server restart             # restart, for example after the GPU memory setting was changed
+zero-server start -Model 35b -MtpDrafts 2 -ThinkBudget 4096 -NoSwap   # other options (see zero-server help)
+zero-server help                # the common commands and options; help options / writing / errors / all for the rest
+```
+
+Several GPUs: `serverz --gpus N` (`--split tensor` or `--split layer`, `--tensor-split 3,1` for unequal shares,
+[docs/multi-gpu.md](docs/multi-gpu.md)); copy drafting for edits of text already in the conversation: `--copy-draft`.
+
+The server log is `%USERPROFILE%\.inferzero\logs\server.log` (on Linux `~/.inferzero/logs/server.log`;
+`-LogDir D` or `ARC_LOG_DIR` another folder). Each start writes it anew; the earlier servers' logs are
+kept next to it, named by the local date and time of their last line
+(`server_2026-11-09_14-13-48.log`), the newest 10; older ones in a zip each (`server_<date>_<time>.zip`), kept 90 days
+or 200 MB at most. The log's format, its options and `/metrics`: [docs/logging.md](docs/logging.md). The server uses port 8090. For scripts, `zero-server`'s
+exit code says what happened: 0 ok, 1 a wrong option or value, 2 the server stopped while loading, 3 not ready within
+10 minutes, 4 the port is used by another program.
+
+**Writing the options** (`zero-server help writing` and `zero-server help errors` have the full list; `zero-pi
+--help-all` too):
+- `zero-server` and `zero-pi` take one dash or two, in any case: `-Whisper auto`, `--whisper auto` and
+  `-whisper AUTO` are the same. `bin\serverz.exe` itself takes two dashes only (`--whisper auto`).
+- On / off values: `on`, `yes`, `true`, `1` or `off`, `no`, `false`, `0`; `-Whisper on` is `-Whisper auto`.
+- Paths with spaces go in quotes, and a quoted path never ends in a backslash (`"C:\folder\"` makes the closing
+  quote part of the path; write `"C:\folder"`). `-Model` takes a `.gguf` **file**, `-Whisper` the **folder** that
+  holds `model.bin`, `-Asr` a `.gguf` **file**; usually none is needed (shortcuts and `auto` find them).
+- A wrong option or value stops before anything loads, with what it expects: `unknown option -Whispr: did you mean
+  -Whisper?`, `-Npu: expected on, off (got 'maybe')`, `-Whisper: '...\model.bin' is a file: give the folder that
+  holds model.bin, ...`, `--whisper needs a value (auto (or on), off, or a faster-whisper folder with model.bin)`.
+- `zero-server start` without `-Model` shows the numbered list in a console. Where no one can type a number (a
+  script, a scheduled task, a redirected input), it keeps the running server, else starts the model used last.
+
+**inferzero (the engine):** the server runs through Level Zero (Intel's GPU driver). For
+MoE models (Qwen3.6 35B) the experts are kept on the SSD and only the frequently used experts are in GPU memory (a
+cache): the context can reach 262K together with images and MTP. The automatic context reserves 128K tokens, then
+sizes the expert cache, because a small cache makes generation pause for SSD reads (section 5).
+
+```powershell
+zero-server start -Model 35b          # experts streamed from the SSD
+zero-pi 35b
+zero-pi 35b --no-stream               # without the SSD cache: every expert on the GPU (a smaller context)
+```
+
+On first use, inferzero writes the expert file once (35B UD-IQ4_XS: 16 GB, about 2.5 minutes; Flash Next: 56 GB, about 9.5 minutes):
+next to the GGUF when the GGUF is inside `%USERPROFILE%\.inferzero` (its `models` folder, or a package in
+`zero\models\<name>\`), else in a folder of its own, `%USERPROFILE%\.inferzero\zero\models\<model name>\`, with a
+`source.txt` naming the GGUF. Delete a model and you know which expert file to delete with it; the server log also
+names a folder whose GGUF is gone (it deletes nothing itself). Expert files from before 2026-11-09 lie loose in
+`zero\` and move to their place the next time their model is loaded. An expert file can be deleted at any time; when
+it is missing, it is written again automatically. The cache size is set automatically: inferzero uses the GPU memory Windows reports for the iGPU (your
+shared-memory setting) less 0.5 GiB for the driver (`-DriverReserveGb N` on `zero-server`, `--driver-reserve-gb N` on serverz / runz, or `ARC_DRIVER_RESERVE_GB`, changes it), and the cache takes what the rest of the model leaves (it can be
+changed: server options `--expert-cache-gb`, `--expert-cache-pct`). If GPU memory suddenly runs short because of other apps (e.g.
+Chrome), the cache shrinks itself by 1 GB per step instead of crashing.
+
+On a GPU with memory of its own (Arc B580 / B60 / A770) the RAM is a second tier: each expert read from the SSD
+stays in RAM (up to the free RAM less 16 GiB) and the GPU copies it from there the next time it is missing from the
+GPU cache, so a large RAM saves most SSD reads. `--expert-ram-gb N` sets the size, `--expert-ram-gb 0` turns it off.
+Never on the iGPU, whose GPU memory is that RAM. A model split over several GPUs keeps at most 32 GiB per GPU there
+(and 128 GiB in all; `ARC_XRAM_GB=N` sets N GiB per GPU, 0 none): DeepSeek-V4.1-Flash over 4 Pro B60s generated
+9.25 tok/s with it, 3.55 without (issue #4).
+
+inferzero notes:
+- The SSD cache is only for MoE models (35B, Qwen3.8 Flash Next and Gemma 4 26B; the experts of the 35B's MTP
+  layer are in the same file). Dense models (27B, 9B, 4B, Gemma 12B / E4B) keep every weight on the GPU.
+- Expert files are never deleted automatically: the next start uses them right away (35B about 10 s, including
+  filling the GPU cache from the last list). They are rewritten only when the GGUF changes; files of an old version
+  have to be deleted by hand from `%USERPROFILE%\.inferzero\zero\`.
+- Disk space: a MoE model's experts are stored twice, in the GGUF and in the expert file (Gemma 4 26B: 14.4 + 13.2
+  GB). `bin\serverz.exe --pack <model.gguf>` turns them into a package in `%USERPROFILE%\.inferzero\zero\models\`: a
+  small GGUF with the other weights (26B: 1.6 GB) and the expert file (moved, not written again: seconds). Copy the
+  `mmproj` file next to the package for images. The model list then uses the package, and the original GGUF can be
+  moved to a backup disk. The package gives bit-identical logits and the same image answers (checked on the 26B,
+  20 Oct; the 35B and Flash Next run from packages too).
+  The launcher does it from **More > Pack the selected MoE model**, or `scripts\zero-server.ps1 pack -Model <name or
+  path>`: it packs the model and copies its own `mmproj` / `mtp-` files into the package. Then it offers to delete
+  the original GGUF (`zero-server remove-original -Model ...`, only once the package is complete). A package runs in
+  inferzero only: to use the model in another program you would download it again.
+- GPU kernels are compiled once and then saved (`%USERPROFILE%\.inferzero\kernels`): the first request of a model on
+  zero, the first image, or the first use after an Intel driver update feels slower, after that it is normal.
+
+**DFlash2 drafter (`--dflash`, inferzero only: `serverz.exe` / `runz.exe`).** This drafter guesses 7 tokens at
+once from the main model's hidden state, then the main model checks them in a single pass. Download the drafter
+([docs/install.md, section 6](docs/install.md#6-download-models)), then pass its folder (the snapshot folder containing `config.json` and `model.safetensors`)
+with `--dflash DIR`. The model's MTP block is still used: at each step the server picks DFlash2 while many of its
+drafts are accepted, otherwise MTP; greedy answers are identical to running without a drafter.
+
+A model with a DFlash2 drafter is also listed (Pi's `/model`, `zero-pi --pick`) with one drafter only:
+`<id>-nodf` drafts with the MTP block only, `<id>-df` with DFlash2 only (the MTP block is not loaded, which leaves a
+little more GPU memory for the expert cache), e.g. `35b`, `35b-nodf`, `35b-df`; picking one in Pi switches the
+server like another model does. On the command line: `--draft auto|mtp|dflash` (server and `runz`). Which one to
+use: `-df` for code, `-nodf` for Indonesian and other prose (the drafter was trained mostly on English text and
+code), the default (both) when the text is mixed. Speeds of each variant:
+[docs/before-after.md, "Where it stands"](docs/before-after.md#where-it-stands).
+
+**Gemma 4 runs in its accurate mode** (float attention; the 26B and 12B with two int8 passes per matmul, E4B with
+one: [docs/architecture.md, "How it works"](docs/architecture.md#how-it-works), its KL under "Validation"). Conversations saved by an older
+mode are not loaded (they are processed again).
+
+**The NPU next to the GPU (`-Npu on`).** `zero-pi 27b --npu on` (or `zero-server start -Model 27b -Npu on`) lets
+the Intel AI Boost NPU compute part of every prompt chunk while the GPU computes the rest (Qwen3.8 27B and Gemma 4
+12B; generation unchanged). The setting stays with the server across model switches and `zero-server restart`; a
+stop turns it off. Which models it helps, its cost and first-use compile: [docs/npu-experiment.md](docs/npu-experiment.md).
+
+**Two conversations at once (`-Slots 2`, inferzero).** By default the server holds one conversation and runs one
+request at a time: a second Pi window waits until the first one's answer is finished, and switching between them
+goes through the session cache. `zero-pi 35b --slots 2` (or `zero-server start -Model 35b -Slots 2`) makes the server
+hold two conversations, each with its own attention cache, DeltaNet states and snapshots; start a second Pi in
+another terminal with plain `zero-pi` and it shares that server. The GPU still runs one step at a time, but the two
+requests take turns step by step (a piece of up to 8,192 prompt tokens, or one generated token / verification
+pass), sharing the GPU time evenly, so a short question is answered while the other session reads a long prompt
+(35B, a 46K-token prompt in one slot: a question sent 2 s later was answered after 9.6 s instead of after the whole
+prompt). Each slot gets the context that fits two of them (`-Ctx auto`: 27B 2 x 49,152 tokens; streamed MoE models
+aim at 128K in all and keep at least 32K per slot: 35B 2 x 65,536, its expert cache 76 -> 73 % of the experts, Gemma 4
+26B-A4B 2 x 32,768, 72 -> 65 %). When both are writing their answers, their next tokens (with their
+drafts) go through the model in one GPU pass, so the weights are read once for both: two answers at once, 27B
+7.3 -> 10.5 tokens/s together for prose, 11.6 -> 15.4 for code; 35B 20.2 -> 24.7 and 29.0 -> 30.7; Gemma 4 26B-A4B
+19.8 -> 26.2 and 19.6 -> 26.5 (Gemma's drafts are verified one slot at a time). Flash Next batches its slots too since
+2026-10-27, without a drafter (with DFlash2 they take turns), but on this laptop two chats get only ~1.05x together:
+each conversation reads its own missing experts from the SSD (1.43x when the experts are cached). The answers are the same as with one slot (greedy text identical; the
+engine's logits bit-identical alone, interleaved or batched). `ARC_NO_BATCH=1` turns the batching off (turns only).
+
+**Qwen3.8 Flash Next (inferzero only).** A MoE model with 512 experts fetched from the SSD (like the 35B). Run
+`serverz.exe` with `-m` pointing to the first file (`...-IQ3_S-00001-of-00002.gguf`); the second file must be in the
+same folder (or use `zero-pi flash` / `zero-server start -Model flash`). The first start writes a 56 GB expert file
+to `%USERPROFILE%\.inferzero\zero\` (~9.5 minutes); later loads through the server take ~21–26 s. It writes ~6–7
+tokens/s (the expert cache holds about a fifth of the experts at 131K); prompts: 166 tokens/s at 4K, ~145-163 at
+9-32K, ~123 at 125K, in its fast mode (below). The automatic context is 131,072 in the fast mode and 106,496 in the
+precise one; up to 262,144 with `--ctx`. Since 2026-11-22 it runs in its precise mode by default: KL against the CPU
+reference 0.0033 on 480 tokens of markdown and 0.0073 on 3,584 of prose, under the 0.015 limit, with prompts at about
+60 % of the fast mode's speed (the laptop, 3,584 tokens: 74.8 against 127.7 tokens/s). In precise mode the
+system-prompt cache and saved conversations are off (how precise mode was repaired:
+[docs/flash-precise-repair-2026-11-13.md](docs/flash-precise-repair-2026-11-13.md)). Its fast mode is for text work such as summaries, where it does
+not change what is said (0.0109 on the prose), but it is less exact on code and tables (0.0415 on the markdown):
+`zero-server start -Model flash -Fast` (`zero-pi flash --fast`, the model `flash-fast`, the launcher's "Precise mode"
+switch off; kept on a restart and a model switch like `-Npu`, `-Precise` goes back; the server's own option
+`--fast`, or `ARC_FN_PRECISE=0`). The model file has no MTP
+block, but its MTP head as a file of its own works: put `mtp-Qwen3.8-Flash-Next-Q4_0.gguf` (2.2 GB, from
+[SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF](https://huggingface.co/SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF),
+the base model's head made for llama.cpp; the launcher's Get models takes the link; its Q8_0 head
+`mtp-Qwen3.8-Flash-Next-Q8_0.gguf` works too since 2026-11-17, taking about twice the GPU memory) next to the model
+and MTP is on (`runz --mtp`; a head elsewhere with `--mtp-model FILE`, in runz and serverz): 3 drafts a step, 96 % accepted, +18 % on the laptop (its experts take
+1.4 GiB of GPU memory from the expert cache); with the DFlash2 drafter too, the server picks one per step. It
+reads images with its projector next to it (bartowski's `mmproj-Qwen3.8-Flash-Next-f16.gguf`); the packaged single
+file in `%USERPROFILE%\.inferzero\zero\models` works too.
+
+Stop the server (`zero-server stop`) before using the laptop for other heavy GPU work (games, video editing), or
+before moving or rebuilding the inferzero folder.
+
+**Discrete Arc cards (experimental).** The same server runs on Arc B-series cards (B580, Pro B60, Pro B70) and
+A-series cards (Alchemist: A770, A750, A580). A dense model that nearly fills the card keeps part of its weights in
+RAM, read over PCIe on every token, so generation slows with that share: an Arc B580 12 GB ran the 27B at 3.5 tok/s
+with 1.02 GiB of its weights in RAM, 7.1 with `ARC_HOST_KEEP_GB=0.75` (less room kept on the card, 0.49 GiB in RAM;
+issue #37). With several cards it runs one model over them:
+
+```powershell
+.\bin\serverz.exe -m <model.gguf> --gpus 4 --slots 4
+```
+
+- It supports Qwen dense models, the 35B-A3B, Flash Next and DeepSeek-V4.1-Flash.
+- A model that cannot be split loads on one GPU.
+- MTP / DFlash2, images and the disk caches are off on a split model for now.
+- If a GPU hangs, `/health` answers 503 until a restart.
+
+What to measure on such a card, and the switches: [docs/xe2-tuning.md](docs/xe2-tuning.md). The split and its
+failsafes: [docs/multi-gpu.md](docs/multi-gpu.md).
+
+## 4. Web UI and other apps
+
+While the server is running:
+
+- **Web UI**: open http://127.0.0.1:8090/ in a browser to chat directly. It is laid out like WhatsApp Web:
+  - **Chats** on the left: every conversation is kept by the server in the data folder, **one folder per chat**:
+    `%USERPROFILE%\.inferzero\chats\<date> <first words> (<id>)\` holds `chat.json` and the chat's files under their
+    own names (uploads, voice messages, documents the model wrote). Search the chats; the pencil starts a new one; the
+    bin on a chat deletes its folder with its files (other chats keep their own copies).
+  - **The model** in the chat header: click its name to pick another model or variant; the server loads it with the
+    next message (5-40 s). Under the name: the context used, and whether thinking and web search are on.
+  - **Attachments** with the paperclip, drag-and-drop or paste: text files, images (Gemma 4 12B / E4B / 26B, Qwen3.5
+    4B / 9B, Qwen3.8 27B, Qwen3.6 35B), audio. Each file goes into the chat's folder; messages refer to it, and the model also gets its name,
+    type, size and upload time.
+  - **@ in the message** lists the files uploaded before (filtered as you type): Enter or a click attaches one again,
+    without uploading it again (a file from another chat is copied into this chat's folder: a command run in one
+    chat does not change the other's).
+  - **Files** in the left rail: every saved file of every chat with its size, date and the chats that use it;
+    filter, sort, search, attach it to the message, or delete files one by one, several at once, or all files no chat
+    uses. Files put into a chat's folder by hand show up too.
+  - A message's menu (the arrow on its bubble): **Edit** (correct it and send again) or **Delete** (the message with
+    its answer, and its files when no other message uses them).
+  - **Messages while an answer runs** wait in a **queue** above the message box (Send or Enter while the model
+    answers) and go one by one, in order, when it ends; your draft in the box stays. Each has **Steer**, **Edit**
+    (back into the box) and **×**. **Steer** puts it into the answer under way: while the model runs tools (web
+    search, files) it goes in before its next step and the model reads it before going on; while the model writes, the
+    answer stops where it is (what it wrote is kept) and your message goes at once. A queue waits with its chat: open
+    another chat and it goes on when you come back.
+  - The model knows when each message was sent (day, date, time and time zone go with every message).
+  - **Answers go on in the background**: open another chat while one answers and it keeps going ("answering…" in the
+    list); open it again to watch it or Stop it. **Conversations at once** in the settings sets how many chats answer
+    at the same time (the server loads the model again, 5-40 s; each chat then has 1/N of the context, and a chat
+    too long for it is summarized before its next answer). With every slot answering, New chat is off and a
+    message in another chat waits in its box until one ends (or Stop). A bar over the chat list shows
+    what runs and has **Stop all**; an answer with no output from the server for 10 minutes stops by itself.
+  - **Settings** behind the gear (bottom left; on a phone in the chats' header): **Thinking** as the model offers it
+    (Qwen3.8: off / low / medium / high; the other models: on / off), **Files**, **Terminal**, **Web search**, the **Voice** of Talk mode
+    (the Windows voice that reads answers aloud and its rate), **Advanced** (your own temperature instead of the
+    model maker's recommended sampling, which the server takes from the model file; a system prompt), the theme,
+    **Data** (what is stored; clear the chats, or the chats and their files).
+  - **Memory**: tell the model "remember that …" (or "ingat ya …") and it saves one dated note with its `remember`
+    tool; "forget …" removes the notes that contain those words.
+    - The notes live in `%USERPROFILE%\.inferzero\MEMORY.md`, which you can read and edit by hand or in Settings >
+      Memory (Save notes).
+    - Every new chat starts with them, whatever the model.
+    - A chat keeps the notes it started with, so a note saved now reaches the next chats. This way a running chat's
+      prompt never changes and the prompt cache holds.
+    - The model is told to save only when you ask, but `remember` does not ask you first (a web page or file could
+      talk a model into it): check Settings > Memory now and then. It stops at ~8,000 characters (~2,000 tokens) and
+      asks to merge old notes. `forget` removes at most 3 notes at a time; remove more in Settings.
+    - Settings > Memory > Use memory turns it off. Chats from before memory existed keep their prompt without it.
+    - Memory and projects work in the web UI on this computer only, not from another device (`--host 0.0.0.0`).
+  - **Projects** (the project menu over the chat list): a project is a folder of yours.
+    - New project… opens a folder picker on this computer. A Google Drive folder works too, through Google Drive for
+      desktop (`G:\My Drive\…`), though Google Docs' own files there are only links.
+    - A project's chats see only that project (the server refuses another project's files). A folder that holds
+      your whole user folder, AppData, `.ssh` and Windows' folders cannot be a project. Their model:
+      - reads the folder's files: `list_files` with scope `project`, then `read_file` / `search_file` /
+        `digest_file` on `project:<id>/<path>`;
+      - follows the folder's `AGENTS.md` (or `CLAUDE.md`) as instructions;
+      - has a memory of its own besides the global one (`projects\<id>\MEMORY.md` in the data folder, never in your
+        folder);
+      - opens its terminal in the folder.
+    - The model writes documents into the chat's own files. It changes the project folder only through the terminal,
+      which asks you first.
+    - The folder must be an existing one, not a whole drive, not Windows' or the programs' folders, and not the
+      inferzero data folder. Paths that leave it (`..`, junctions, links) are refused, and junctions are not
+      listed.
+    - Removing a project from the list keeps its folder, chats and memory; adding the folder again brings it back.
+    - "No project" shows the chats outside every project.
+  - There is no answer length limit to set: an answer may use the rest of the context (the reasoning is bounded by
+    the server's thinking budget), and **Compact** in the chat header (or automatically when the context is nearly
+    full) summarizes the earlier messages.
+- **Recordings that end badly.** A meeting recorder (`zero-server record`) that is killed, a shutdown or a power
+  cut leaves its WAV in `%USERPROFILE%\.inferzero\recordings`: the server picks it up at its next start
+  and transcribes it. A live recording whose browser tab closed or lost its connection is stopped once the page has sent
+  nothing for 5 minutes, and transcribed as well; a recording of another tab can be stopped with its Stop
+  button. Files and recordings of up to 6 hours are transcribed.
+- **Web UI: other chats and recordings.** With **Files** on, the model can look into your other chats with it
+  ("what did we decide in the chat about the budget?": it searches them and reads the exchange it needs) and
+  into the recordings and meetings of the Transcripts menu. `@` in the message box lists them next to
+  the saved files: picking one attaches it like a document (a long one as its outline, read in parts).
+- **OCR models** (Xiaomi-OCR-0 and others whose name says "OCR"; convert one to GGUF with model + mmproj, and put
+  both files directly in `%USERPROFILE%\.inferzero\models`, not in a subfolder of it, so the launcher and the
+  model menu list it; `.inferzero\zero\models` holds only MoE packages made with `--pack`): add an image and send. The server asks the model with its own task prompt, so just name the task, in Indonesian or
+  English:
+  - nothing: the text;
+  - `dokumen`: Markdown, tables as OTSL, formulas as LaTeX;
+  - `tabel` or `rumus`;
+  - `json:` and the fields, e.g. `json: tanggal, total, nama toko`.
+
+  A PDF works too: each page is read in turn and comes under its own `## Page N / M` heading, 50 pages a turn.
+  The web UI then sends "lanjut" by itself until the last page (Stop ends it); `halaman 51-100` picks pages.
+  Each time you send a PDF, it offers to save the text to a `.md`, each page added as it is read. You choose its name
+  (`<the PDF's name>.md`) and folder (empty: the chat's files; or e.g. `C:\Users\you\Downloads`). An existing file is
+  never written over (`name (2).md` then). Saved, the chat shows only a bar of the pages done and keeps a note of the
+  file, not the pages; switch to a chat model in the same chat (Files on) and it reads the file with `read_file`. A
+  folder of your own gets a copy in the chat's files too, for that. Not saved, the chat shows every page.
+
+  **Many files at once:** pick several images and PDFs (the paperclip button takes many, or drop them) and send
+  them in one message. They are read one after another, in the order attached, each under `# File K / F: name`
+  (a PDF's pages under `## Page N / M`), all with the task your words name. The web UI asks how to save them:
+  - **one merged Markdown** (the name you give; `<first file> and N more.md`): every file under its own `# name`
+    heading;
+  - **one Markdown per file**: `<file's name>.md` each, with `# name` on top;
+  - or **just show it**.
+
+  The rules of a single PDF hold: an existing file is never written over (`name (2).md`), at most 50 pages a turn
+  over all the files (an image counts as one), and "lanjut" goes on from the file and page where the last turn
+  stopped, by itself until the last file. Page words (`halaman 51-100`) are not read for several files.
+
+  Stop ends the page being read at once (the pages before it stay in the `.md`). If the `.md` cannot be written
+  (a full disk, the folder removed), the reading stops there and the answer says so. A page larger than a poster is
+  read at 4000 pixels on its long side; an image from a project's folder may be up to 64 MB.
+
+  **Files already in a project's folder:** in a project's chat with the OCR model loaded, the folder button next to
+  the paperclip lists the project's PDFs and images (subfolders too). Tick several, or **All**, and send: they are
+  read where they are, not uploaded again. The `.md` files go into the project's `ocr` folder by default (another
+  folder works too), so every chat of the project and any model finds them (`list_files` with scope `project`).
+  Only this computer and the server's own page can do this, and only with the chat's own project.
+
+  The text keeps the image's language. For questions about a document, use Qwen3.5 4B / 9B or Gemma 4 instead
+  ([tools/server_ocr.h](tools/server_ocr.h)).
+- **Web UI: Transcripts and Meetings** (the left rail's second and third buttons; the server started with
+  `--whisper auto`, or `zero-server start -Whisper auto`, or with no chat model: `zero-server start -Model none`, the
+  launcher's More > "Start speech to text only"; [docs/whisper-native.md](docs/whisper-native.md)).
+  - **Transcripts**: drop audio or video files (MP3, M4A, WAV, Ogg / Opus voice notes, MP4, MOV, MKV, WebM, AVI,
+    WMV) or choose them; they upload and wait their turn, each with its progress. Pick the **language** (Indonesian, the
+    default, English, **Indonesian + English mixed**, or detect; with Qwen3-ASR Indonesian keeps the English words
+    and terms said in it, while detect often takes Indonesian for Malay; with Whisper the mixed one is about 3x
+    slower), **Accurate** (beam 5) or **Fast**, and a **Glossary** of names and terms the speech uses: jargon,
+    abbreviations, people's names, written as you want them (written inside a casual sentence, the text keeps a
+    casual spelling). **Model**: Qwen3-ASR (the default: the most complete on noisy mixed Indonesian and English, one text
+    without word times; the glossary helps it most), Gemma 4 E4B (the most readable on clear speech, but it can add
+    sentences over noise; the server switches its chat model to E4B) or Whisper large-v3 (every word's time); it can
+    be changed any time, each file keeps the one it was added with ([docs/qwen3-asr.md](docs/qwen3-asr.md)). Open a transcript: it plays with its media and lights the word being said; click a word or a time to
+    play from there; double-click a line to correct it; **Find / Replace all** changes a term everywhere; tick the
+    formats (SRT, WebVTT, YouTube SBV / SRV3, ASS, TTML, text, Markdown, CSV, Remotion captions / pipeline, JSON) and
+    the subtitle shape, then **Export**. Everything is kept in `%USERPROFILE%\.inferzero\transcripts\`.
+  - **Live**: choose the microphone or a tab's / the screen's sound (Chrome asks what to share: tick "Share tab
+    audio") and press **Live**: the text comes about 2 s behind, grey while a sentence is still being said;
+    **★ Mark** marks a moment. **Stop**: the whole recording is transcribed again accurately, then kept in the
+    format of the format menu:
+    - **WAV** (lossless);
+    - **MP3** 96-320 kbps (one track at most 128);
+    - **M4A** (AAC) 96-192 kbps, which sounds better than MP3 at the same bitrate.
+
+    **Mono / Stereo**: Stereo keeps left and right of a tab's sound (music, a video) or of a stereo microphone; the
+    text is the same either way.
+  - **Meetings**: **Start a meeting** records your microphone as "Me" and the meeting's sound (the tab of Meet /
+    Zoom web / Teams web, or the screen) as "Others"; use headphones, so the microphone does not hear the others
+    too. Afterwards **Summarize** (the loaded chat model writes the summary, decisions, action items and open
+    questions with their minute, in the meeting's language) and **Minutes DOCX / PDF** (also in the Files panel).
+    A recording made elsewhere can be dropped in the Transcripts list too. For a meeting in a desktop app (Zoom,
+    Teams) or a long one: `zero-server record -App Zoom.exe -Title "weekly"` records your microphone and that app's
+    sound in the background (without `-App`: everything the speakers play; `-NoMic`: the meeting's sound only),
+    whatever the browser or the server do meanwhile; `zero-server record-stop` ends it, and it appears in the
+    Transcripts list, transcribed as Me / Others.
+  - **Audio in a chat**: an attached audio file or a voice message reaches every model as text written by
+    Qwen3-ASR (Whisper when Qwen3-ASR is off; long recordings as a document the model reads by parts). Settings >
+    Voice > **Speech**: written by the speech model (every model), or "The model hears it" (Gemma 4 E4B / 12B get the sound itself; ~0.2 s quicker in
+    Talk).
+- **Web UI: web search.** Turn on **Web search** in the settings and the model can search the web (`web_search`) and
+  read pages (`web_fetch`): each search or page shows as a card in its answer (with the links), and the answer goes
+  on with what it found. The server does the requests itself: it asks Brave Search, Bing, DuckDuckGo and Wikipedia
+  at once and merges their results as SearXNG does (a page several engines rank high comes first; when one engine
+  refuses, a rate limit or a bot check, the others still answer), and it
+  turns pages into plain text; it only reaches public http(s) addresses (nothing on this machine or the local
+  network). The model can also follow links and open files: a GitHub issue comes with all its comments and a list of
+  the files attached to it; a PDF, Word, Excel or PowerPoint file (up to 20 MB) is read and saved in the chat's files;
+  an image is saved and shown to a model that sees images (Gemma 4, Qwen with its mmproj); an audio file (up to 60 MB, its
+  first 30 minutes) is saved and written out by the speech model. **web_view** shows the model a page as a browser does: Microsoft Edge
+  opens it unseen and takes a screenshot (for a model that sees images) and the page's text after its scripts ran. Edge
+  gets a new empty profile each time (nothing of yours) and can only reach public addresses. Other clients can use the
+  same endpoints ([docs/server.md, "Run the server by hand"](docs/server.md#run-the-server-by-hand));
+  `--no-web-tools` turns them off.
+- **Web UI: files and documents.** With **Files** on (the default) the model can list the saved files
+  (`list_files`: by kind, name, upload time, this chat only), read them (`read_file`: DOCX, PDF, Excel XLSX / XLSM, PowerPoint
+  PPTX (one heading per slide, with its speaker notes), text, Markdown, CSV; "read all the files I uploaded today" works; a spreadsheet reads as one heading per sheet and one
+  line per row, "Nama: Budi | Nilai: 80" when it has a header row, dates as yyyy-mm-dd, formulas as their values) and write files (`create_file`: DOCX, PDF, DOC, RTF and XLSX made from Markdown; any
+  text format, such as HTML, SVG, CSS, JS, Python, JSON, CSV or TXT, saved as written; a saved HTML / SVG file's card
+  opens the page sandboxed; binary formats such as PPTX, PNG or ZIP are refused). A document the model's context
+  takes in one read (about a sixth of it: ~40K tokens for Qwen 3.5 4B's 262K) comes whole. A **longer document** gets
+  its outline (chapters with pages): the model reads the chapters or pages the question needs (`pages: "1-20"` in one
+  call), or searches it (`search_file`: the passages with the question's words, with their pages), and says where its
+  answer comes from. For all of it (a summary, a review) **`digest_file`** has the server read it part by part with
+  the loaded model, each section or function kept whole, and returns notes of every part with their pages; the notes
+  are saved in the chat's files as `<name> (notes).md`, so a later question reads them at once (a 57 KB README with a
+  16K context: 3 parts, 3 minutes on Qwen 3.5 4B).
+  **Scanned PDFs** (pages that are images, without text) are read by the loaded model when it sees images (Qwen 3.5
+  4B / 9B, Gemma 4 E4B / 12B / 26B with their mmproj): `read_file` with `pages` has it transcribe those pages from
+  their images first, up to 4 a call (10-60 s a page: ~1,000 image tokens, then the text), and the text is kept with
+  the file (the chat folder's `.pages\<id>.json`), so later reads, other chats and `search_file` use it without the
+  vision model. JPEG, Flate and CCITT fax images are read; JBIG2 and JPEG 2000 scans are not. A model without an
+  image encoder says which pages are scans and that a vision model is needed. With one slot the transcription is a
+  conversation of its own, so the chat's prompt is processed again at its next turn (`--slots 2` or the session
+  cache avoid that). Documents it writes: **DOCX** (opens in Word without
+  repair), **PDF**, **DOC** (Word 97-2003 compatible, written as RTF, which Word opens as a document), RTF or Markdown,
+  from Markdown with headings, bold / italic / underline / strike / highlight, colors and font sizes, lists, tables
+  (column alignment, a header row repeated on each page), code, rules, centered or justified blocks and page breaks;
+  page size and orientation, margins, font, line spacing, heading and table colors, header, footer and page numbers.
+  **XLSX** (Excel, opens without repair): each Markdown table becomes a sheet named by the heading before it, with
+  numbers, Rp amounts, percentages and dates as real values (so sums and filters work; Indonesian 1.234,5 or US
+  1,234.5 told apart per table, or set with `number_format` id / us), a bold frozen header row with
+  an autofilter; the text around the tables goes to a first "Notes" sheet. The document shows as a file card in the answer (open or download) and is saved in the chat's folder. Ask for a
+  change ("the spacing is too tight", "make the title dark red") and the model reads the document's source and writes
+  a new version next to it (`name (2).docx`).
+  Long results of earlier questions (document parts, web pages, search passages, command output) go back to the
+  model as a one-line note of what was read, so a few reads do not fill the context; the model reads a part again
+  when it needs it. The last exchange and the answer running now get them whole, and the chat keeps them all.
+- **Web UI: terminal.** The **Terminal** button above the chat opens the chat's terminal in a panel on the right: a
+  PowerShell that starts in the chat's folder, so it can use the chat's files and the programs installed here
+  (inferzero's own tools are on its PATH). Type commands there yourself (Enter runs, Up brings back the last one).
+  The folder and the environment carry over from one command to the next: `cd`, `$env:X = ...` and an activated
+  `.venv` (`.\.venv\Scripts\Activate.ps1`, later `deactivate`) stay; PowerShell variables and functions do not, and no
+  program keeps running after its command. The terminal belongs to the chat: it is still there when the chat is opened
+  again. **The model may use it too** (`run_command`, shown in the panel as AI), and **opens it itself** when it is
+  closed (to make a `.venv` and install a package, say): that first command waits in its card for **Run** / **Don't
+  run**, and the panel opens once you allow it. **Settings > Terminal**: **Ask once per terminal session** (the
+  default: only the first command of each session waits for Run; the other commands of that answer wait for your
+  answer instead of asking too), **Ask before every command**, or **Model never** (the model neither opens nor uses
+  it). Asked only to open, hide or exit the terminal, the model does that alone
+  (`terminal_panel`; "close" hides it, the session goes on). The model is told the shell and Windows version in the
+  session's first result, so it writes commands for Windows PowerShell 5.1 rather than bash. **Exit** (the power
+  button) ends it: a command still running (yours or the model's, also one waiting for Run) is stopped, and the next
+  session starts again in the chat's folder, its first command asking again; **×** only hides the panel. A command
+  stops after 2 minutes (the model may ask for up to 10; yours: 10), together with every program it started; up to
+  64 KB of its output goes back to the model. Only the web UI on this computer can use the terminal: the server
+  refuses it to other computers (also with `--host`; such a server is opened by its IP address,
+  http://192.168.x.x:port/, not by a name, against DNS rebinding), and entirely with `--no-terminal`.
+- **Web UI: pages.** A code block of HTML or SVG in an answer has **Open** next to Copy and Download, and a saved
+  `.html` / `.svg` file's chip opens the page (Ctrl+click: its source). It opens in a new tab inside a sandbox: its
+  scripts run and it may load from `https:` sites (a CDN's chart library, images, fonts), but it cannot reach this
+  server (no commands, chats or files), the web UI's storage or its window.
+- **Pages of other sites and of other local servers** (another port on this computer) reach only the model
+  endpoints (chat, audio, /tokenize): not the tools, files, chats, transcripts, live recording, slots or sessions,
+  which are the web UI's own.
+- **Web UI: voice messages and talking.** The microphone in the message box records a voice message (the bin
+  discards it, Send sends it). The headset in the chat header starts **Talk**: the microphone stays on, the end of
+  each sentence is detected after a second of quiet, and the answer is read aloud while it is written. Speak while
+  it talks to interrupt it; press the headset again to stop. With speech to text on the server (`--whisper auto`, or
+  `zero-server start -Whisper auto`: Qwen3-ASR by default) your speech is written as text first, so both work with
+  every model; without it they need Gemma 4 E4B or 12B, which hear the recording
+  themselves. Something you said just before stopping Talk waits in the message box instead of being sent. Pick the reading voice and
+  speed in the settings (Windows: Settings > Time & language > Speech adds an Indonesian voice). The audio goes only
+  to this server. Headphones avoid the AI hearing itself.
+  With **Web** ticked as well, searches run in the background while you talk: the AI says it is looking, and
+  talks about the results when they arrive.
+- **OpenAI API**: base URL `http://127.0.0.1:8090/v1`, any API key (for example `inferzero`), model `qwen3.8-27b`
+  (or the model currently loaded; other models in the list are loaded automatically). Supports streaming,
+  `reasoning_content`, tool calls, `usage`, repetition penalties (`frequency_penalty`, `repeat_penalty`),
+  `logit_bias`, `logprobs`, several answers at once (`n`, also on `/v1/completions`), guaranteed-valid JSON answers
+  (`response_format` with `json_schema`), and `tool_choice` (forcing a tool call). Limits: a request body up to
+  256 MiB (larger: 413), all requests together up to 1 GiB at once (more: 503, try again); a prompt longer than the
+  context gets llama-server's `exceed_context_size_error`, which Pi and other clients use to compact and retry.
+- **Other formats** (same models and features):
+  - **Ollama**: apps that have an "Ollama" option (e.g. Open WebUI, many editor plugins) just need to point to
+    `http://127.0.0.1:8090` (`/api/chat`, `/api/generate`, `/api/tags`, ...).
+  - **Anthropic**: `http://127.0.0.1:8090/v1/messages` (Claude format, including tool_use and thinking).
+  - **OpenAI Responses**: `/v1/responses` (used e.g. by Codex CLI); the old **Completions**: `/v1/completions`
+    (raw prompt, for code autocomplete).
+  - **Audio transcription**: `/v1/audio/transcriptions` (upload an audio file, the result is text), with
+    `--whisper auto` (zero-server `-Whisper auto`): which model answers what is in
+    [docs/qwen3-asr.md, "Using it"](docs/qwen3-asr.md#using-it).
+- Embeddings (`/v1/embeddings`) are not available yet: they need an embedding model with an architecture the engine
+  does not support yet.
+- **Web UI: automatic compaction.** The top right shows the context use ("context 12.3K / 40.9K"). If the next
+  message would make the context almost full, the older messages are summarized by the model first, then the
+  conversation continues with the summary + the last exchanges. The **Compact** button does this at any time;
+  **Stop** cancels it.
+- **Well-formed tool calls** (Gemma 4 and Qwen): the server keeps every tool call valid for the tool's schema
+  ([docs/server.md, "Run the server by hand"](docs/server.md#run-the-server-by-hand); `ARC_TOOL_CONSTRAINT=0` turns it off).
+- **Qwen3.6 35B: `zero-pi 35b --preserve-thinking`**: the thinking of earlier turns stays in the prompt (an official
+  option of the Qwen3.6 template; Qwen3.8 27B always does this). Follow-up messages do not process anything again;
+  the context fills faster.
+
+Example from PowerShell:
+
+```powershell
+$body = @{ model = "qwen3.8-27b"; reasoning_effort = "none"
+           messages = @(@{ role = "user"; content = "Hi! Explain inferzero in one sentence." }) } | ConvertTo-Json -Depth 4
+(Invoke-RestMethod http://127.0.0.1:8090/v1/chat/completions -Method Post -ContentType "application/json" -Body $body).choices[0].message.content
+```
+
+From Python (the `openai` package):
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:8090/v1", api_key="inferzero")
+r = client.chat.completions.create(model="qwen3.8-27b", messages=[{"role": "user", "content": "Hi!"}],
+                                   extra_body={"reasoning_effort": "none"})
+print(r.choices[0].message.content)
+```
+
+## 5. Context size, and when a conversation gets long
+
+Each model uses the largest context that fits the GPU memory currently available (set in Intel Graphics Software,
+a 20.4 GiB GPU share on this laptop now; the amount the driver offers changes with what other apps run), minus 0.5 GiB
+for the driver, or the model's training limit. The context adjusts itself when that setting is changed (run
+`zero-server restart` afterwards). The launcher window shows the current numbers. Examples:
+
+| Model | Default context |
+|---|---|
+| Qwen3.8 27B | 65,536 with images + MTP + DFlash2 (`27b`); 90,112 `27b-df`; 110,592 `27b-mtp` / `27b-nodf`; 143,360 `27b-vision`; 188,416 `27b-std` |
+| Gemma 4 26B-A4B | 90,112 with images + drafter (`g26`); 118,784 `g26-mtp`; 102,400 `g26-vision`; 131,072 `g26-std`; the expert cache keeps at least 0.6 of the free memory (generation at 36K of depth: 11.4 tok/s with a 49K context, 10.5 with 131K) |
+| Qwen3.6 35B-A3B | 131,072 automatically (images + MTP + DFlash2; the automatic context reserves 128K, then sizes the expert cache: ~76-81 % of the experts cached); up to 262,144 with `--ctx 262144` or the `-std` variant (71-77 % cached) |
+| Qwen3.8 Flash Next | 131,072 automatically (~20-25 % of the experts cached); up to 262,144 with `--ctx` |
+| Qwen3.5 9B / 4B | 262,144 tokens (full) |
+| Gemma 4 12B | 262,144 tokens (full) |
+| Gemma 4 E4B | 131,072 tokens (full) |
+
+`zero-pi --ctx N` sets a context, `zero-pi --ctx auto` goes back to the automatic one (restarting a server that runs a
+fixed context). `--chunk 1024` frees 1.1 GiB on the 27B for more context (118,784 at 18.3 GiB; prompts of ~11K
+tokens ~4 % slower, from ~34K on no difference).
+
+inferzero uses the whole GPU share you set except 0.5 GiB for the driver, so the share decides how much RAM is left
+for Windows: if the laptop becomes slow or stops responding while a model runs, lower the GPU memory setting.
+
+The output limit (`maxTokens` in Pi) equals the context size: Pi itself clamps each request to the room left
+(window − prompt − 4096). Very long prompts still take time (see section 6), so a large context is mainly useful
+for long sessions that use the prefix cache.
+
+Pi handles a full context, not the server. When the conversation passes `context size − 16384` tokens (counted from
+the token usage the server reports), Pi summarizes the older part and keeps the latest ~20,000 tokens. If a single
+request still exceeds the context, the server sends llama-server's `exceed_context_size_error` ("the request exceeds
+the available context size"); a prompt that cannot possibly fit (more text than the context times the longest
+token) gets it before it is tokenized, with "at least N tokens". Pi recognizes it, then summarizes and retries
+automatically. You can also summarize at any time with the `/compact` command in Pi.
+
+This summary takes time (a few minutes on the 27B), because the model has to read the part being summarized and
+then process the new conversation again. The server cannot simply drop old tokens: the DeltaNet layers of
+Qwen3.5/3.8 keep a state that cannot "forget" individual tokens.
+
+Between turns the cache keeps the conversation: a new message processes only itself. Qwen keeps its DeltaNet state
+at the end of each prompt, the start of the model's turn and the turn start after the user's last message. Gemma 4's
+sliding-window layers keep a ring of ~4K positions beyond their window; since 2026-10-31 the same points keep a copy
+of that ring too, and a tool call goes into the prompt without its reasoning every turn, so a long answer or a long
+tool result no longer makes the next turn process the whole conversation again (E4B: a follow-up after a 20K-token
+file read 0.8 s, 38 s before). In the web UI, a document too long for the context is better read with
+`digest_file` (section 4, Files) than in parts inside one answer: its parts do not use the answer's tool rounds.
+
+## 6. How fast
+
+Current numbers, measured on this laptop with inferzero (every model, how it was measured, and llama.cpp for
+comparison: [docs/before-after.md, "Where it stands"](docs/before-after.md#where-it-stands)):
+
+- Qwen3.6 35B-A3B (UD-IQ4_XS): reads a 32K prompt at 604 tokens/s, 128K at 324; writes 20.6 tokens/s, Python code
+  ~50 with DFlash2, Indonesian ~22 with MTP; 12.6-13.0 tokens/s deep in a 128K context.
+- Qwen3.8 27B: reads ~135 tokens/s; writes 4.9 tokens/s, code 18.1 with DFlash2 + MTP, Indonesian ~7 with MTP.
+- Qwen3.8 Flash Next: reads ~164 tokens/s (4K) to 123 (125K); writes ~6-7 tokens/s.
+- Gemma 4: 26B reads ~252 tokens/s (4K), writes ~25 with its drafter; 12B 137 / 19; E4B ~724 / 32.
+- Images: a 1,064-token image takes ~7.4 s on Gemma 4 26B, ~3 s on E4B and the Qwen models.
+- Very long prompts are read more slowly (attention gets heavier), and drafting helps code more than prose.
+
+Tips:
+
+- The longest part is usually the thinking phase. `--think off` or `--think minimal` speeds up simple answers.
+- Follow-up requests, new sessions in a project used before and old sessions taken up again only process what is
+  new (the caches: section 2). Saved conversations are in `%USERPROFILE%\.inferzero\zero\sessions`;
+  `zero-server clear-cache` deletes them.
+- A new message in the same session (Qwen 4B / 9B / 35B) only processes the last turn again: the Qwen template drops
+  the thinking of earlier turns as soon as you write again, and the server keeps the starting point of that turn
+  (inferzero).
+- Stop the server with `zero-server stop` (or the Stop button in the launcher), not by killing its process: only
+  that way is the conversation being held saved first.
+- A hot laptop slows down by 5–10 %. Do not run other GPU work at the same time.
+
+## 7. Moving the inferzero folder
+
+1. `zero-server stop`
+2. Move the `inferzero` folder to its new location (File Explorer or `mv`).
+3. Run setup again from the new location: `<new-folder>\setup.cmd -Models none`
+
+Only the `zero-pi` / `zero-server` shortcut commands store the folder location; everything else uses relative paths.
+
+## 8. Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| `zero-pi` is not recognized | Run `setup.cmd` (section 1), then open a new terminal. |
+| Setup fails at the build step | Visual Studio Build Tools (C++) is not installed; setup shows how to install it. The compiler output is in `%USERPROFILE%\.inferzero\build.log`. |
+| "The server stopped while loading", or another model fails to start | Look at the log it shows (`%USERPROFILE%\.inferzero\logs\server.log`). Usually there is not enough GPU memory: another inferzero server or a llama.cpp process holds it (`zero-server stop`, close other GPU programs), or use `--ctx 32768` / a smaller model. |
+| Windows is slow or stops responding while a model loads | The GPU memory is set too high (section 5; seen at 20 GB on a 32 GB laptop): lower it in Intel Graphics Software, then `zero-server restart`. |
+| Generation gets slower after a few minutes | The laptop throttles under sustained load (5–10 %); plug in the charger and use a performance power mode. |
+| `web_search` in Pi answers "No results found" or never finishes | Its default search engines are DuckDuckGo and Startpage; DuckDuckGo is blocked in Indonesia, so neither returns results. Add Yandex in `%USERPROFILE%\.pi\agent\settings.json`: `"webSearch": {"engines": ["yandex", "startpage", "duckduckgo"]}` (or with the `/search-config` command in Pi). |
+| A new Pi session takes ~40 s before answering | Normal for the first session in a new project folder (the system prompt is processed once); later sessions in that folder are fast. The server log shows it (`system-prompt cache: saved / loaded ... for <folder>`). |
+| `unknown option ...`, `... needs a value`, `expected ... (got ...)`, `is a folder` / `is a file`, `has a quote in it` | An option was written wrong; the message names what it takes (section 3, "Writing the options"; `zero-server help errors`). A path ending in a backslash inside quotes gives "has a quote in it": leave the last backslash out. |
+| Flash Next does not read images | Its image projector is not in the model's folder: `hf download bartowski/Qwen3.8-Flash-Next-GGUF mmproj-Qwen3.8-Flash-Next-f16.gguf`, copied next to the model (or its package in `%USERPROFILE%\.inferzero\zero\models\<name>\`). |
+| A MoE model stops at once: "unsupported expert tensor ... the experts run in a quantized type only" | The GGUF's experts are BF16 or another float type, which the expert paths do not run. Use a quantized file of the model (Q8_0 is close to the unquantized one). The check runs before the expert file is written, so no disk is used. |
+| "h8.cl needs rot.cl in front of it: ... rebuild both" | `bin\runz.exe` / `bin\serverz.exe` are older than `zero\kernels`: rebuild both (section 9), or unpack a whole package. |
+| "Model file ... not found" | The model has not been downloaded to the Hugging Face cache yet (see [docs/install.md, section 6](docs/install.md#6-download-models)). |
+| Models in another folder or drive (`zero-server list` finds none) | Add the folder: `zero-server model-dirs -Add D:\ai\models`, or in the launcher window **More > Model folders...** (on Linux `./zero-launcher.sh --add-model-dir /path`). `zero-server model-dirs` lists them, `-Remove D` takes one out. They are kept one per line in `%USERPROFILE%\.inferzero\model-dirs.txt` (or `ARC_MODEL_DIRS`, `;`-separated), e.g. `D:\models` (a Hugging Face cache layout `models--...`, or `.gguf` files directly in that folder). The Hugging Face cache on C: is still searched first, so a model kept in both places loads from there. A plain folder of `.gguf` files (a copied model, e.g. `hub\agentionai-Qwen3.8-27B-AP-GGUF\`) is found one level deep in the Hugging Face cache and in those folders too. A model that is in several places (the same file name and size, such as a backup on another drive, or the GGUF an inferzero package was made from) is listed once: the package, else the Hugging Face cache, else the C: copy. If that drive is removed, its models disappear from the list until the drive is connected again. |
+| Pi stops with a context error | Type `/compact` in Pi, or start a new session. |
+| The answer is very slow at the start | Normal for the first large prompt (see section 6); later ones use the cache. |
+| Want to see what is happening | `zero-server status`, and the log: `zero-server logs -Follow`, the launcher's Log tab, or `%USERPROFILE%\.inferzero\logs\server.log` (prompt processing time, speed, MTP statistics per request). |
+| Something else does not work | `zero-server doctor` (or the launcher's More > "Check this PC") checks the exes, the GPU driver, the NPU, memory and disk, the port and other GPU programs; paste its report into a GitHub issue. |
+
+## 9. Rebuilding from source
+
+Needs Visual Studio 2026 Build Tools (MSVC). From the inferzero folder, `.\setup.cmd -Models none` rebuilds only what
+is needed (and stops the server first when `serverz.exe` is rebuilt too). Or by hand:
+
+```powershell
+zero-server stop
+.\build.ps1 zero\serverz.cpp zero\runz.cpp
+```
+
+GPU kernels (`zero\kernels\*.cl`) are compiled by the driver
+when the server starts, so kernel changes do not need a build.
+Compiled kernels are saved in `%USERPROFILE%\.inferzero\kernels`, so only the first use of each variant waits for
+compilation.
+Regression tests: `.\tests\run_tests.ps1` finds the models itself (`-ListModels` shows which), or give them:
+`-Model4B`, `-Model27B`, `-Model35B`, `-ModelGemma` (12B), `-ModelFlashNext` (the packaged file first, else the
+first part).

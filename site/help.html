@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Help out with inferzero</title>
+<meta name="description" content="How to help inferzero, the free open-source LLM engine for Intel GPUs: measure your hardware, report a problem, or improve the code.">
+<meta name="color-scheme" content="light">
+<meta property="og:title" content="inferzero: free, open-source AI on your Intel PC">
+<meta property="og:description" content="Run Qwen, Gemma 4 and DeepSeek models on Intel Core Ultra graphics and Arc cards. Free, open source, no cloud.">
+<meta property="og:type" content="website">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to the content</a>
+
+<header>
+  <div class="wrap">
+    <a class="brand" href="index.html" aria-label="inferzero, home page"><svg class="mark" width="26" height="26" viewBox="0 0 64 64" aria-hidden="true"><rect class="l" x="1.5" y="1.5" width="13" height="13" rx="3"/><rect class="l" x="17.5" y="1.5" width="13" height="13" rx="3"/><rect class="l" x="33.5" y="1.5" width="13" height="13" rx="3"/><rect class="l" x="49.5" y="1.5" width="13" height="13" rx="3"/><rect class="d" x="1.5" y="17.5" width="13" height="13" rx="3"/><rect class="d" x="17.5" y="17.5" width="13" height="13" rx="3"/><rect class="l" x="33.5" y="17.5" width="13" height="13" rx="3"/><rect class="d" x="49.5" y="17.5" width="13" height="13" rx="3"/><rect class="d" x="1.5" y="33.5" width="13" height="13" rx="3"/><rect class="l" x="17.5" y="33.5" width="13" height="13" rx="3"/><rect class="d" x="33.5" y="33.5" width="13" height="13" rx="3"/><rect class="d" x="49.5" y="33.5" width="13" height="13" rx="3"/><rect class="l" x="1.5" y="49.5" width="13" height="13" rx="3"/><rect class="l" x="17.5" y="49.5" width="13" height="13" rx="3"/><rect class="l" x="33.5" y="49.5" width="13" height="13" rx="3"/><rect class="l" x="49.5" y="49.5" width="13" height="13" rx="3"/></svg>inferzero</a>
+    <nav aria-label="Main">
+      <a href="install.html">Install</a>
+      <a href="results.html">Results</a>
+      <a href="multi-gpu.html">Several GPUs</a>
+      <a href="help.html" aria-current="page">Help out</a>
+    </nav>
+    <div class="hdr-right">
+      <a class="gh" href="https://github.com/rizagp/inferzero">GitHub</a>
+      <a class="btn p sm" href="https://github.com/rizagp/inferzero/releases/latest">Download</a>
+    </div>
+  </div>
+</header>
+
+<main id="main">
+
+<div class="wrap hero small" id="top">
+  <h1>Help out</h1>
+  <p class="lead">inferzero is free and open source, and still far from what Intel's chips can do. Most of its speed came from people running it on hardware we don't have and posting what they saw. You don't need to write code to help.</p>
+  <nav class="jump" aria-label="On this page">
+    <a href="#measure">Measure your hardware</a><a href="#report">Report a problem</a><a href="#code">Improve the code</a><a href="#free">Free and open source</a>
+  </nav>
+</div>
+
+<section id="measure">
+  <div class="wrap">
+    <h2>Measure your hardware</h2>
+    <p>The most useful thing most people can do: we can only tune for a GPU someone has measured.</p>
+    <ol class="go">
+      <li><a href="install.html">Install it</a> and download a model with the launcher.</li>
+      <li>Run the benchmark. Windows: <code>run-tests.cmd quick</code> in the inferzero folder (about an hour) writes one zip to the Desktop, with user names taken out of the paths. Linux: <code>bench/website_bench.sh</code>. One model by hand: <code>bin\runz.exe &lt;model.gguf&gt; --bench-pp 4096 --n 128</code>.</li>
+      <li>Open an issue with the <a href="https://github.com/rizagp/inferzero/issues/new?template=hardware-results.yml">Hardware results</a> template and attach the zip or paste the output.</li>
+    </ol>
+    <div class="card" style="margin-top:18px">
+      <h3>Especially wanted</h3>
+      <ul>
+        <li>Arc A750, A580, A380 and B570 cards, and the laptop A-series (A370M, A770M).</li>
+        <li>Core Ultra laptops and mini PCs not on the <a href="results.html">results page</a> yet: Meteor Lake, Lunar Lake, Arrow Lake H, Panther Lake.</li>
+        <li>Two or more Arc cards, above all on Windows and on Linux distributions not yet tried (<a href="multi-gpu.html">several GPUs</a>).</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section id="report">
+  <div class="wrap">
+    <h2>Report a problem</h2>
+    <p>Something fails, crashes, gives wrong text, or is much slower than it should be: open a <a href="https://github.com/rizagp/inferzero/issues/new?template=bug-report.yml">bug report</a>. Say which GPU, system and release, which model, and how you started it. In the Windows launcher, <b>Copy for an issue</b> copies the log with user names taken out. Numbers that disagree with this website are welcome too: that is how most of the tuning was found.</p>
+  </div>
+</section>
+
+<section id="code">
+  <div class="wrap">
+    <h2>Improve the code</h2>
+    <p>The engine is C++ on Intel's Level Zero, with its GPU kernels in OpenCL C, for Windows and Linux. Places where help moves it most:</p>
+    <div class="grid">
+      <div class="card"><h3>GPU kernels</h3><p>The prompt and generation kernels on XMX and DP4a: each card's table on the <a href="results.html">results page</a> shows how far from its peak it still is.</p></div>
+      <div class="card"><h3>Several GPUs</h3><p>Faster sums between cards on Windows, and a split by layers for slow PCIe links.</p></div>
+      <div class="card"><h3>Linux and the web UI</h3><p>Packages for Nix, Arch and Fedora, the Docker files, and the chat in the browser (one file, <code>webui/index.html</code>).</p></div>
+    </div>
+    <p style="margin-top:18px">Start with the issues labelled <a href="https://github.com/rizagp/inferzero/labels/good%20first%20issue">good first issue</a> and <a href="https://github.com/rizagp/inferzero/labels/help%20wanted">help wanted</a>. <a href="https://github.com/rizagp/inferzero/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a> says how to build it and how every change is checked: answers compared with an exact reference, and the same results bit for bit where a change promises them.</p>
+  </div>
+</section>
+
+<section id="free">
+  <div class="wrap">
+    <div class="open">
+      <h2>Free and open source</h2>
+      <p class="big">inferzero costs nothing and never will. Its source code is public under the Apache 2.0 license: use it, change it, share it, at home or at work.</p>
+      <div class="btns">
+        <a class="btn p" href="https://github.com/rizagp/inferzero">Source code on GitHub</a>
+        <a class="btn s" href="https://github.com/rizagp/inferzero/issues">All issues</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+</main>
+
+
+<footer>
+  <div class="wrap">
+    <div>inferzero · Apache 2.0 · <span class="mono">release 2026.11.19.01</span><br>An independent project, not made or endorsed by Intel. Intel and Arc are trademarks of Intel Corporation or its subsidiaries.</div>
+    <div><a href="https://github.com/rizagp/inferzero">GitHub</a> · <a href="https://github.com/rizagp/inferzero/releases">Releases</a> · <a href="https://github.com/rizagp/inferzero/blob/main/USAGE.md">Usage guide</a> · <a href="https://github.com/rizagp/inferzero/blob/main/CHANGELOG.md">Changelog</a></div>
+  </div>
+</footer>
+</body>
+</html>

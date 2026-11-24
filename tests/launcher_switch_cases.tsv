@@ -1,0 +1,37 @@
+words	pc	gpus	drafting	choices	id	expect
+dense;mtp;h8	igpu-xe-lpg	1	0	-	copy_draft	turn Drafting on first
+dense;mtp;h8	igpu-xe-lpg	1	1	-	copy_draft	-
+dense;h8	igpu-xe-lpg	1	0	-	copy_draft	for models with MTP only
+dense;mtp;h8	igpu-xe-lpg	1	1	-	mtp_vocab	-
+dense;mtp;h8	b-series	1	1	-	qsa	for QSA models only
+dense;mtp;h8;qsa	b-series	1	1	-	qsa	-
+dense;mtp;h8	igpu-xe-lpg	1	1	-	h8_q2	needs Arc B-series, Arc A-series, Arc 140T or Lunar Lake / Panther Lake
+dense;mtp;h8	b-series	1	1	-	h8_q2	-
+dense;mtp;h8	-	1	1	-	h8_q2	-
+moe;mtp	b-series	1	1	-	h8_q2	for dense Qwen3.5 / 3.8 models only
+dense;mtp;h8	b-series	1	1	-	p140_res	needs Arc A-series or Arc 140T
+dense;mtp;h8	alchemist	1	1	-	p140_res	-
+dense;mtp;h8	b-series	1	1	-	tp_p2p	needs 2 or more GPUs
+dense;mtp;h8	b-series;multi-gpu	1	1	-	tp_p2p	choose a Multi-GPU split first
+dense;mtp;h8	b-series;multi-gpu	2	1	-	tp_p2p	-
+dense;mtp;h8	b-series;multi-gpu	2	1	split_layer=on	tp_p2p	not with Multi-GPU by layers
+dense;mtp;h8	b-series	1	1	-	split_layer	needs 2 or more GPUs
+dense;mtp;h8	b-series;multi-gpu	2	1	tp_p2p=on	split_layer	not with Multi-GPU sums
+dense;mtp;h8;qsa	b-series;multi-gpu	2	1	qsa=on	split_layer	not with Attention: sparse (on) or full (off)
+dense;mtp;h8;qsa	b-series;multi-gpu	2	1	qsa=off	split_layer	-
+moe;mtp	b-series;multi-gpu	2	1	-	split_layer	for dense models or standard MoE models only
+moe;moe_std;mtp	b-series;multi-gpu	2	1	-	split_layer	-
+moe;qsa;flashnext	b-series;multi-gpu	2	0	-	split_layer	for dense models or standard MoE models only
+moe;qsa;flashnext	b-series	1	0	-	xcpu_q2	-
+moe;qsa;flashnext	b-series	1	0	fn_precise=on	xcpu_q2	-
+moe;qsa;flashnext	b-series	1	0	fn_precise=on,xcpu=off	xcpu_q2	turn CPU experts on first
+moe;qsa;flashnext	b-series	1	0	fn_precise=off	xcpu_q2	turn Precise mode on first
+dense;mtp;h8	b-series	1	1	-	xcpu	for MoE models only
+moe;mtp	b-series	1	1	-	xcpu	-
+dense;mtp;h8	b-series	1	1	-	fn_precise	for Flash Next only
+moe;qsa;flashnext	b-series	1	0	-	fn_precise	-
+moe;mtp	alchemist	1	1	-	gemv_gu	for dense models only
+dense;mtp;h8	igpu-xe-lpg	1	1	-	gemv_gu	-
+dense;mtp;h8	igpu-xe-lpg	1	1	-	batch	-
+dense;mtp;h8	igpu-xe-lpg	1	1	-	h8_exact	needs Lunar Lake / Panther Lake
+dense;mtp;h8	igpu-xe2	1	1	-	h8_exact	-

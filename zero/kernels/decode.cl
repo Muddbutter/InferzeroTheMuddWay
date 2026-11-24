@@ -1,0 +1,2094 @@
+// Decoding of raw GGUF blocks, shared by:
+//  - decode_w8: just-in-time conversion of a matrix into the "W8" GEMM layout (kernels/gemm.cl QTYPE 100..103)
+//  - gemv:      single-token matrix-vector product directly on the raw rows (token generation, lm_head)
+// Generic form of every type: w[e] = d * sc[e/16] * q[e] - dmin * mn[e/16] with int8 q, int8 sc, uint8 mn and
+// per-256-superblock d, dmin (Q8_0 / Q4_0: d is the per-32 scale, sc = 1; a "superblock" is 8 GGUF blocks). Values are produced directly as packed
+// int8x4 words with SWAR bit operations. Compiled per type with -DQT=<ggml type>.
+// Codebooks come in one buffer (TAB_* uint offsets, filled by the host from src/iq_tables.h).
+
+#define TAB_IQ2XXS 0
+#define TAB_IQ2XS 512
+#define TAB_IQ2S 1536
+#define TAB_IQ3XXS 3584
+#define TAB_IQ3S 3840
+#define TAB_IQ1S 4352
+#define TAB_KSIGNS 8448
+#define TAB_KVAL 8480
+#define TAB_KFP4 8484  // (MXFP4's 16 values, src/quants.h kvalues_mxfp4)
+
+#define Q4_0 2
+#define Q8_0 8
+#define IQ4_NL 20
+#define Q2_0 42
+#define MXFP4 39
+#define NVFP4 40  // (Inkling 2 Mini's experts: blocks of 64, a UE4M3 scale per 16; folded per 32 in decode32)
+#define Q5_1 7  // (Unsloth's UD-Q4_K_XL Flash Next: its down experts; requantized per block, see decode32)
+#define Q4_1 3  // (#88, 2026-11-23: as Q5_1 without the fifth bit; it was requantized to Q8_0 on the CPU at load)
+#define Q5_0 6  // (the same day: d (q - 16), q = 0..31, exact in int8)
+#define Q8_1 9  // (the same day: d q with a block sum the GEMV does not need, exact in int8)
+// (a private inferzero type, not a GGML one: AutoRound INT4, 128 values to one f16 scale, zero point 8, pull request
+//  #22; tools/import_autoround_experts.py)
+#define AR4_128 0x41523447
+// The per-type lists, in one place (a new type goes here, and in src/quants.h is_per32_type / is_small_block_type):
+// per-32 float scales (decoded into the W8 GEMM's VARIANT 4 layout: one f32 per 32-block in the header; C++
+// is_per32_type)
+#define PER32 (QT == Q8_0 || QT == Q4_0 || QT == IQ4_NL || QT == Q2_0 || QT == MXFP4 || QT == AR4_128 || QT == Q5_1 || QT == Q4_1 || QT == Q5_0 || QT == Q8_1 || \
+               QT == NVFP4)
+// a vector decoder, vblock (gemv_v, and the experts' MOE_VB / moe_rg): each 32-block read straight into registers
+#define VB_TYPE (QT == AR4_128 || QT == IQ4_XS || QT == Q6_K || QT == Q4_0 || QT == Q8_0 || QT == IQ4_NL || QT == Q2_0 || \
+                 QT == MXFP4)
+
+#if QT == AR4_128
+// AR4_128's GPU superblock: the two 128-groups' f16 scales, then 8 x 16 nibble bytes in Q4_0 order, 4 pad bytes. A
+// 32-block's 16 bytes -> 8 words of four int8 values (low nibbles 0..15, high nibbles 16..31), each nibble - 8.
+inline void ar4_unpack(uint4 q, uint* w) {
+#pragma unroll
+  for (int k = 0; k < 4; ++k) {
+    const uint v = q[k];
+    const uint lo = v & 0x0f0f0f0fu, hi = (v >> 4) & 0x0f0f0f0fu;
+    w[k] = ((lo | 0x80808080u) - 0x08080808u) ^ 0x80808080u;
+    w[k + 4] = ((hi | 0x80808080u) - 0x08080808u) ^ 0x80808080u;
+  }
+}
+#endif
+// header uints per superblock and lane: W8 (d, dmin, 16 scales, 16 mins) or, for PER32, the 8 f32 block scales in
+// the layout of the GEMM's native Q8_0 form (kernels/gemm.cl QTYPE 8), which reads the decoded weights directly
+#if PER32
+#define HSTR 8
+#else
+#define HSTR 10
+#endif
+#define Q2_K 10
+#define Q3_K 11
+#define Q4_K 12
+#define Q5_K 13
+#define Q6_K 14
+#define IQ2_XXS 16
+#define IQ2_XS 17
+#define IQ3_XXS 18
+#define IQ3_S 21
+#define IQ2_S 22
+#define IQ4_XS 23
+#define IQ1_M 29
+#define IQ1_S 19
+
+#if QT == AR4_128
+#define BB 132
+#elif QT == Q2_K
+#define BB 84
+#elif QT == Q3_K
+#define BB 110
+#elif QT == Q4_K
+#define BB 144
+#elif QT == Q5_K
+#define BB 176
+#elif QT == Q6_K
+#define BB 210
+#elif QT == IQ2_XXS
+#define BB 66
+#elif QT == IQ2_XS
+#define BB 74
+#elif QT == IQ2_S
+#define BB 82
+#elif QT == IQ3_XXS
+#define BB 98
+#elif QT == IQ3_S
+#define BB 110
+#elif QT == IQ1_S
+#define BB 50
+#elif QT == IQ1_M
+#define BB 56
+#elif QT == IQ4_XS
+#define BB 136
+#elif QT == Q8_0
+#define BB 272
+#elif QT == Q4_0
+#define BB 144
+#elif QT == IQ4_NL
+#define BB 144  // (8 blocks of 32, as Q4_0)
+#elif QT == MXFP4
+#define BB 136  // (8 blocks of 32: 8 E8M0 scale bytes, then 8 x 16 nibble bytes)
+#elif QT == Q2_0
+#define BB 72  // (4 blocks of 64)
+#elif QT == Q5_1
+#define BB 192  // (8 blocks of 32 as in the GGUF: f16 d, f16 m, 32 high bits, 16 nibble bytes)
+#elif QT == Q4_1
+#define BB 160  // (8 blocks of 32 as in the GGUF: f16 d, f16 m, 16 nibble bytes)
+#elif QT == Q5_0
+#define BB 176  // (8 blocks of 32 as in the GGUF: f16 d, 32 high bits, 16 nibble bytes)
+#elif QT == Q8_1
+#define BB 288  // (8 blocks of 32 as in the GGUF: f16 d, f16 sum, 32 int8)
+#elif QT == NVFP4
+#define BB 144  // (4 blocks of 64: the 16 UE4M3 scale bytes, then 4 x 32 code bytes)
+#else
+#error "unsupported QT"
+#endif
+// superblock size in the padded GPU raw form (multiple of 8 bytes)
+#define BBP ((BB + 7) / 8 * 8)
+// (-DIQ3T: IQ3_S rows in pairs of superblocks repacked as planes; decode32's IQ3_S branch says how. Only IQ3_S, and
+//  only the kernels that were taught it: the others stop at the build, below)
+#if defined(IQ3T) && (QT != IQ3_S || BBP != 112)
+#error "IQ3T: IQ3_S only"
+#endif
+// a superblock s's 32-block ib as decode32 takes it: (the superblock's bytes, ib), or with IQ3T (its pair's first
+// byte, 8 x (s % 2) + ib); p the superblock's own address in a row that starts at an even superblock
+#ifdef IQ3T
+#define IQ3_AT(p, s, ib) ((const uchar*)(p) - ((s) & 1) * BBP), (8 * ((s) & 1) + (ib))
+#else
+#define IQ3_AT(p, s, ib) (const uchar*)(p), (ib)
+#endif
+
+inline uint rd16(const uchar* p) { return (uint)p[0] | ((uint)p[1] << 8); }
+inline uint rd32(const uchar* p) { return (uint)p[0] | ((uint)p[1] << 8) | ((uint)p[2] << 16) | ((uint)p[3] << 24); }
+inline float f16(uint h) { return vload_half(0, (const __private half*)&h); }
+// codebook of this type (GRID_OFF/GRID_N uints) and its auxiliary table (ksigns or kvalues: AUX_OFF/AUX_N uints)
+#if QT == IQ2_XXS
+#define GRID_OFF TAB_IQ2XXS
+#define GRID_N 512
+#elif QT == IQ2_XS
+#define GRID_OFF TAB_IQ2XS
+#define GRID_N 1024
+#elif QT == IQ2_S
+#define GRID_OFF TAB_IQ2S
+#define GRID_N 2048
+#elif QT == IQ3_XXS
+#define GRID_OFF TAB_IQ3XXS
+#define GRID_N 256
+#elif QT == IQ3_S
+#define GRID_OFF TAB_IQ3S
+#define GRID_N 512
+#elif QT == IQ1_M || QT == IQ1_S
+#define GRID_OFF TAB_IQ1S
+#define GRID_N 4096
+#endif
+#if QT == IQ2_XXS || QT == IQ2_XS || QT == IQ3_XXS
+#define AUX_OFF TAB_KSIGNS
+#define AUX_N 32
+#elif QT == IQ4_XS || QT == IQ4_NL
+#define AUX_OFF TAB_KVAL
+#define AUX_N 4
+#elif QT == MXFP4 || QT == NVFP4
+#define AUX_OFF TAB_KFP4
+#define AUX_N 4
+#endif
+// an E8M0 scale's half, 2^(e - 128) (MXFP4: ggml_e8m0_to_fp32_half)
+inline float e8m0_half(uint e) { return as_float(e < 2 ? 0x00200000u << e : (e - 1) << 23); }
+inline uint grid4w(const uint* grid, uint idx) { return grid[idx]; }
+inline uint2 grid8w(const uint* grid, uint idx) { return (uint2)(grid[2 * idx], grid[2 * idx + 1]); }
+inline uint ksigns(const uint* aux, uint i) { return ((const uchar*)aux)[i]; }
+
+// Applies 4 sign bits (bit k negates byte k) to 4 positive int8 values. No byte of g is 0, so the
+// two's-complement increment never carries into the next byte.
+inline uint apply_signs4(uint g, uint s4) {
+  const uint m = ((s4 * 0x00204081u) & 0x01010101u) * 0xFFu;
+  return (g ^ m) + (m & 0x01010101u);
+}
+// Per-byte (q - 1) for 2-bit unsigned values, without cross-byte borrows.
+inline uint sub1_bytes(uint q) { return ((q | 0x80808080u) - 0x01010101u) ^ 0x80808080u; }
+// The four 2-bit codes of byte b (element i in bits 2i) as packed bytes q0..q3, each minus 1 (Q2_0: -1..2).
+inline uint q2_word(uint b) {
+  return sub1_bytes((b & 3u) | (((b >> 2) & 3u) << 8) | (((b >> 4) & 3u) << 16) | (((b >> 6) & 3u) << 24));
+}
+// Per-byte (q - 8) for 4-bit unsigned values, without cross-byte borrows.
+inline uint sub8_bytes(uint q) { return ((q | 0x80808080u) - 0x08080808u) ^ 0x80808080u; }
+// Per-byte (q - 32) for 6-bit unsigned values, without cross-byte borrows.
+inline uint sub32_bytes(uint q) { return ((q | 0x80808080u) - 0x20202020u) ^ 0x80808080u; }
+
+inline void get_scale_min_k4(int j, const uchar* q, int* d, int* m) {
+  if (j < 4) {
+    *d = q[j] & 63;
+    *m = q[j + 4] & 63;
+  } else {
+    *d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+    *m = (q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4);
+  }
+}
+
+// Decodes 32-element block ib of the superblock at p into 8 packed int8x4 words (elements 4k..4k+3 in w[k]).
+inline void decode32(const uchar* p, int ib, const uint* grid, const uint* aux, uint* w, int* psc0, int* psc1,
+                     int* pmn0, int* pmn1, float* pd, float* pdmin) {
+  int sc0, sc1, mn0 = 0, mn1 = 0;
+  float d, dmin = 0.0f;
+#if QT == AR4_128
+  d = f16(rd16(p + 2 * (ib / 4)));
+  sc0 = sc1 = 1;
+  const uchar* q = p + 4 + ib * 16;
+  ar4_unpack((uint4)(rd32(q), rd32(q + 4), rd32(q + 8), rd32(q + 12)), w);
+#elif QT == Q2_K
+  d = f16(rd16(p + 80));
+  dmin = f16(rd16(p + 82));
+  sc0 = p[2 * ib] & 0xF; mn0 = p[2 * ib] >> 4;
+  sc1 = p[2 * ib + 1] & 0xF; mn1 = p[2 * ib + 1] >> 4;
+  {
+    const uchar* qs = p + 16 + 32 * (ib / 4);
+    const int sh = 2 * (ib % 4);
+#pragma unroll
+    for (int k = 0; k < 8; ++k) w[k] = (rd32(qs + 4 * k) >> sh) & 0x03030303u;
+  }
+#elif QT == Q3_K
+  // hmask[32] | qs[64] | 12 bytes of 6-bit scales | f16 d. Block ib: 2-bit values (qs[32 (ib / 4) + e] >> 2 (ib % 4))
+  // plus 4 * (bit ib of hmask[e]), minus 4; scale i (16 elements): low 4 bits from byte i % 8 (nibble i / 8), top 2
+  // bits from byte 8 + i % 4 (bits 2 (i / 4)), minus 32
+  d = f16(rd16(p + 108));
+  {
+    const uchar* sc = p + 96;
+    const int i0 = 2 * ib, i1 = 2 * ib + 1;
+    sc0 = (int)(((sc[i0 & 7] >> (4 * (i0 >> 3))) & 0xF) | (((sc[8 + (i0 & 3)] >> (2 * (i0 >> 2))) & 3) << 4)) - 32;
+    sc1 = (int)(((sc[i1 & 7] >> (4 * (i1 >> 3))) & 0xF) | (((sc[8 + (i1 & 3)] >> (2 * (i1 >> 2))) & 3) << 4)) - 32;
+    const uchar* qs = p + 32 + 32 * (ib / 4);
+    const int sh = 2 * (ib % 4);
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      const uint v = ((rd32(qs + 4 * k) >> sh) & 0x03030303u) | (((rd32(p + 4 * k) >> ib) & 0x01010101u) << 2);
+      w[k] = ((v | 0x80808080u) - 0x04040404u) ^ 0x80808080u;  // per byte v - 4
+    }
+  }
+#elif QT == Q4_K || QT == Q5_K
+  d = f16(rd16(p));
+  dmin = f16(rd16(p + 2));
+  get_scale_min_k4(ib, p + 4, &sc0, &mn0);
+  sc1 = sc0; mn1 = mn0;
+  {
+    const uchar* qs = p + (QT == Q5_K ? 48 : 16) + 32 * (ib / 2);
+    const int sh = 4 * (ib % 2);
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      w[k] = (rd32(qs + 4 * k) >> sh) & 0x0F0F0F0Fu;
+#if QT == Q5_K
+      w[k] |= ((rd32(p + 16 + 4 * k) >> ib) & 0x01010101u) << 4;
+#endif
+    }
+  }
+#elif QT == Q6_K
+  d = f16(rd16(p + 208));
+  sc0 = (char)p[192 + 2 * ib];
+  sc1 = (char)p[192 + 2 * ib + 1];
+  {
+    const int nn = ib / 4, quarter = ib % 4;
+    const uchar* L = p + 64 * nn + ((quarter & 1) ? 32 : 0);
+    const uchar* H = p + 128 + 32 * nn;
+    const int lsh = quarter >= 2 ? 4 : 0, hsh = 2 * quarter;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      const uint lo = (rd32(L + 4 * k) >> lsh) & 0x0F0F0F0Fu;
+      const uint hi = ((rd32(H + 4 * k) >> hsh) & 0x03030303u) << 4;
+      w[k] = sub32_bytes(lo | hi);
+    }
+  }
+#elif QT == Q8_0
+  {
+    // GPU form (src/quants.h gpu_raw_sb): the 8 f16 scales, then 8 blocks of 32 int8
+    d = f16(rd16(p + 2 * ib));
+    sc0 = sc1 = 1;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) w[k] = rd32(p + 16 + 32 * ib + 4 * k);
+  }
+#elif QT == Q4_0
+  {
+    // GPU form (src/quants.h gpu_raw_sb): 8 f16 scales, then 16 bytes per block with elements 0..15 in the low
+    // nibbles and 16..31 in the high ones; w = d * (q - 8)
+    const uchar* blk = p + 16 + 16 * ib;
+    d = f16(rd16(p + 2 * ib));
+    sc0 = sc1 = 1;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      const uint v = rd32(blk + 4 * k);
+      w[k] = sub8_bytes(v & 0x0F0F0F0Fu);
+      w[k + 4] = sub8_bytes((v >> 4) & 0x0F0F0F0Fu);
+    }
+  }
+#elif QT == IQ4_NL
+  {
+    // GPU form (src/quants.h gpu_raw_sb): 8 f16 scales, then 16 nibble bytes per block as Q4_0; w = d * kvalues[q]
+    d = f16(rd16(p + 2 * ib));
+    sc0 = sc1 = 1;
+    const uchar* kv = (const uchar*)aux;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      const uint b = rd32(p + 16 + 16 * ib + 4 * k);
+      w[k] = kv[b & 0xF] | ((uint)kv[(b >> 8) & 0xF] << 8) | ((uint)kv[(b >> 16) & 0xF] << 16) | ((uint)kv[(b >> 24) & 0xF] << 24);
+      w[4 + k] = kv[(b >> 4) & 0xF] | ((uint)kv[(b >> 12) & 0xF] << 8) | ((uint)kv[(b >> 20) & 0xF] << 16) |
+                 ((uint)kv[(b >> 28) & 0xF] << 24);
+    }
+  }
+#elif QT == MXFP4
+  {
+    // GPU form (src/quants.h gpu_raw_sb): 8 E8M0 scale bytes, then 16 nibble bytes per block; w = 2^(e - 128) kvalues[q]
+    d = e8m0_half(p[ib]);
+    sc0 = sc1 = 1;
+    const uchar* kv = (const uchar*)aux;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      const uint b = rd32(p + 8 + 16 * ib + 4 * k);
+      w[k] = kv[b & 0xF] | ((uint)kv[(b >> 8) & 0xF] << 8) | ((uint)kv[(b >> 16) & 0xF] << 16) | ((uint)kv[(b >> 24) & 0xF] << 24);
+      w[4 + k] = kv[(b >> 4) & 0xF] | ((uint)kv[(b >> 12) & 0xF] << 8) | ((uint)kv[(b >> 20) & 0xF] << 16) |
+                 ((uint)kv[(b >> 28) & 0xF] << 24);
+    }
+  }
+#elif QT == Q2_0
+  {
+    // GPU form: 4 f16 scales (one per 64-block), then 16 code bytes per 64-block; 32-block ib is half ib % 2 of
+    // 64-block ib / 2, its elements 4k..4k+3 the four codes of byte 8 (ib % 2) + k; w = d * (q - 1)
+    d = f16(rd16(p + 2 * (ib / 2)));
+    sc0 = sc1 = 1;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) w[k] = q2_word(p[8 + 16 * (ib / 2) + 8 * (ib % 2) + k]);
+  }
+#elif QT == Q5_1
+  {
+    // GPU form = the GGUF's (src/quants.h gpu_raw_sb copies it): 24 bytes per block, f16 d, f16 m, the 32 high bits,
+    // 16 bytes with elements 0..15 in the low nibbles and 16..31 in the high ones; w = d * q + m, q = 0..31. The
+    // per-32 int8 form has no offset, so the block is requantized: scale s = max(|m|, |m + 31 d|) / 127 (the
+    // largest magnitude any code reaches), w = rint((d q + m) / s), at most s / 2 off (~0.4 % of the block's
+    // largest value), as Q4_K / Q5_K are requantized for the min-free GEMM. Every path (decode_w8, the GEMVs, the
+    // experts' kernels) decodes through here, so prompt and generation see the same int8 values. A padding block
+    // (d = m = 0, rows of K = 640) gives s = 0 and zeros.
+    const uchar* b = p + 24 * ib;
+    const float bd = f16(rd16(b)), bm = f16(rd16(b + 2));
+    const uint qh = rd32(b + 4);
+    const float vmax = fmax(fabs(bm), fabs(bm + 31.0f * bd));
+    const float inv = vmax > 0.0f ? 127.0f / vmax : 0.0f;
+    d = vmax / 127.0f;
+    sc0 = sc1 = 1;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      const uint v = rd32(b + 8 + 4 * k);
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        uint word = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          const int e = 16 * h + 4 * k + j;
+          const int q = (int)((v >> (8 * j + 4 * h)) & 15u) | (int)(((qh >> e) & 1u) << 4);
+          const int i8 = clamp((int)rint((bd * (float)q + bm) * inv), -127, 127);
+          word |= ((uint)i8 & 0xFFu) << (8 * j);
+        }
+        w[k + 4 * h] = word;
+      }
+    }
+  }
+#elif QT == Q4_1
+  {
+    // GPU form = the GGUF's (gpu_raw_sb copies it): 20 bytes per block, f16 d, f16 m, 16 bytes with elements 0..15 in
+    // the low nibbles and 16..31 in the high ones; w = d q + m, q = 0..15. Requantized per block as Q5_1 above (the
+    // per-32 int8 form has no offset): s = max(|m|, |m + 15 d|) / 127, w = rint((d q + m) / s), at most s / 2 off.
+    // Every path decodes through here. (2026-11-23, #88: before, the CPU requantized Q4_1 rows to Q8_0 at load, 1.7x
+    // their bytes on the card)
+    const uchar* b = p + 20 * ib;
+    const float bd = f16(rd16(b)), bm = f16(rd16(b + 2));
+    const float vmax = fmax(fabs(bm), fabs(bm + 15.0f * bd));
+    const float inv = vmax > 0.0f ? 127.0f / vmax : 0.0f;
+    d = vmax / 127.0f;
+    sc0 = sc1 = 1;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      const uint v = rd32(b + 4 + 4 * k);
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        uint word = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          const int q = (int)((v >> (8 * j + 4 * h)) & 15u);
+          const int i8 = clamp((int)rint((bd * (float)q + bm) * inv), -127, 127);
+          word |= ((uint)i8 & 0xFFu) << (8 * j);
+        }
+        w[k + 4 * h] = word;
+      }
+    }
+  }
+#elif QT == Q5_0
+  {
+    // GPU form = the GGUF's: 22 bytes per block, f16 d, the 32 high bits, 16 nibble bytes (elements 0..15 low, 16..31
+    // high); w = d (q - 16), q = 0..31: the int8 values are exact, d the block's scale (2026-11-23; it was requantized
+    // to Q8_0 on the CPU at load)
+    const uchar* b = p + 22 * ib;
+    d = f16(rd16(b));
+    sc0 = sc1 = 1;
+    const uint qh = rd32(b + 2);
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      const uint v = (uint)b[6 + 4 * k] | ((uint)b[7 + 4 * k] << 8) | ((uint)b[8 + 4 * k] << 16) | ((uint)b[9 + 4 * k] << 24);
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        uint word = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          const int e = 16 * h + 4 * k + j;
+          const int q = ((int)((v >> (8 * j + 4 * h)) & 15u) | (int)(((qh >> e) & 1u) << 4)) - 16;
+          word |= ((uint)q & 0xFFu) << (8 * j);
+        }
+        w[k + 4 * h] = word;
+      }
+    }
+  }
+#elif QT == Q8_1
+  {
+    // GPU form = the GGUF's: 36 bytes per block, f16 d, f16 sum (unused here), 32 int8; w = d q, exact (2026-11-23)
+    const uchar* b = p + 36 * ib;
+    d = f16(rd16(b));
+    sc0 = sc1 = 1;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) w[k] = rd32(b + 4 + 4 * k);
+  }
+#elif QT == NVFP4
+  {
+    // GPU form (src/quants.h gpu_raw_sb): the superblock's 16 UE4M3 scales (one per 16 values), then 16 code bytes per
+    // 32-block (8 per half: low nibbles values 0..7 of the half, high 8..15). The per-32 form has one scale, so the two
+    // halves' scales s0, s1 are folded as src/quants.h nvfp4_block32_w8 does, in the same integers: equal halves keep
+    // their codes (d = s); else d = max / 8, the larger half's codes x 8, the other's round(|kv| 8 M_h / (M_big
+    // 2^(E_big - E_h))) half away from zero. Every path decodes through here, so prompt and generation agree.
+    const uchar* kv = (const uchar*)aux;
+    int M[2], E[2];
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const uint x = p[2 * ib + h];
+      const uint e = (x >> 3) & 15u, m = x & 7u;
+      const bool z = x == 0u || x == 0x7Fu;
+      M[h] = z ? 0 : (e == 0u ? (int)m : 8 + (int)m);
+      E[h] = z || e == 0u ? 1 : (int)e;
+    }
+    const float s0 = ldexp((float)M[0], E[0] - 11), s1 = ldexp((float)M[1], E[1] - 11);
+    const int big = s1 > s0 ? 1 : 0;
+    const bool same = s0 == s1;
+    d = same ? s0 : fmax(s0, s1) * 0.125f;
+    sc0 = sc1 = 1;
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const uint lo = rd32(p + 16 + 16 * ib + 8 * h), hi = rd32(p + 16 + 16 * ib + 8 * h + 4);
+      const int den = M[big] << (E[big] - E[h]), mh = 8 * M[h];
+#pragma unroll
+      for (int k = 0; k < 4; ++k) {
+        // word k of the half: values 4k..4k+3 = (k < 2: low nibbles of bytes 4k..4k+3; else high nibbles of 4(k-2)..)
+        const uint src = (k & 1) ? hi : lo;
+        const int sh = k < 2 ? 0 : 4;
+        uint word = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          const int c = (char)kv[(src >> (8 * j + sh)) & 15u];
+          int v = c;
+          if (!same) {
+            if (h == big) v = 8 * c;
+            else {
+              const int a = c < 0 ? -c : c;
+              const int r = (2 * a * mh + den) / (2 * den);
+              v = c < 0 ? -r : r;
+            }
+          }
+          word |= ((uint)v & 0xFFu) << (8 * j);
+        }
+        w[4 * h + k] = word;
+      }
+    }
+  }
+#elif QT == IQ2_XXS
+  // (IQ2 / IQ3 types in their GPU form, src/quants.h gpu_raw_sb: the f16 d last, every other field 2 bytes earlier)
+  d = f16(rd16(p + BB - 2)) * 0.125f;
+  {
+    const uint a0 = rd32(p + 8 * ib), a1 = rd32(p + 8 * ib + 4);
+    sc0 = sc1 = 1 + 2 * (a1 >> 28);
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+      const uint2 g = grid8w(grid, (a0 >> (8 * l)) & 0xFF);
+      const uint sg = ksigns(aux, (a1 >> (7 * l)) & 127);
+      w[2 * l] = apply_signs4(g.s0, sg & 0xF);
+      w[2 * l + 1] = apply_signs4(g.s1, sg >> 4);
+    }
+  }
+#elif QT == IQ2_XS
+  d = f16(rd16(p + BB - 2)) * 0.125f;
+  {
+    const uint scb = p[64 + ib];
+    sc0 = 1 + 2 * (scb & 0xF);
+    sc1 = 1 + 2 * (scb >> 4);
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+      const uint q16 = rd16(p + 2 * (4 * ib + l));
+      const uint2 g = grid8w(grid, q16 & 511);
+      const uint sg = ksigns(aux, q16 >> 9);
+      w[2 * l] = apply_signs4(g.s0, sg & 0xF);
+      w[2 * l + 1] = apply_signs4(g.s1, sg >> 4);
+    }
+  }
+#elif QT == IQ2_S
+  d = f16(rd16(p + BB - 2)) * 0.125f;
+  {
+    const uint scb = p[72 + ib], h = p[64 + ib];
+    sc0 = 1 + 2 * (scb & 0xF);
+    sc1 = 1 + 2 * (scb >> 4);
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+      const uint2 g = grid8w(grid, p[4 * ib + l] | ((h << (8 - 2 * l)) & 0x300));
+      const uint sg = p[32 + 4 * ib + l];
+      w[2 * l] = apply_signs4(g.s0, sg & 0xF);
+      w[2 * l + 1] = apply_signs4(g.s1, sg >> 4);
+    }
+  }
+#elif QT == IQ3_XXS
+  d = f16(rd16(p + BB - 2)) * 0.25f;
+  {
+    const uint a = rd32(p + 64 + 4 * ib);
+    sc0 = sc1 = 1 + 2 * (a >> 28);
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+      const uint sg = ksigns(aux, (a >> (7 * l)) & 127);
+      w[2 * l] = apply_signs4(grid4w(grid, p[8 * ib + 2 * l]), sg & 0xF);
+      w[2 * l + 1] = apply_signs4(grid4w(grid, p[8 * ib + 2 * l + 1]), sg >> 4);
+    }
+  }
+#elif QT == IQ3_S && defined(IQ3T)
+  // -DIQ3T (ARC_IQ3S_TILE, 2026-11-17): the rows in pairs of superblocks repacked as planes (engine_load.h
+  // upload_padded): p is the pair's first byte and ib its 32-block 0..15 (8 x superblock + block). Planes of the
+  // pair's 224 bytes: qs at 0 (block L's 8 bytes as words L and 16 + L), signs at 128 (word L), qh at 192 (byte L),
+  // scales at 208 (4 bytes a superblock), d at 216 (2 bytes a superblock). The same bytes as below, the same values
+  {
+    const int L = ib, hb = L / 8, b8 = L % 8;
+    d = f16(rd16(p + 216 + 2 * hb));
+    sc0 = sc1 = 1 + 2 * ((p[208 + 4 * hb + b8 / 2] >> (4 * (b8 % 2))) & 0xF);
+    const uint h = p[192 + L];
+    const uchar qb[8] = {p[4 * L], p[4 * L + 1], p[4 * L + 2], p[4 * L + 3],
+                         p[64 + 4 * L], p[65 + 4 * L], p[66 + 4 * L], p[67 + 4 * L]};
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+      const uint g1 = qb[2 * l] | ((h << (8 - 2 * l)) & 256);
+      const uint g2 = qb[2 * l + 1] | ((h << (7 - 2 * l)) & 256);
+      const uint sg = p[128 + 4 * L + l];
+      w[2 * l] = apply_signs4(grid4w(grid, g1), sg & 0xF);
+      w[2 * l + 1] = apply_signs4(grid4w(grid, g2), sg >> 4);
+    }
+  }
+#elif QT == IQ3_S
+  d = f16(rd16(p + BB - 2));
+  {
+    sc0 = sc1 = 1 + 2 * ((p[104 + ib / 2] >> (4 * (ib % 2))) & 0xF);
+    const uint h = p[64 + ib];
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+      const uint g1 = p[8 * ib + 2 * l] | ((h << (8 - 2 * l)) & 256);
+      const uint g2 = p[8 * ib + 2 * l + 1] | ((h << (7 - 2 * l)) & 256);
+      const uint sg = p[72 + 4 * ib + l];
+      w[2 * l] = apply_signs4(grid4w(grid, g1), sg & 0xF);
+      w[2 * l + 1] = apply_signs4(grid4w(grid, g2), sg >> 4);
+    }
+  }
+#elif QT == IQ1_S
+  {
+    // (one 3-bit scale and delta sign per 32 values in qh[ib]: bits 12-14 and 15; grid index bits 8-10 per 8 values)
+    d = f16(rd16(p)) * 0.125f;
+    const uint qh = rd16(p + 34 + 2 * ib);
+    sc0 = sc1 = 2 * ((qh >> 12) & 7) + 1;
+    const int dl = (qh & 0x8000) ? -1 : 1;
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+      const uint2 g = grid8w(grid, p[2 + 4 * ib + l] | (((qh >> (3 * l)) & 7) << 8));
+#pragma unroll
+      for (int hw = 0; hw < 2; ++hw) {
+        const uint gw = hw ? g.s1 : g.s0;
+        uint o = 0;
+#pragma unroll
+        for (int b = 0; b < 4; ++b) o |= (uint)(uchar)(char)(8 * (char)((gw >> (8 * b)) & 0xFF) + dl) << (8 * b);
+        w[2 * l + hw] = o;
+      }
+    }
+  }
+#elif QT == IQ1_M
+  {
+    const uint s0 = rd16(p + 48), s1 = rd16(p + 50), s2 = rd16(p + 52), s3 = rd16(p + 54);
+    const uint su = (s0 >> 12) | ((s1 >> 8) & 0x00f0) | ((s2 >> 4) & 0x0f00) | (s3 & 0xf000);
+    d = f16(su) * 0.125f;
+    const uint sc = ib / 2 == 0 ? s0 : ib / 2 == 1 ? s1 : ib / 2 == 2 ? s2 : s3;
+    sc0 = 2 * ((sc >> (6 * (ib % 2) + 0)) & 7) + 1;
+    sc1 = 2 * ((sc >> (6 * (ib % 2) + 3)) & 7) + 1;
+    const uint h0 = p[32 + 2 * ib], h1 = p[32 + 2 * ib + 1];
+    const uint idx[4] = {p[4 * ib] | ((h0 << 8) & 0x700), p[4 * ib + 1] | ((h0 << 4) & 0x700),
+                         p[4 * ib + 2] | ((h1 << 8) & 0x700), p[4 * ib + 3] | ((h1 << 4) & 0x700)};
+    const int dl[4] = {(h0 & 0x08) ? -1 : 1, (h0 & 0x80) ? -1 : 1, (h1 & 0x08) ? -1 : 1, (h1 & 0x80) ? -1 : 1};
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+      const uint2 g = grid8w(grid, idx[l]);
+#pragma unroll
+      for (int hw = 0; hw < 2; ++hw) {
+        const uint gw = hw ? g.s1 : g.s0;
+        uint o = 0;
+#pragma unroll
+        for (int b = 0; b < 4; ++b) o |= (uint)(uchar)(char)(8 * (char)((gw >> (8 * b)) & 0xFF) + dl[l]) << (8 * b);
+        w[2 * l + hw] = o;
+      }
+    }
+  }
+#elif QT == IQ4_XS
+  d = f16(rd16(p));
+  {
+    const uint sh = rd16(p + 2);
+    const int ls = ((p[4 + ib / 2] >> (4 * (ib % 2))) & 0xF) | (((sh >> (2 * ib)) & 3) << 4);
+    sc0 = sc1 = ls - 32;
+    // a 16-byte table in local memory: measured faster than a 256-entry byte-pair table (SLM bank conflicts) and
+    // than sub-group shuffles with a variable lane index
+    const uchar* kv = (const uchar*)aux;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      const uint b = rd32(p + 8 + 16 * ib + 4 * k);
+      w[k] = kv[b & 0xF] | ((uint)kv[(b >> 8) & 0xF] << 8) | ((uint)kv[(b >> 16) & 0xF] << 16) | ((uint)kv[(b >> 24) & 0xF] << 24);
+      w[4 + k] = kv[(b >> 4) & 0xF] | ((uint)kv[(b >> 12) & 0xF] << 8) | ((uint)kv[(b >> 20) & 0xF] << 16) |
+                 ((uint)kv[(b >> 28) & 0xF] << 24);
+    }
+  }
+#endif
+  *psc0 = sc0; *psc1 = sc1; *pmn0 = mn0; *pmn1 = mn1; *pd = d; *pdmin = dmin;
+}
+
+// raw GGUF rows -> W8 GEMM layout: [g][s][j][w=0..15][lane] uint words and [g][s][10][lane] uint headers
+// (d, dmin, sc[16] bytes, mn[16] bytes; Q8_0 stores the f32 scale of each 32-block in header word ib), by the
+// decode_w8_* kernels below.
+#ifndef GL
+#define GL 16
+#endif
+// arcinferzero expert streaming (-DXCACHE): an expert's rows are not at e * rows in one buffer but in its record,
+// wherever the expert cache put it; xaddr[e] holds the record's address, the matrix at byte offset `off` in it.
+#ifdef XCACHE
+#define XROW(base, off, e, NR, n, sb) ((__global const uchar*)xaddr[e] + (off) + ((size_t)(n) * nsb + (sb)) * BBP)
+#define XBASE(base, off, e, NR) ((__global const uchar*)xaddr[e] + (off))
+#define XARGS_W8 , __global const ulong* xaddr, int xe0, int xn, int xoff
+#define XARGS_GU , __global const ulong* xaddr, int xog, int xou
+#define XARGS_D , __global const ulong* xaddr, int xod
+#else
+#define XROW(base, off, e, NR, n, sb) ((base) + (((size_t)(e) * (NR) + (n)) * nsb + (sb)) * BBP)
+#define XBASE(base, off, e, NR) ((base) + (size_t)(e) * (NR) * nsb * BBP)
+#define XARGS_W8
+#define XARGS_GU
+#define XARGS_D
+#endif
+// row n, superblock sb of an expert matrix starting at b (its address read once per work-item: XBASE)
+#define XR(b, n, sb) ((b) + ((size_t)(n) * nsb + (sb)) * BBP)
+// The conversion, one work-item per (row, superblock) with the codebooks staged in local memory once per
+// work-group. grid (N, K/256), local (LSZ, 1) with LSZ dividing N.
+__kernel void decode_w8_sb(__global const uchar* raw, int N, int K, __global const uint* tabs, __global uint* wq,
+                           __global uint* wh XARGS_W8) {
+#ifdef GRID_OFF
+  __local uint lgrid[GRID_N];
+  for (int i = get_local_id(0); i < GRID_N; i += get_local_size(0)) lgrid[i] = tabs[GRID_OFF + i];
+  const uint* grid = lgrid;
+#else
+  const uint* grid = tabs;
+#endif
+#ifdef AUX_OFF
+  __local uint laux[AUX_N];
+  for (int i = get_local_id(0); i < AUX_N; i += get_local_size(0)) laux[i] = tabs[AUX_OFF + i];
+  const uint* aux = laux;
+#else
+  const uint* aux = tabs;
+#endif
+  barrier(CLK_LOCAL_MEM_FENCE);
+  const int n = get_global_id(0), s = get_global_id(1);
+  const int nsb = K / 256, g = n / GL, lane = n % GL;
+  if (n >= N) return;
+  // the superblock into registers with 8-byte vector loads, decoded from there (byte-wise reads of global memory
+  // made decoding several times slower than reading the weights)
+#ifdef IQ3T
+#if defined(XCACHE)
+#error "IQ3T: not for experts"
+#endif
+  // (this superblock's parts of its pair (superblock hb of it), loaded into superblock 0's places of a pair-shaped
+  //  copy, so the decode below reads it as lanes 0..7 at offsets the unrolled loop knows: registers, where a copy of
+  //  the whole pair indexed by s % 2 went to private memory, 8 KB a thread, ocloc bmg)
+  uint sbu[2 * BBP / 4];
+  {
+    const int hb = s & 1;
+    __global const uint* pr = (__global const uint*)(raw + ((size_t)n * nsb + (s & ~1)) * BBP);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      sbu[i] = pr[8 * hb + i];             // qs, lanes' first words
+      sbu[16 + i] = pr[16 + 8 * hb + i];   // qs, second words
+      sbu[32 + i] = pr[32 + 8 * hb + i];   // signs
+    }
+    sbu[48] = pr[48 + 2 * hb];             // qh, the superblock's 8 bytes
+    sbu[49] = pr[48 + 2 * hb + 1];
+    sbu[52] = pr[52 + hb];                 // its scales
+    sbu[54] = (pr[54] >> (16 * hb)) & 0xFFFF;  // its d, in the low half
+  }
+  const uchar* p = (const uchar*)sbu;
+#else
+  uint sbu[BBP / 4];
+  {
+#ifdef XCACHE
+    __global const uint* src = (__global const uint*)XROW(raw, xoff, xe0 + n / xn, 0, n % xn, s);
+#else
+    __global const uint* src = (__global const uint*)(raw + ((size_t)n * nsb + s) * BBP);
+#endif
+#pragma unroll
+    for (int i = 0; i < BBP / 8; ++i) {
+      const uint2 v = vload2(i, src);
+      sbu[2 * i] = v.x;
+      sbu[2 * i + 1] = v.y;
+    }
+  }
+  const uchar* p = (const uchar*)sbu;
+#endif
+  __global uint* hd = wh + ((size_t)g * nsb + s) * HSTR * GL;
+#if (QT == Q2_K || QT == Q4_K || QT == Q5_K) && !defined(W8_MINS)
+  // (-DW8_MINS, Flash Next's precise mode: these types too as their values, scales and mins below, for gemm.cl's
+  //  variants 102 / 103 with the activations' per-16 sums)
+  // Types with per-block mins (w = d*sc*q - dmin*m, q unsigned) are requantized to signed int8 so they can use
+  // the min-free GEMM: one float D per superblock, an int8 scale per 16 (equal halves for Q4_K/Q5_K) chosen from
+  // the analytic block range, q' = round(w / (D*sc')). The added error is ~1/16 of the original quantization step.
+#if QT == Q4_K
+  const float qmax = 15.0f;
+#elif QT == Q5_K
+  const float qmax = 31.0f;
+#else
+  const float qmax = 3.0f;
+#endif
+  uint wv[8][8];
+  float fs[16], fm[16], am[16];
+  float D = 0.0f;
+  for (int ib = 0; ib < 8; ++ib) {
+    int sc0, sc1, mn0, mn1;
+    float d, dmin;
+    decode32(p, ib, grid, aux, wv[ib], &sc0, &sc1, &mn0, &mn1, &d, &dmin);
+    fs[2 * ib] = d * sc0; fs[2 * ib + 1] = d * sc1;
+    fm[2 * ib] = dmin * mn0; fm[2 * ib + 1] = dmin * mn1;
+  }
+  for (int h = 0; h < 16; ++h) {
+    am[h] = fmax(fabs(fm[h]), fabs(fs[h] * qmax - fm[h]));
+    D = fmax(D, am[h]);
+  }
+  D /= 127.0f * 127.0f;
+  uint scw[4] = {0, 0, 0, 0};
+  for (int ib = 0; ib < 8; ++ib) {
+    float step[2];
+    for (int hh = 0; hh < 2; ++hh) {
+      const int h = 2 * ib + hh;
+      const int sq = D > 0.0f ? clamp((int)ceil(am[h] / (127.0f * D) - 1e-4f), 1, 127) : 1;
+      scw[h / 4] |= (uint)sq << (8 * (h % 4));
+      step[hh] = D * sq;
+    }
+    __global uint* dst = wq + (((size_t)g * nsb + s) * 4 + ib / 2) * 16 * GL + (ib % 2) * 8 * GL + lane;
+    for (int k = 0; k < 8; ++k) {
+      const int h = 2 * ib + k / 4;
+      const float inv = step[k / 4] > 0.0f ? 1.0f / step[k / 4] : 0.0f;
+      uint o = 0;
+      for (int b = 0; b < 4; ++b) {
+        const float v = fs[h] * (float)((wv[ib][k] >> (8 * b)) & 0xFF) - fm[h];
+        o |= (uint)(clamp(convert_int_rte(v * inv), -127, 127) & 0xFF) << (8 * b);
+      }
+      dst[k * GL] = o;
+    }
+  }
+  hd[0 * GL + lane] = as_uint(D);
+  hd[1 * GL + lane] = 0u;
+  for (int f = 0; f < 4; ++f) {
+    hd[(2 + f) * GL + lane] = scw[f];
+    hd[(6 + f) * GL + lane] = 0u;
+  }
+#else
+  uint scw[4] = {0, 0, 0, 0}, mnw[4] = {0, 0, 0, 0};
+  float d0 = 0.0f, dm0 = 0.0f;
+  for (int ib = 0; ib < 8; ++ib) {
+    uint w[8];
+    int sc0, sc1, mn0, mn1;
+    float d, dmin;
+    decode32(p, ib, grid, aux, w, &sc0, &sc1, &mn0, &mn1, &d, &dmin);  // (IQ3T: the copy is superblock 0 of a pair)
+    __global uint* dst = wq + (((size_t)g * nsb + s) * 4 + ib / 2) * 16 * GL + (ib % 2) * 8 * GL + lane;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) dst[k * GL] = w[k];
+#if PER32
+    hd[ib * GL + lane] = as_uint(d);
+#else
+    const int b0 = 2 * ib, b1 = 2 * ib + 1;
+    scw[b0 / 4] |= (uint)(uchar)(char)sc0 << (8 * (b0 % 4));
+    scw[b1 / 4] |= (uint)(uchar)(char)sc1 << (8 * (b1 % 4));
+    mnw[b0 / 4] |= (uint)(uchar)mn0 << (8 * (b0 % 4));
+    mnw[b1 / 4] |= (uint)(uchar)mn1 << (8 * (b1 % 4));
+    d0 = d;
+    dm0 = dmin;
+#endif
+  }
+#if !PER32
+  hd[0 * GL + lane] = as_uint(d0);
+  hd[1 * GL + lane] = as_uint(dm0);
+#pragma unroll
+  for (int f = 0; f < 4; ++f) {
+    hd[(2 + f) * GL + lane] = scw[f];
+    hd[(6 + f) * GL + lane] = mnw[f];
+  }
+#endif
+#endif  // requantized types
+}
+
+#ifdef H8RDEC
+// ---- H8R straight from the raw rows (zero/engine_h8.h, ARC_H8=1; -DH8RDEC -DHB=<block> -DSRC=<W8 layout 100..103>):
+// decode_w8_sb + h8.cl h8r_weights in one pass, without writing and reading back the W8 copy. A lane decodes its two
+// 32-blocks with decode32 and forms each value as h8r_load forms it from that W8 copy (d * (float)sc, minus dmin * mn,
+// the scale and min bytes as stored there), so the rotated weights are those of the two kernels bit for bit. The column
+// scales (col) come from the first decode's h8r_colmax. Since 2026-11-14 also (B60 prefill plan 13.3):
+//  - the per-32 float types (Q8_0, Q4_0, IQ4_NL, Q2_0, MXFP4; -DSRC=8): decode32's block scale d and scale 1, so
+//    d * 1 * q - 0, the value h8r_load reads back (d * q);
+// The types decode_w8 requantizes (Q2_K / Q4_K / Q5_K) keep the two passes: their requantization repeated here gave ~2
+// values in a million 1 apart on the laptop (27B, 2026-11-14), the rounding of decode_w8_sb's division and multiply-adds
+// depending on the code around them under -cl-mad-enable.
+#if QT == Q2_K || QT == Q4_K || QT == Q5_K
+#error "H8RDEC: the requantized types keep decode_w8 + h8r_weights"
+#endif
+// grid (N / 16 * 256, K / HB / H8DR), local (256, 1): sub-group c = row (column) c of the group, lane l = values 64 l
+// .. + 63 of the rotation block (HB 1024: two 32-blocks of one superblock; HB 512: one).
+#define H8NV (HB / 16)  // values per lane: 64 (HB 1024) or 32 (512), whole 32-blocks
+#if H8NV % 32
+#error "H8RDEC: HB 512 or 1024"
+#endif
+#define H8WPL (HB / 64)
+#define H8TP (HB / 4 + 1)
+__attribute__((intel_reqd_sub_group_size(16)))
+__kernel void h8r_decode(__global const uchar* raw, int N, int K, __global const uint* tabs, __global uint* wq,
+                         __global const float* restrict col) {
+#ifdef GRID_OFF
+  __local uint lgrid[GRID_N];
+  for (int i = get_local_id(0); i < GRID_N; i += get_local_size(0)) lgrid[i] = tabs[GRID_OFF + i];
+  const uint* grid = lgrid;
+#else
+  const uint* grid = tabs;
+#endif
+#ifdef AUX_OFF
+  __local uint laux[AUX_N];
+  for (int i = get_local_id(0); i < AUX_N; i += get_local_size(0)) laux[i] = tabs[AUX_OFF + i];
+  const uint* aux = laux;
+#else
+  const uint* aux = tabs;
+#endif
+  __local uint tout[16 * H8TP];
+#define H8SB (HB / 256)
+#define H8RU (H8SB * BBP / 4)  // (uints of one row's superblocks; BBP is a multiple of 8)
+#ifndef H8D_PRIV
+  __local uint sraw[16 * H8RU];
+#endif
+  const int c = get_sub_group_id(), l = get_sub_group_local_id();
+  const int g = get_group_id(0), nsb = K / 256, nb = K / HB;
+  // (H8DR rotation blocks of the same 16 rows one after another per work-group, so its codebook copy into local memory
+  //  serves H8DR times the weights; the same work per block as before)
+#ifndef H8DR
+#define H8DR 1
+#endif
+  for (int jb = 0; jb < H8DR; ++jb) {
+  const int blk = get_group_id(1) * H8DR + jb;
+  if (blk >= nb) break;  // (the same for the whole work-group: its barriers stay uniform)
+  const int n = g * 16 + c, e0 = blk * HB + H8NV * l, s = e0 / 256, ib0 = (e0 % 256) / 32;
+#ifdef H8D_PRIV
+  // (before 2026-11-14, -DH8D_PRIV: each lane loads its whole superblock into registers, of which it decodes one or two
+  //  32-blocks: the work-group fetched every superblock 4 (HB 1024) or 8 (HB 512) times, in scattered 8-byte loads)
+#ifdef IQ3T
+#error "IQ3T: not with H8D_PRIV (one superblock's copy; its bytes are spread over its pair)"
+#endif
+  barrier(CLK_LOCAL_MEM_FENCE);
+  uint sbu[BBP / 4];
+  {
+    __global const uint* src = (__global const uint*)(raw + ((size_t)n * nsb + s) * BBP);
+#pragma unroll
+    for (int i = 0; i < BBP / 8; ++i) {
+      const uint2 u = vload2(i, src);
+      sbu[2 * i] = u.x;
+      sbu[2 * i + 1] = u.y;
+    }
+  }
+  const uchar* p = (const uchar*)sbu;
+#else
+  // the work-group's 16 rows x HB / 256 superblocks, read once by its 256 lanes in row order (each row's bytes are
+  // contiguous) into local memory; each lane decodes its 32-blocks from there (B60 prefill plan 13.3, 2026-11-14).
+  // (a later block's loads come after the previous block's barrier before its stores: every lane is past its decode)
+  {
+    const int s0 = blk * H8SB;
+    for (int i = get_local_id(0); i < 16 * H8RU; i += 256) {
+      const int r = i / H8RU, o = i % H8RU;
+      sraw[i] = ((__global const uint*)(raw + ((size_t)(g * 16 + r) * nsb + s0) * BBP))[o];
+    }
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  const uchar* p = (const uchar*)(sraw + c * H8RU) + (s - blk * H8SB) * BBP;
+#endif
+  float v[H8NV];
+#pragma unroll
+  for (int h = 0; h < H8NV / 32; ++h) {
+    uint w[8];
+    int sc0, sc1, mn0, mn1;
+    float d, dmin;
+    decode32(IQ3_AT(p, s, ib0 + h), grid, aux, w, &sc0, &sc1, &mn0, &mn1, &d, &dmin);
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      // (the W8 header's bytes as h8r_load reads them: per-32 layouts the first 16-block's scale, per-16 each half's)
+#if SRC & 1
+      const int sc = (int)(char)(uchar)(char)sc0;
+#else
+      const int sc = (int)(char)(uchar)(char)(k < 4 ? sc0 : sc1);
+#endif
+#if SRC >= 102
+      const float mn = (float)(uchar)(k < 4 ? mn0 : mn1);
+#else
+      const float mn = 0.0f;
+#endif
+      const float dq = d * (float)sc, off = dmin * mn;
+#pragma unroll
+      for (int b = 0; b < 4; ++b) {
+        const float x = dq * (float)(char)(w[k] >> (8 * b)) - off;
+        v[32 * h + 4 * k + b] = rot_sign(x, H8NV * l + 32 * h + 4 * k + b);
+      }
+    }
+  }
+  rot_block(v);
+  const float cs = col[g * 16 + c];
+  const float iv = cs > 0.0f ? 1.0f / (cs * sqrt((float)HB)) : 0.0f;
+#pragma unroll
+  for (int i = 0; i < H8WPL; ++i) tout[c * H8TP + H8WPL * l + i] = rot_pack(v + 4 * i, iv);
+  barrier(CLK_LOCAL_MEM_FENCE);
+  // (as h8.cl h8r_weights writes them: the 16 rows' block is 4 HB uints from the first, lane lid writes words
+  //  lid / 16 + 16 i of row lid % 16 at uint 256 i + lid, or in gemm_xw8's packed order (XW_PACKW_OUT) at 256 i + o)
+  {
+    const int lid = get_local_id(0), cl = lid % 16, w0 = lid / 16;
+#ifdef XW_PACKW_OUT
+    const int o = ((w0 / 8) * 2 + cl / 8) * 64 + (w0 % 8) * 8 + cl % 8;
+#else
+    const int o = lid;
+#endif
+#if defined(XW_WGLB) && defined(XW_PACKW_OUT)
+    // (-DXW_WGLB=G, ARC_GEMM_XW_WGL: gemm_xw8 -DXS_WGLB's order, the groups in blocks of G (the big tile's work-group
+    //  columns): chunk c of group g at ((g / G) * K / 64 + c) * G * 256 + (g % G) * 256, the same 256 words in it)
+    __global uint* wr = wq + (size_t)(g / XW_WGLB) * XW_WGLB * 4 * K + (size_t)(g % XW_WGLB) * 256 +
+                        (size_t)blk * (4 * HB) * XW_WGLB;
+#pragma unroll
+    for (int i = 0; i < H8WPL; ++i) wr[256 * XW_WGLB * i + o] = tout[cl * H8TP + w0 + 16 * i];
+#else
+    __global uint* wr = wq + (size_t)g * 4 * K + (size_t)blk * (4 * HB);
+#pragma unroll
+    for (int i = 0; i < H8WPL; ++i) wr[256 * i + o] = tout[cl * H8TP + w0 + 16 * i];
+#endif
+  }
+  }  // (jb)
+}
+#endif  // H8RDEC
+
+// Same conversion for 16 rows of SL_NSB superblocks (the whole rows: K = 256 * SL_NSB) per work-group of
+// 16 * SL_NSB: the rows' bytes (contiguous) are first copied to local memory with coalesced loads, then each
+// work-item decodes one superblock from there (lane = row, so the W8 stores of a sub-group are contiguous).
+// Types without mins only. grid (N / 16 * 16 * SL_NSB), local (16 * SL_NSB).
+#ifdef SL_NSB
+__kernel void decode_w8_sl(__global const uchar* raw, int N, int K, __global const uint* tabs, __global uint* wq,
+                           __global uint* wh XARGS_W8) {
+#ifdef GRID_OFF
+  __local uint lgrid[GRID_N];
+  for (int i = get_local_id(0); i < GRID_N; i += get_local_size(0)) lgrid[i] = tabs[GRID_OFF + i];
+  const uint* grid = lgrid;
+#else
+  const uint* grid = tabs;
+#endif
+#ifdef AUX_OFF
+  __local uint laux[AUX_N];
+  for (int i = get_local_id(0); i < AUX_N; i += get_local_size(0)) laux[i] = tabs[AUX_OFF + i];
+  const uint* aux = laux;
+#else
+  const uint* aux = tabs;
+#endif
+  __local uint sl[16 * SL_NSB * BBP / 4];
+  const int lid = get_local_id(0), nsb = SL_NSB, n0 = get_group_id(0) * 16;
+  {
+#ifdef XCACHE
+    __global const uint* src = (__global const uint*)XROW(raw, xoff, xe0 + n0 / xn, 0, n0 % xn, 0);
+#else
+    __global const uint* src = (__global const uint*)(raw + (size_t)n0 * nsb * BBP);
+#endif
+    for (int i = lid; i < 16 * SL_NSB * BBP / 4; i += 16 * SL_NSB) sl[i] = src[i];
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  const int lane = lid % 16, s = lid / 16, n = n0 + lane, g = n / GL;
+  const uchar* p = (const uchar*)(sl + (lane * nsb + s) * (BBP / 4));
+  __global uint* hd = wh + ((size_t)g * nsb + s) * HSTR * GL;
+  uint scw[4] = {0, 0, 0, 0};
+  float d0 = 0.0f;
+  for (int ib = 0; ib < 8; ++ib) {
+    uint w[8];
+    int sc0, sc1, mn0, mn1;
+    float d, dmin;
+    decode32(IQ3_AT(p, s, ib), grid, aux, w, &sc0, &sc1, &mn0, &mn1, &d, &dmin);
+    __global uint* dst = wq + (((size_t)g * nsb + s) * 4 + ib / 2) * 16 * GL + (ib % 2) * 8 * GL + lane;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) dst[k * GL] = w[k];
+#if PER32
+    hd[ib * GL + lane] = as_uint(d);
+#else
+    const int b0 = 2 * ib, b1 = 2 * ib + 1;
+    scw[b0 / 4] |= (uint)(uchar)(char)sc0 << (8 * (b0 % 4));
+    scw[b1 / 4] |= (uint)(uchar)(char)sc1 << (8 * (b1 % 4));
+    d0 = d;
+#endif
+  }
+#if !PER32
+  hd[0 * GL + lane] = as_uint(d0);
+  hd[1 * GL + lane] = 0u;
+#pragma unroll
+  for (int f = 0; f < 4; ++f) {
+    hd[(2 + f) * GL + lane] = scw[f];
+    hd[(6 + f) * GL + lane] = 0u;
+  }
+#endif
+}
+#endif
+
+// Single-token matrix-vector product on the padded raw rows (token generation / lm_head):
+//   C[c_off + n] (+)= sum_k W[n][k] * a[k],  a = int8 activations of token 0 with per-32 scales (row stride M)
+//   and per-16 sums. Each sub-group streams GROWS rows; per step it block-reads two superblocks (coalesced)
+//   into local memory, then lane l decodes 32-block (l % 8) of superblock (l / 8) from there.
+//   Codebooks are staged in local memory once per work-group. grid (ceil(N/GROWS)*16 rounded to 256), local 256.
+#ifndef GROWS
+#define GROWS 4
+#endif
+// -DSOFTCAP=c (output head of Gemma): results are soft-capped, c * tanh(v / c)
+#ifdef SOFTCAP
+#define HEAD_OUT(v) (SOFTCAP * tanh((v) * (1.0f / SOFTCAP)))
+#else
+#define HEAD_OUT(v) (v)
+#endif
+
+// -DQ2F (Gemma 4 two-pass mode, one token): the second pass fused in. Next to the activations' int8 values the
+// buffers hold their rounding residuals at fixed offsets (-DQ2_AQ bytes into aq, -DQ2_SC floats into asc, -DQ2_AB
+// halves into absum, as ops.cl's quant_store16 writes them); each weight block read is dotted with both and kept in
+// two accumulators. The output is what the two launches gave, value pass then residual pass (accumulate = 1):
+// (C + v) + r, or v + r. No soft cap (the two-pass head is capped after both passes).
+#ifdef Q2F
+#ifdef SOFTCAP
+#error "Q2F: no soft cap in the fused two-pass GEMV"
+#endif
+#define Q2F_STORE(n, v, r) C[c_off + (n)] = (accumulate ? C[c_off + (n)] + (v) : (v)) + (r)
+#endif
+// -DGU2 (gemv, gemv_v; one token): two matrices of N rows in one launch, the FFN's gate (raw) and up (raw2), as
+// two launches would write them: rows [N, 2N) of the grid read raw2 and write at c_off + N. Each row's sums are
+// those of its own launch, bit for bit; one launch instead of two (ARC_GEMV_GU, zero/engine.h gemv_gu)
+#ifdef GU2
+#define GU2_ARG , __global const uchar* raw2
+#define GU2_SWITCH(r0) if ((r0) >= N) { raw = raw2; (r0) -= N; c_off += N; }
+#else
+#define GU2_ARG
+#define GU2_SWITCH(r0)
+#endif
+#define WIN_U (2 * BBP / 4)          // uints per two-superblock window
+#define WIN_CALLS ((WIN_U + 15) / 16)
+// -DGEMV_DB (ARC_GEMV_DB=1, zero/xe2/engine_xe2.h; 2026-11-15, the loads kept in flight across the decode): the window
+// reads one window ahead. The (step, row) windows a sub-group reads, in order, are loaded
+// into registers one window early, so the next row's (or the next step's first row's) bytes are on their way while
+// this row is decoded; without it each row's reads are issued and waited for before its decode. The same bytes in
+// the same local-memory window, the same arithmetic in the same order: bit-identical. WIN_CALLS registers more.
+// Not with -DGEMV_PF (the reads of a whole step issued at once) or GV_PROBE.
+#if defined(GEMV_DB) && (defined(GEMV_PF) || defined(GV_PROBE))
+#error "gemv: GEMV_DB with GEMV_PF or GV_PROBE"
+#endif
+// -DGEMV_DEEP=D (ARC_GEMV_DEEP=D, 2026-11-22, opt-in): GEMV_DB with D windows in flight instead of one. A ring of D
+// windows' words in registers: each window is copied from ring[0] into the local window, the ring moves down one, and
+// the window D ahead (the same order as GEMV_DB's: every row of a step, then the next step) is read into ring[D - 1].
+// A sub-group keeps ~D x 220 bytes in flight (IQ3_S) where the window loop kept one: a Pro B65's one-token GEMVs read
+// at 252.7 of its 598 GB/s with the decode skipped (GV_PROBE=1, issue #47), against gpu_bench's 2 KB in flight a
+// sub-group reaching all of it. The same bytes in the same local window and the same arithmetic in the same order:
+// bit-identical. D x WIN_CALLS registers. With GV_PROBE=1 (the reads' ceiling), not with GEMV_PF, GEMV_DB or GV_PROBE=2
+#ifdef GEMV_DEEP
+#if defined(GEMV_PF) || defined(GEMV_DB) || (defined(GV_PROBE) && GV_PROBE == 2)
+#error "gemv: GEMV_DEEP with GEMV_PF, GEMV_DB or GV_PROBE=2"
+#endif
+#if GEMV_DEEP < 2 || GEMV_DEEP > 16
+#error "gemv: GEMV_DEEP must be 2 to 16"
+#endif
+#endif
+#if defined(SPLITK) && defined(GEMV_DEEP)
+#error "gemv: SPLITK with GEMV_DEEP (its ring assumes the unsplit order of steps)"
+#endif
+__attribute__((intel_reqd_sub_group_size(16)))
+__kernel void gemv(__global const uchar* raw, int N, int K, __global const uint* tabs, __global const char* aq,
+                   __global const float* asc, __global const ushort* absum, int M, __global float* C, int c_off,
+                   int accumulate GU2_ARG) {
+  __local uint win_all[16][WIN_CALLS * 16];
+  // (win_all holds 16 sub-groups' windows: the launches use work-groups of 256 or 64. A larger group would share
+  //  windows, a silent race: it returns instead. Audit 2026-11-12 #7; uniform over the group, before any barrier)
+  if (get_num_sub_groups() > 16) return;
+  __local uint* win = win_all[get_sub_group_id() & 15];
+#ifdef GRID_OFF
+  __local uint lgrid[GRID_N];
+  for (int i = get_local_id(0); i < GRID_N; i += get_local_size(0)) lgrid[i] = tabs[GRID_OFF + i];
+  const uint* grid = lgrid;
+#else
+  const uint* grid = tabs;
+#endif
+#ifdef AUX_OFF
+  __local uint laux[AUX_N];
+  for (int i = get_local_id(0); i < AUX_N; i += get_local_size(0)) laux[i] = tabs[AUX_OFF + i];
+  const uint* aux = laux;
+#else
+  const uint* aux = tabs;
+#endif
+  barrier(CLK_LOCAL_MEM_FENCE);
+  const int lane = get_sub_group_local_id();
+#ifdef SPLITK
+  // -DSPLITK=S (ARC_GEMV_SPLITK, 2026-11-18): S sub-groups of one work-group share a row group, sub-group j taking the
+  // steps j, j + S, ... of its rows; their sums meet in local memory and are added in a fixed order (deterministic,
+  // but not the unsplit kernel's order). S divides 16; the launch has S times the lanes
+  const int kj = (int)(get_global_id(0) / 16) % SPLITK;
+  int r0 = (int)((get_global_id(0) / 16) / SPLITK) * GROWS;
+  const int sk0 = 2 * kj, sks = 2 * SPLITK;
+#else
+  int r0 = (get_global_id(0) / 16) * GROWS;
+  const int sk0 = 0, sks = 2;
+#endif
+  GU2_SWITCH(r0)
+  const int nsb = K / 256;
+  float acc[GROWS];
+#pragma unroll
+  for (int r = 0; r < GROWS; ++r) acc[r] = 0.0f;
+#ifdef Q2F
+  float acc2[GROWS];
+#pragma unroll
+  for (int r = 0; r < GROWS; ++r) acc2[r] = 0.0f;
+#endif
+#if defined(IQ3T) && !defined(Q2F) && !defined(GV_PROBE) && !defined(GU2)
+  // ---- IQ3_S in pairs of planes (ARC_IQ3S_TILE, 2026-11-17; bench\gemv_iq3p.cl): each lane's bytes straight into
+  //      registers, the pair's qs / signs / qh / meta in four block reads, no local-memory window and no barriers;
+  //      decode32's IQ3T expression on the same bytes and the dot products below: the same results bit for bit.
+  //      (laptop, gemv_bench, 27B IQ3_S matrices: 66-68 -> 70-77 GB/s.) GEMV_PF / GEMV_DB tune the window: not here
+  //      (v2, 2026-11-18: the reads ahead of the decode, as the default path's GEMV_PF / GEMV_DB do on discrete cards:
+  //       every row's four reads of a pair issued before any row is decoded, and with -DGEMV_PF / -DGEMV_DB the next
+  //       pair's too while this one decodes. The first form waited for each row's loads in turn: a Pro B70's
+  //       27B 35.24 -> 32.7 tok/s, issue #27. The same bytes and arithmetic: bit-identical)
+  {
+    const int sbl = lane / 8, ibl = lane % 8;
+#if defined(GEMV_PF) || defined(GEMV_DB)
+#define IQ3T_AHEAD 1
+#endif
+    uint2 Q[GROWS];
+    uint S4[GROWS], H1[GROWS], MB1[GROWS];
+#define IQ3T_LOAD(QA, SA, HA, MA, SP)                                                         \
+  _Pragma("unroll") for (int r = 0; r < GROWS; ++r) {                                         \
+    __global const uchar* pr = raw + ((size_t)min(r0 + r, N - 1) * nsb + (SP)) * BBP;          \
+    QA[r] = intel_sub_group_block_read2((__global const uint*)pr);                            \
+    SA[r] = intel_sub_group_block_read((__global const uint*)(pr + 128));                     \
+    HA[r] = intel_sub_group_block_read_uc(pr + 192);                                          \
+    MA[r] = intel_sub_group_block_read_uc(pr + 208);                                          \
+  }
+#ifdef IQ3T_AHEAD
+    uint2 Qn[GROWS];
+    uint S4n[GROWS], H1n[GROWS], MB1n[GROWS];
+    IQ3T_LOAD(Qn, S4n, H1n, MB1n, 0)
+#endif
+    for (int sp = 0; sp < nsb; sp += 2) {
+      const int b = sp * 8 + lane;  // this lane's 32-block within the row
+      const bool has = sp + lane / 8 < nsb;
+#ifdef IQ3T_AHEAD
+#pragma unroll
+      for (int r = 0; r < GROWS; ++r) Q[r] = Qn[r], S4[r] = S4n[r], H1[r] = H1n[r], MB1[r] = MB1n[r];
+      if (sp + 2 < nsb) { IQ3T_LOAD(Qn, S4n, H1n, MB1n, sp + 2) }  // (the next pair's, in flight during this decode)
+#else
+      IQ3T_LOAD(Q, S4, H1, MB1, sp)
+#endif
+      const uint8 a8 = has ? vload8(0, (__global const uint*)(aq + 32 * b)) : (uint8)0;
+      const float sa = has ? asc[(size_t)b * M] : 0.0f;
+#pragma unroll
+      for (int r = 0; r < GROWS; ++r) {
+        const uint2 q = Q[r];
+        const uint sg4 = S4[r];
+        const uint h = H1[r];
+        const uint mb = MB1[r];
+        const uint scb = sub_group_shuffle(mb, sbl * 4 + ibl / 2);
+        const uint dl = sub_group_shuffle(mb, 8 + 2 * sbl), dh = sub_group_shuffle(mb, 9 + 2 * sbl);
+        const float d = f16(dl | (dh << 8));
+        const int sc0 = 1 + 2 * ((scb >> (4 * (ibl % 2))) & 0xF), sc1 = sc0;
+        const uint qb[8] = {q.x & 0xFF, (q.x >> 8) & 0xFF, (q.x >> 16) & 0xFF, q.x >> 24,
+                            q.y & 0xFF, (q.y >> 8) & 0xFF, (q.y >> 16) & 0xFF, q.y >> 24};
+        uint w[8];
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+          const uint g1 = qb[2 * l] | ((h << (8 - 2 * l)) & 256);
+          const uint g2 = qb[2 * l + 1] | ((h << (7 - 2 * l)) & 256);
+          const uint sg = (sg4 >> (8 * l)) & 0xFF;
+          w[2 * l] = apply_signs4(grid4w(grid, g1), sg & 0xF);
+          w[2 * l + 1] = apply_signs4(grid4w(grid, g2), sg >> 4);
+        }
+        int lo = dot_4x8packed_ss_int(a8.s0, w[0]);
+        lo += dot_4x8packed_ss_int(a8.s1, w[1]);
+        lo += dot_4x8packed_ss_int(a8.s2, w[2]);
+        lo += dot_4x8packed_ss_int(a8.s3, w[3]);
+        int hi = dot_4x8packed_ss_int(a8.s4, w[4]);
+        hi += dot_4x8packed_ss_int(a8.s5, w[5]);
+        hi += dot_4x8packed_ss_int(a8.s6, w[6]);
+        hi += dot_4x8packed_ss_int(a8.s7, w[7]);
+        acc[r] += sa * d * (float)(sc0 * lo + sc1 * hi);
+      }
+    }
+  }
+#else
+#ifdef GEMV_DB
+  uint nxt[WIN_CALLS];  // (the next window's words: step 0, row 0 first)
+  {
+    __global const uint* src = (__global const uint*)(raw + ((size_t)min(r0, N - 1) * nsb + min(sk0, nsb - 1)) * BBP);
+#pragma unroll
+    for (int c = 0; c < WIN_CALLS; ++c) nxt[c] = intel_sub_group_block_read(src + c * 16);
+  }
+#endif
+#ifdef GEMV_DEEP
+  // (the ring: windows 0 .. D - 1 in the order they are used; dl_r / dl_sp: the next window to read, D ahead)
+  uint ring[GEMV_DEEP][WIN_CALLS];
+  int dl_r = 0, dl_sp = 0;
+#pragma unroll
+  for (int k = 0; k < GEMV_DEEP; ++k) {
+    if (dl_sp < nsb) {
+      __global const uint* src = (__global const uint*)(raw + ((size_t)min(r0 + dl_r, N - 1) * nsb + dl_sp) * BBP);
+#pragma unroll
+      for (int c = 0; c < WIN_CALLS; ++c) ring[k][c] = intel_sub_group_block_read(src + c * 16);
+    }
+    if (++dl_r == GROWS) { dl_r = 0; dl_sp += 2; }
+  }
+#endif
+  for (int sp = sk0; sp < nsb; sp += sks) {
+    const int b = sp * 8 + lane;  // this lane's 32-block within the row
+    const bool has = sp + lane / 8 < nsb;
+    const uint8 a8 = has ? vload8(0, (__global const uint*)(aq + 32 * b)) : (uint8)0;
+    const float sa = has ? asc[(size_t)b * M] : 0.0f;
+#if QT == Q2_K || QT == Q4_K || QT == Q5_K
+    const int bs0 = has ? (short)absum[(size_t)(2 * b) * M] : 0, bs1 = has ? (short)absum[(size_t)(2 * b + 1) * M] : 0;
+#endif
+#ifdef Q2F
+    const uint8 r8 = has ? vload8(0, (__global const uint*)(aq + Q2_AQ + 32 * b)) : (uint8)0;
+    const float sr = has ? asc[Q2_SC + (size_t)b * M] : 0.0f;
+#if QT == Q2_K || QT == Q4_K || QT == Q5_K
+    const int rs0 = has ? (short)absum[Q2_AB + (size_t)(2 * b) * M] : 0;
+    const int rs1 = has ? (short)absum[Q2_AB + (size_t)(2 * b + 1) * M] : 0;
+#endif
+#endif
+#ifdef GEMV_PF
+    // (discrete GPUs, ARC_GEMV_PF=1, zero/xe2/engine_xe2.h: every row's reads of this step issued before the first
+    //  row is decoded, GROWS x WIN_CALLS loads in flight instead of WIN_CALLS; the same values, the same sums)
+    uint pre[GROWS][WIN_CALLS];
+#pragma unroll
+    for (int r = 0; r < GROWS; ++r) {
+#if GV_PROBE == 2
+      __global const uint* src = (__global const uint*)(raw + ((size_t)min(r0 + r, N - 1) * nsb) * BBP);
+#else
+      __global const uint* src = (__global const uint*)(raw + ((size_t)min(r0 + r, N - 1) * nsb + sp) * BBP);
+#endif
+#pragma unroll
+      for (int c = 0; c < WIN_CALLS; ++c) pre[r][c] = intel_sub_group_block_read(src + c * 16);
+    }
+#endif
+#pragma unroll
+    for (int r = 0; r < GROWS; ++r) {
+#if defined(GEMV_PF)
+#pragma unroll
+      for (int c = 0; c < WIN_CALLS; ++c) win[c * 16 + lane] = pre[r][c];
+#elif defined(GEMV_DEEP)
+#pragma unroll
+      for (int c = 0; c < WIN_CALLS; ++c) win[c * 16 + lane] = ring[0][c];
+#pragma unroll
+      for (int k = 0; k + 1 < GEMV_DEEP; ++k)
+#pragma unroll
+        for (int c = 0; c < WIN_CALLS; ++c) ring[k][c] = ring[k + 1][c];
+      if (dl_sp < nsb) {
+        __global const uint* src = (__global const uint*)(raw + ((size_t)min(r0 + dl_r, N - 1) * nsb + dl_sp) * BBP);
+#pragma unroll
+        for (int c = 0; c < WIN_CALLS; ++c) ring[GEMV_DEEP - 1][c] = intel_sub_group_block_read(src + c * 16);
+      }
+      if (++dl_r == GROWS) { dl_r = 0; dl_sp += 2; }
+#elif defined(GEMV_DB)
+#pragma unroll
+      for (int c = 0; c < WIN_CALLS; ++c) win[c * 16 + lane] = nxt[c];
+      {
+        // the window after this one: row r + 1 of this step, or row 0 of the next step (none after the last)
+        const int nr = r + 1 < GROWS ? r + 1 : 0, nsp = r + 1 < GROWS ? sp : sp + sks;
+        if (nsp < nsb) {
+          __global const uint* src = (__global const uint*)(raw + ((size_t)min(r0 + nr, N - 1) * nsb + nsp) * BBP);
+#pragma unroll
+          for (int c = 0; c < WIN_CALLS; ++c) nxt[c] = intel_sub_group_block_read(src + c * 16);
+        }
+      }
+#else
+      const int n = min(r0 + r, N - 1);
+#if GV_PROBE == 2
+      // probe 2 (decode only): always the row's first two superblocks (they stay in cache), full decode
+      __global const uint* src = (__global const uint*)(raw + ((size_t)n * nsb) * BBP);
+#else
+      __global const uint* src = (__global const uint*)(raw + ((size_t)n * nsb + sp) * BBP);
+#endif
+#pragma unroll
+      for (int c = 0; c < WIN_CALLS; ++c) win[c * 16 + lane] = intel_sub_group_block_read(src + c * 16);
+#endif
+      sub_group_barrier(CLK_LOCAL_MEM_FENCE);
+      uint w[8];
+      int sc0, sc1, mn0, mn1;
+      float d, dmin;
+#if GV_PROBE == 1
+      // probe 1 (reads only): the window's words as the weights, no codebook, no bit work
+      for (int i = 0; i < 8; ++i) w[i] = win[(lane * 8 + i) % WIN_U];
+      sc0 = sc1 = 1; mn0 = mn1 = 0; d = 1.0f; dmin = 0.0f;
+#else
+      decode32(IQ3_AT((const uchar*)win + (lane / 8) * BBP, lane / 8, lane % 8), grid, aux, w, &sc0, &sc1, &mn0, &mn1, &d, &dmin);
+#endif
+      sub_group_barrier(CLK_LOCAL_MEM_FENCE);
+      int lo = dot_4x8packed_ss_int(a8.s0, w[0]);
+      lo += dot_4x8packed_ss_int(a8.s1, w[1]);
+      lo += dot_4x8packed_ss_int(a8.s2, w[2]);
+      lo += dot_4x8packed_ss_int(a8.s3, w[3]);
+      int hi = dot_4x8packed_ss_int(a8.s4, w[4]);
+      hi += dot_4x8packed_ss_int(a8.s5, w[5]);
+      hi += dot_4x8packed_ss_int(a8.s6, w[6]);
+      hi += dot_4x8packed_ss_int(a8.s7, w[7]);
+#if QT == Q2_K || QT == Q4_K || QT == Q5_K
+      acc[r] += sa * (d * (float)(sc0 * lo + sc1 * hi) - dmin * (float)(mn0 * bs0 + mn1 * bs1));
+#else
+      acc[r] += sa * d * (float)(sc0 * lo + sc1 * hi);
+#endif
+#ifdef Q2F
+      int lo2 = dot_4x8packed_ss_int(r8.s0, w[0]);
+      lo2 += dot_4x8packed_ss_int(r8.s1, w[1]);
+      lo2 += dot_4x8packed_ss_int(r8.s2, w[2]);
+      lo2 += dot_4x8packed_ss_int(r8.s3, w[3]);
+      int hi2 = dot_4x8packed_ss_int(r8.s4, w[4]);
+      hi2 += dot_4x8packed_ss_int(r8.s5, w[5]);
+      hi2 += dot_4x8packed_ss_int(r8.s6, w[6]);
+      hi2 += dot_4x8packed_ss_int(r8.s7, w[7]);
+#if QT == Q2_K || QT == Q4_K || QT == Q5_K
+      acc2[r] += sr * (d * (float)(sc0 * lo2 + sc1 * hi2) - dmin * (float)(mn0 * rs0 + mn1 * rs1));
+#else
+      acc2[r] += sr * d * (float)(sc0 * lo2 + sc1 * hi2);
+#endif
+#endif
+    }
+  }
+#endif  // (the window form)
+#pragma unroll
+  for (int r = 0; r < GROWS; ++r) {
+#ifdef Q2F
+    const float v = sub_group_reduce_add(acc[r]), v2 = sub_group_reduce_add(acc2[r]);
+    const int n = r0 + r;
+    if (lane == 0 && n < N) Q2F_STORE(n, v, v2);
+#elif defined(SPLITK)
+    acc[r] = sub_group_reduce_add(acc[r]);
+#else
+    const float v = HEAD_OUT(sub_group_reduce_add(acc[r]));
+    const int n = r0 + r;
+    if (lane == 0 && n < N) C[c_off + n] = accumulate ? C[c_off + n] + v : v;
+#endif
+  }
+#if defined(SPLITK) && !defined(Q2F)
+  __local float part[16][GROWS];
+  const int sg = get_sub_group_id() & 15;
+  if (lane == 0) {
+#pragma unroll
+    for (int r = 0; r < GROWS; ++r) part[sg][r] = acc[r];
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (kj == 0 && lane == 0) {
+#pragma unroll
+    for (int r = 0; r < GROWS; ++r) {
+      float t = part[sg][r];
+      for (int j = 1; j < SPLITK; ++j) t += part[sg + j][r];
+      const float v = HEAD_OUT(t);
+      const int n = r0 + r;
+      if (n < N) C[c_off + n] = accumulate ? C[c_off + n] + v : v;
+    }
+  }
+#endif
+}
+
+#if VB_TYPE || defined(GRID_OFF)
+// GEMVs that read the weights straight into registers (gemv_v: one token, gemv_mt_v: TB tokens): IQ4_XS, and Q6_K
+// for output heads. As gemv / gemv_mt, lane l handles 32-element block (l % 8) of superblock (sp + l / 8), the 16
+// lanes two contiguous superblocks; but each lane vector-loads its own bytes from global memory instead of the
+// sub-group staging the window in local memory (block reads, two barriers, byte-wise rd32 from local memory): about
+// half the instructions per weight, which matters where decoding, not memory, was the limit. IQ4_XS's 16 codebook
+// values come from four local tables pre-shifted into byte 0..3, so a packed int8x4 word is four lookups ORed
+// together. Same arithmetic as gemv / gemv_mt: bit-identical results. Measured (gemv_bench, weights streaming from
+// memory): E4B IQ4_XS matrices 44-65 -> 67-70 GB/s, Q6_K output heads 66-67 -> 72 GB/s; Q4_K / Q5_K matrices were
+// as fast or faster with gemv (their decoding is cheap and every lane would reload the shared header), so they
+// stay there. Q4_0 (Google's QAT Gemma 4) in its regrouped GPU form: one 16-byte vector load per block.
+#if QT == IQ4_XS || QT == IQ4_NL || QT == MXFP4
+#define VB_TABLES 64
+#if QT == MXFP4
+#define VB_TAB TAB_KFP4
+#else
+#define VB_TAB TAB_KVAL
+#endif
+inline void vb_tables(__local uint* kt, __global const uint* tabs) {
+  if (get_local_id(0) < 64) {
+    const int t = get_local_id(0) / 16, v = get_local_id(0) % 16;
+    kt[t * 16 + v] = ((tabs[VB_TAB + v / 4] >> (8 * (v % 4))) & 0xFFu) << (8 * t);
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+}
+#elif defined(GRID_OFF)
+// codebook types (IQ1_M, IQ2_*, IQ3_*): the codebook (and the sign table) staged in local memory; each lane loads
+// its superblock into registers with 8-byte vector loads and decodes its block there with decode32 (gemv decoded
+// from a sub-group-staged local window with byte-wise reads: 27-61 GB/s on these types)
+#if defined(AUX_OFF) && defined(SGN_MASKS)
+// (-DSGN_MASKS: the sign table expanded to byte masks, 128 x (low word, high word): apply_signs4 becomes
+//  (g ^ m) + (m & 0x01010101) with m read from local memory, no per-word multiplies; the same words)
+#define VB_TABLES (GRID_N + 256)
+#elif defined(AUX_OFF)
+#define VB_TABLES (GRID_N + AUX_N)
+#elif defined(SGN_MASKS) && (QT == IQ3_S || QT == IQ2_S)
+#define VB_TABLES (GRID_N + 512)  // (sign bytes stored directly: 256 x (low mask, high mask))
+#else
+#define VB_TABLES GRID_N
+#endif
+inline void vb_tables(__local uint* kt, __global const uint* tabs) {
+  // (four loads in flight before their stores: the staging loop otherwise waits for each load in turn, eight
+  // round trips for IQ2_S's 2048 words with 256 work-items)
+  const int ls = get_local_size(0);
+  int i = get_local_id(0);
+  for (; i + 3 * ls < GRID_N; i += 4 * ls) {
+    const uint t0 = tabs[GRID_OFF + i], t1 = tabs[GRID_OFF + i + ls], t2 = tabs[GRID_OFF + i + 2 * ls],
+               t3 = tabs[GRID_OFF + i + 3 * ls];
+    kt[i] = t0;
+    kt[i + ls] = t1;
+    kt[i + 2 * ls] = t2;
+    kt[i + 3 * ls] = t3;
+  }
+  for (; i < GRID_N; i += ls) kt[i] = tabs[GRID_OFF + i];
+#if defined(AUX_OFF) && defined(SGN_MASKS)
+  for (int i = get_local_id(0); i < 128; i += get_local_size(0)) {
+    const uint sg = (tabs[AUX_OFF + i / 4] >> (8 * (i % 4))) & 0xFFu;
+    kt[GRID_N + 2 * i] = ((((sg & 0xFu) * 0x00204081u) & 0x01010101u) * 0xFFu);
+    kt[GRID_N + 2 * i + 1] = ((((sg >> 4) * 0x00204081u) & 0x01010101u) * 0xFFu);
+  }
+#elif defined(AUX_OFF)
+  for (int i = get_local_id(0); i < AUX_N; i += get_local_size(0)) kt[GRID_N + i] = tabs[AUX_OFF + i];
+#elif defined(SGN_MASKS) && (QT == IQ3_S || QT == IQ2_S)
+  for (int i = get_local_id(0); i < 256; i += get_local_size(0)) {
+    kt[GRID_N + 2 * i] = (((((uint)i & 0xFu) * 0x00204081u) & 0x01010101u) * 0xFFu);
+    kt[GRID_N + 2 * i + 1] = (((((uint)i >> 4) * 0x00204081u) & 0x01010101u) * 0xFFu);
+  }
+#endif
+  barrier(CLK_LOCAL_MEM_FENCE);
+}
+inline uint apply_mask4(uint g, uint m) { return (g ^ m) + (m & 0x01010101u); }
+#else
+#define VB_TABLES 1
+inline void vb_tables(__local uint* kt, __global const uint* tabs) {}
+#endif
+// Block ib of the superblock at p, as decode32: 32 int8 weights packed in w (elements 4k..4k+3 in w[k]) and the
+// scales of its two 16-element halves (dmin / mins: 0, kept for decode32's interface).
+inline void vblock(__global const uchar* p, int ib, __local const uint* kt, uint* w, float* d, float* dmin, int* sc0,
+                   int* sc1, int* mn0, int* mn1) {
+  __global const uint* pu = (__global const uint*)p;
+#if QT == AR4_128
+  *d = f16(((__global const ushort*)p)[ib / 4]);
+  *dmin = 0.0f; *sc0 = *sc1 = 1; *mn0 = *mn1 = 0;
+  ar4_unpack(vload4(0, pu + 1 + 4 * ib), w);
+#elif QT == IQ4_XS
+  const uint2 h = vload2(0, pu);
+  const uint4 q = vload4(0, (__global const uint*)(p + 8 + 16 * ib));
+  *d = f16(h.x & 0xFFFFu);
+  *dmin = 0.0f;
+  *sc0 = *sc1 = (int)(((h.y >> (4 * ib)) & 0xFu) | (((h.x >> (16 + 2 * ib)) & 3u) << 4)) - 32;
+  *mn0 = *mn1 = 0;
+#pragma unroll
+  for (int k = 0; k < 4; ++k) {
+    const uint bk = k == 0 ? q.x : k == 1 ? q.y : k == 2 ? q.z : q.w;
+    w[k] = kt[bk & 15u] | kt[16 + ((bk >> 8) & 15u)] | kt[32 + ((bk >> 16) & 15u)] | kt[48 + ((bk >> 24) & 15u)];
+    w[4 + k] = kt[(bk >> 4) & 15u] | kt[16 + ((bk >> 12) & 15u)] | kt[32 + ((bk >> 20) & 15u)] | kt[48 + (bk >> 28)];
+  }
+#elif QT == Q6_K
+  const int nn = ib / 4, quarter = ib % 4;
+  const uint8 L = vload8(0, (__global const uint*)(p + 64 * nn + ((quarter & 1) ? 32 : 0)));
+  const uint8 H = vload8(0, (__global const uint*)(p + 128 + 32 * nn));
+  const uint sw = *(__global const ushort*)(p + 192 + 2 * ib);
+  *d = f16(*(__global const ushort*)(p + 208));
+  *dmin = 0.0f;
+  *sc0 = (char)(sw & 0xFFu);
+  *sc1 = (char)(sw >> 8);
+  *mn0 = *mn1 = 0;
+  const int lsh = quarter >= 2 ? 4 : 0, hsh = 2 * quarter;
+#pragma unroll
+  for (int k = 0; k < 8; ++k) w[k] = sub32_bytes(((L[k] >> lsh) & 0x0F0F0F0Fu) | (((H[k] >> hsh) & 0x03030303u) << 4));
+#elif QT == Q8_0
+  const uint8 q = vload8(0, pu + 4 + 8 * ib);
+  *d = f16(((__global const ushort*)p)[ib]);
+  *dmin = 0.0f;
+  *sc0 = *sc1 = 1;
+  *mn0 = *mn1 = 0;
+  w[0] = q.s0; w[1] = q.s1; w[2] = q.s2; w[3] = q.s3; w[4] = q.s4; w[5] = q.s5; w[6] = q.s6; w[7] = q.s7;
+#elif QT == IQ4_NL
+  const uint4 q = vload4(0, pu + 4 + 4 * ib);
+  *d = f16(((__global const ushort*)p)[ib]);
+  *dmin = 0.0f;
+  *sc0 = *sc1 = 1;
+  *mn0 = *mn1 = 0;
+#pragma unroll
+  for (int k = 0; k < 4; ++k) {
+    const uint bk = k == 0 ? q.x : k == 1 ? q.y : k == 2 ? q.z : q.w;
+    w[k] = kt[bk & 15u] | kt[16 + ((bk >> 8) & 15u)] | kt[32 + ((bk >> 16) & 15u)] | kt[48 + ((bk >> 24) & 15u)];
+    w[4 + k] = kt[(bk >> 4) & 15u] | kt[16 + ((bk >> 12) & 15u)] | kt[32 + ((bk >> 20) & 15u)] | kt[48 + (bk >> 28)];
+  }
+#elif QT == MXFP4
+  const uint4 q = vload4(0, pu + 2 + 4 * ib);
+  *d = e8m0_half(p[ib]);
+  *dmin = 0.0f;
+  *sc0 = *sc1 = 1;
+  *mn0 = *mn1 = 0;
+#pragma unroll
+  for (int k = 0; k < 4; ++k) {
+    const uint bk = k == 0 ? q.x : k == 1 ? q.y : k == 2 ? q.z : q.w;
+    w[k] = kt[bk & 15u] | kt[16 + ((bk >> 8) & 15u)] | kt[32 + ((bk >> 16) & 15u)] | kt[48 + ((bk >> 24) & 15u)];
+    w[4 + k] = kt[(bk >> 4) & 15u] | kt[16 + ((bk >> 12) & 15u)] | kt[32 + ((bk >> 20) & 15u)] | kt[48 + (bk >> 28)];
+  }
+#elif QT == Q2_0
+  const uint2 q = vload2(0, (__global const uint*)(p + 8 + 16 * (ib / 2) + 8 * (ib % 2)));
+  *d = f16(((__global const ushort*)p)[ib / 2]);
+  *dmin = 0.0f;
+  *sc0 = *sc1 = 1;
+  *mn0 = *mn1 = 0;
+#pragma unroll
+  for (int k = 0; k < 4; ++k) {
+    w[k] = q2_word((q.x >> (8 * k)) & 0xFFu);
+    w[4 + k] = q2_word((q.y >> (8 * k)) & 0xFFu);
+  }
+#elif QT == Q4_0
+  const uint4 q = vload4(0, pu + 4 + 4 * ib);
+  *d = f16(((__global const ushort*)p)[ib]);
+  *dmin = 0.0f;
+  *sc0 = *sc1 = 1;
+  *mn0 = *mn1 = 0;
+#pragma unroll
+  for (int k = 0; k < 4; ++k) {
+    const uint qk = k == 0 ? q.x : k == 1 ? q.y : k == 2 ? q.z : q.w;
+    w[k] = sub8_bytes(qk & 0x0F0F0F0Fu);
+    w[4 + k] = sub8_bytes((qk >> 4) & 0x0F0F0F0Fu);
+  }
+#elif defined(GRID_OFF)
+  // codebook types: the block's bytes with 16-bit vector loads (offsets 2 mod 4), codebook / signs from local memory
+  __global const ushort* ps = (__global const ushort*)p;
+  __local const uchar* ksg = (__local const uchar*)(kt + GRID_N);  // (types with a sign table)
+  // (-DGV_SGNPOP, 2026-11-22: the sign table computed, not read: ksigns_iq2xs[i] is i with its parity as bit 7 (all 128
+  //  entries, src/iq_tables.h), so the 4 random local-memory reads a 32-block become a popcount; the same values)
+#ifdef GV_SGNPOP
+#define KSG(i) ((uint)(i) | ((popcount((uint)(i)) & 1u) << 7))
+#else
+#define KSG(i) ((uint)ksg[i])
+#endif
+  *dmin = 0.0f;
+  *mn0 = *mn1 = 0;
+#if QT == IQ3_XXS
+  *d = f16(ps[(BB - 2) / 2]) * 0.25f;
+  const ushort4 qv = as_ushort4(vload2(ib, pu));
+  const uint a = pu[16 + ib];
+  *sc0 = *sc1 = 1 + 2 * (int)(a >> 28);
+  const uint qq[4] = {qv.x, qv.y, qv.z, qv.w};
+#pragma unroll
+  for (int l = 0; l < 4; ++l) {
+#ifdef SGN_MASKS
+    const uint2 m = vload2((a >> (7 * l)) & 127, kt + GRID_N);
+    w[2 * l] = apply_mask4(kt[qq[l] & 0xFF], m.x);
+    w[2 * l + 1] = apply_mask4(kt[qq[l] >> 8], m.y);
+#else
+    const uint sg = KSG((a >> (7 * l)) & 127);
+    w[2 * l] = apply_signs4(kt[qq[l] & 0xFF], sg & 0xF);
+    w[2 * l + 1] = apply_signs4(kt[qq[l] >> 8], sg >> 4);
+#endif
+  }
+#elif QT == IQ2_XXS
+  *d = f16(ps[(BB - 2) / 2]) * 0.125f;
+  const uint2 qa = vload2(ib, pu);
+  const uint a0 = qa.x, a1 = qa.y;
+  *sc0 = *sc1 = 1 + 2 * (int)(a1 >> 28);
+#pragma unroll
+  for (int l = 0; l < 4; ++l) {
+#ifdef SGN_MASKS
+    const uint gi = (a0 >> (8 * l)) & 0xFF;
+    const uint2 m = vload2((a1 >> (7 * l)) & 127, kt + GRID_N);
+    w[2 * l] = apply_mask4(kt[2 * gi], m.x);
+    w[2 * l + 1] = apply_mask4(kt[2 * gi + 1], m.y);
+#else
+    const uint gi = (a0 >> (8 * l)) & 0xFF, sg = KSG((a1 >> (7 * l)) & 127);
+    w[2 * l] = apply_signs4(kt[2 * gi], sg & 0xF);
+    w[2 * l + 1] = apply_signs4(kt[2 * gi + 1], sg >> 4);
+#endif
+  }
+#elif QT == IQ3_S && defined(IQ3T)
+  // (tiled rows, ARC_IQ3S_TILE: these per-lane loads of one superblock cannot read them; the engine takes gemv /
+  //  gemv_mt for such a weight. Every kernel of the file is built, so not an #error: a NaN scale, which no result
+  //  could hide, should one ever get here)
+  *d = NAN;
+  *dmin = 0.0f;
+  *sc0 = *sc1 = 1;
+  *mn0 = *mn1 = 0;
+#pragma unroll
+  for (int k = 0; k < 8; ++k) w[k] = 0;
+#elif QT == IQ3_S
+  *d = f16(ps[(BB - 2) / 2]);
+  const ushort4 qv = as_ushort4(vload2(ib, pu));
+  const uint sgn = pu[18 + ib], h = (pu[16 + ib / 4] >> (8 * (ib % 4))) & 0xFF;
+  *sc0 = *sc1 = 1 + 2 * (int)((pu[26] >> (4 * ib)) & 0xF);
+  const uint qq[4] = {qv.x, qv.y, qv.z, qv.w};
+#pragma unroll
+  for (int l = 0; l < 4; ++l) {
+    const uint g1 = (qq[l] & 0xFF) | ((h << (8 - 2 * l)) & 256), g2 = (qq[l] >> 8) | ((h << (7 - 2 * l)) & 256);
+#ifdef SGN_MASKS
+    const uint2 m = vload2((sgn >> (8 * l)) & 0xFF, kt + GRID_N);
+    w[2 * l] = apply_mask4(kt[g1], m.x);
+    w[2 * l + 1] = apply_mask4(kt[g2], m.y);
+#else
+    const uint sg = (sgn >> (8 * l)) & 0xFF;
+    w[2 * l] = apply_signs4(kt[g1], sg & 0xF);
+    w[2 * l + 1] = apply_signs4(kt[g2], sg >> 4);
+#endif
+  }
+#elif QT == IQ2_XS
+  *d = f16(ps[(BB - 2) / 2]) * 0.125f;
+  const ushort4 qv = as_ushort4(vload2(ib, pu));
+  const uint scb = (pu[16 + ib / 4] >> (8 * (ib % 4))) & 0xFF;
+  *sc0 = 1 + 2 * (int)(scb & 0xF);
+  *sc1 = 1 + 2 * (int)(scb >> 4);
+  const uint qq[4] = {qv.x, qv.y, qv.z, qv.w};
+#pragma unroll
+  for (int l = 0; l < 4; ++l) {
+#ifdef SGN_MASKS
+    const uint gi = qq[l] & 511;
+    const uint2 m = vload2(qq[l] >> 9, kt + GRID_N);
+    w[2 * l] = apply_mask4(kt[2 * gi], m.x);
+    w[2 * l + 1] = apply_mask4(kt[2 * gi + 1], m.y);
+#else
+    const uint gi = qq[l] & 511, sg = KSG(qq[l] >> 9);
+    w[2 * l] = apply_signs4(kt[2 * gi], sg & 0xF);
+    w[2 * l + 1] = apply_signs4(kt[2 * gi + 1], sg >> 4);
+#endif
+  }
+#elif QT == IQ2_S
+  *d = f16(ps[(BB - 2) / 2]) * 0.125f;
+  const uint qs4 = pu[ib], sg4 = pu[8 + ib];
+  const uint h = (pu[16 + ib / 4] >> (8 * (ib % 4))) & 0xFF, scb = (pu[18 + ib / 4] >> (8 * (ib % 4))) & 0xFF;
+  *sc0 = 1 + 2 * (int)(scb & 0xF);
+  *sc1 = 1 + 2 * (int)(scb >> 4);
+#pragma unroll
+  for (int l = 0; l < 4; ++l) {
+    const uint gi = ((qs4 >> (8 * l)) & 0xFF) | ((h << (8 - 2 * l)) & 0x300), sg = (sg4 >> (8 * l)) & 0xFF;
+#ifdef SGN_MASKS
+    const uint2 m = vload2(sg, kt + GRID_N);
+    w[2 * l] = apply_mask4(kt[2 * gi], m.x);
+    w[2 * l + 1] = apply_mask4(kt[2 * gi + 1], m.y);
+#else
+    w[2 * l] = apply_signs4(kt[2 * gi], sg & 0xF);
+    w[2 * l + 1] = apply_signs4(kt[2 * gi + 1], sg >> 4);
+#endif
+  }
+#else
+  // (other codebook types, IQ1_M: decode32 from global memory, byte-wise)
+#ifdef AUX_OFF
+  decode32((const uchar*)p, ib, (const uint*)kt, (const uint*)(kt + GRID_N), w, sc0, sc1, mn0, mn1, d, dmin);
+#else
+  decode32((const uchar*)p, ib, (const uint*)kt, (const uint*)kt, w, sc0, sc1, mn0, mn1, d, dmin);
+#endif
+#endif
+#endif
+}
+// decode_w8_sb for the types with a vector block decoder (vblock: the bytes loaded straight from global memory, no
+// private copy of the superblock indexed byte by byte), scales + mins-free types only. grid (N, K/256), local (LSZ, 1)
+// with LSZ dividing N and >= 64.
+__kernel void decode_w8_vb(__global const uchar* raw, int N, int K, __global const uint* tabs, __global uint* wq,
+                           __global uint* wh) {
+  __local uint kt[VB_TABLES];
+  vb_tables(kt, tabs);
+  const int n = get_global_id(0), s = get_global_id(1);
+  const int nsb = K / 256, g = n / GL, lane = n % GL;
+  if (n >= N) return;
+  __global const uchar* p = raw + ((size_t)n * nsb + s) * BBP;
+  __global uint* hd = wh + ((size_t)g * nsb + s) * HSTR * GL;
+  uint scw[4] = {0, 0, 0, 0};
+  float d0 = 0.0f;
+#pragma unroll
+  for (int ib = 0; ib < 8; ++ib) {
+    uint w[8];
+    int sc0, sc1, mn0, mn1;
+    float d, dmin;
+    vblock(p, ib, kt, w, &d, &dmin, &sc0, &sc1, &mn0, &mn1);
+    __global uint* dst = wq + (((size_t)g * nsb + s) * 4 + ib / 2) * 16 * GL + (ib % 2) * 8 * GL + lane;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) dst[k * GL] = w[k];
+#if PER32
+    hd[ib * GL + lane] = as_uint(d);
+#else
+    const int b0 = 2 * ib, b1 = 2 * ib + 1;
+    scw[b0 / 4] |= (uint)(uchar)(char)sc0 << (8 * (b0 % 4));
+    scw[b1 / 4] |= (uint)(uchar)(char)sc1 << (8 * (b1 % 4));
+    d0 = d;
+#endif
+  }
+#if !PER32
+  hd[0 * GL + lane] = as_uint(d0);
+  hd[1 * GL + lane] = 0u;
+#pragma unroll
+  for (int f = 0; f < 4; ++f) {
+    hd[(2 + f) * GL + lane] = scw[f];
+    hd[(6 + f) * GL + lane] = 0u;
+  }
+#endif
+}
+
+__attribute__((intel_reqd_sub_group_size(16)))
+__kernel void gemv_v(__global const uchar* raw, int N, int K, __global const uint* tabs, __global const char* aq,
+                     __global const float* asc, __global const ushort* absum, int M, __global float* C, int c_off,
+                     int accumulate GU2_ARG) {
+  __local uint kt[VB_TABLES];
+  vb_tables(kt, tabs);
+  const int lane = get_sub_group_local_id();
+#ifdef SPLITK
+  // (-DSPLITK=S as in gemv: S sub-groups share a row group, each taking every S-th step; sums added in a fixed order)
+  const int kj = (int)(get_global_id(0) / 16) % SPLITK;
+  int r0 = (int)((get_global_id(0) / 16) / SPLITK) * GROWS;
+  const int sk0 = 2 * kj, sks = 2 * SPLITK;
+#else
+  int r0 = (get_global_id(0) / 16) * GROWS;
+  const int sk0 = 0, sks = 2;
+#endif
+  GU2_SWITCH(r0)
+  const int nsb = K / 256, ib = lane % 8, hs = lane / 8;
+  float acc[GROWS];
+#pragma unroll
+  for (int r = 0; r < GROWS; ++r) acc[r] = 0.0f;
+#ifdef Q2F
+  float acc2[GROWS];
+#pragma unroll
+  for (int r = 0; r < GROWS; ++r) acc2[r] = 0.0f;
+#endif
+  for (int sp = sk0; sp < nsb; sp += sks) {
+    const int b = sp * 8 + lane;
+    const bool has = sp + hs < nsb;
+    const int s = has ? sp + hs : sp;
+    const uint8 a8 = has ? vload8(0, (__global const uint*)(aq + 32 * b)) : (uint8)0;
+    const float sa = has ? asc[(size_t)b * M] : 0.0f;
+#ifdef Q2F
+    const uint8 r8 = has ? vload8(0, (__global const uint*)(aq + Q2_AQ + 32 * b)) : (uint8)0;
+    const float sr = has ? asc[Q2_SC + (size_t)b * M] : 0.0f;
+#endif
+#pragma unroll
+    for (int r = 0; r < GROWS; ++r) {
+      uint w[8];
+      float d, dmin;
+      int sc0, sc1, mn0, mn1;
+      const int row = min(r0 + r, N - 1);
+      vblock(raw + ((size_t)row * nsb + s) * BBP, ib, kt, w, &d, &dmin, &sc0, &sc1, &mn0, &mn1);
+      int lo = dot_4x8packed_ss_int(a8.s0, w[0]);
+      lo += dot_4x8packed_ss_int(a8.s1, w[1]);
+      lo += dot_4x8packed_ss_int(a8.s2, w[2]);
+      lo += dot_4x8packed_ss_int(a8.s3, w[3]);
+      int hi = dot_4x8packed_ss_int(a8.s4, w[4]);
+      hi += dot_4x8packed_ss_int(a8.s5, w[5]);
+      hi += dot_4x8packed_ss_int(a8.s6, w[6]);
+      hi += dot_4x8packed_ss_int(a8.s7, w[7]);
+      acc[r] += sa * d * (float)(sc0 * lo + sc1 * hi);
+#ifdef Q2F
+      int lo2 = dot_4x8packed_ss_int(r8.s0, w[0]);
+      lo2 += dot_4x8packed_ss_int(r8.s1, w[1]);
+      lo2 += dot_4x8packed_ss_int(r8.s2, w[2]);
+      lo2 += dot_4x8packed_ss_int(r8.s3, w[3]);
+      int hi2 = dot_4x8packed_ss_int(r8.s4, w[4]);
+      hi2 += dot_4x8packed_ss_int(r8.s5, w[5]);
+      hi2 += dot_4x8packed_ss_int(r8.s6, w[6]);
+      hi2 += dot_4x8packed_ss_int(r8.s7, w[7]);
+      acc2[r] += sr * d * (float)(sc0 * lo2 + sc1 * hi2);
+#endif
+    }
+  }
+#pragma unroll
+  for (int r = 0; r < GROWS; ++r) {
+#ifdef Q2F
+    const float v = sub_group_reduce_add(acc[r]), v2 = sub_group_reduce_add(acc2[r]);
+    const int n = r0 + r;
+    if (lane == 0 && n < N) Q2F_STORE(n, v, v2);
+#elif defined(SPLITK)
+    acc[r] = sub_group_reduce_add(acc[r]);
+#else
+    const float v = HEAD_OUT(sub_group_reduce_add(acc[r]));
+    const int n = r0 + r;
+    if (lane == 0 && n < N) C[c_off + n] = accumulate ? C[c_off + n] + v : v;
+#endif
+  }
+#if defined(SPLITK) && !defined(Q2F)
+  __local float part[16][GROWS];
+  const int sg = get_sub_group_id() & 15;
+  if (lane == 0) {
+#pragma unroll
+    for (int r = 0; r < GROWS; ++r) part[sg][r] = acc[r];
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  if (kj == 0 && lane == 0) {
+#pragma unroll
+    for (int r = 0; r < GROWS; ++r) {
+      float t = part[sg][r];
+      for (int j = 1; j < SPLITK; ++j) t += part[sg + j][r];
+      const float v = HEAD_OUT(t);
+      const int n = r0 + r;
+      if (n < N) C[c_off + n] = accumulate ? C[c_off + n] + v : v;
+    }
+  }
+#endif
+}
+#ifndef TB
+#define TB 2
+#endif
+__attribute__((intel_reqd_sub_group_size(16)))
+__kernel void gemv_mt_v(__global const uchar* raw, int N, int K, __global const uint* tabs, __global const char* aq,
+                        __global const float* asc, __global const ushort* absum, int M, int T, __global float* C,
+                        int ldc, int c_off, int accumulate) {
+  // Token-outer form: the GROWS rows' blocks are decoded first, then each token's activations are loaded once for
+  // all rows (instead of once per row: half the activation reads with 2 rows, one scale load per token
+  // instead of one per row and token), each half block (4 words) one half ahead of its use, so a load is always in
+  // flight. The rows' dot chains are written interleaved (the compiler keeps source order). No per-token branches:
+  // tokens t >= T read token T - 1's bytes (results never stored); lanes past the last superblock (odd nsb) read a
+  // valid block and multiply by a zero scale (st = 0, as before: the term is +-0). Same integer sums and the same
+  // float expression per (row, token): bit-identical to the row-outer form.
+#ifndef MT_ONESC
+#if QT == IQ3_XXS || QT == IQ3_S || QT == IQ4_XS || QT == IQ2_XXS
+#define MT_ONESC 1  // (sc0 == sc1 by construction; -DMT_ONESC=0 for the two-chain form)
+#else
+#define MT_ONESC 0
+#endif
+#endif
+// -DQ2F (two-pass mode, built with TB = 2 x the tokens): slots TB / 2 .. TB - 1 are the residuals of tokens 0 ..
+// TB / 2 - 1 (at -DQ2_AQ / -DQ2_SC), each slot computed as before; the store adds a token's residual sum to its value
+// as the second launch did. Otherwise slot t is token min(t, T - 1).
+#ifdef Q2F
+#define MT_TH (TB / 2)
+#define MT_TOK(t) min((t) % MT_TH, T - 1)
+#define MT_APO(t) (((t) >= MT_TH ? Q2_AQ / 4 : 0) + (size_t)MT_TOK(t) * K4)
+#define MT_SCO(t) (((t) >= MT_TH ? Q2_SC : 0) + MT_TOK(t))
+#else
+#define MT_APO(t) ((size_t)min((t), T - 1) * K4)
+#define MT_SCO(t) min((t), T - 1)
+#endif
+  __local uint kt[VB_TABLES];
+  vb_tables(kt, tabs);
+  const int lane = get_sub_group_local_id(), r0 = (get_global_id(0) / 16) * GROWS;
+  const int nsb = K / 256, ib = lane % 8, hs = lane / 8, K4 = K / 4;
+  __global const uchar* rp[GROWS];
+#pragma unroll
+  for (int r = 0; r < GROWS; ++r) rp[r] = raw + (size_t)min(r0 + r, N - 1) * nsb * BBP;
+  float acc[GROWS][TB];
+#pragma unroll
+  for (int r = 0; r < GROWS; ++r)
+#pragma unroll
+    for (int t = 0; t < TB; ++t) acc[r][t] = 0.0f;
+  for (int sp = 0; sp < nsb; sp += 2) {
+    const bool has = sp + hs < nsb;
+    const int s = has ? sp + hs : sp;
+    const int b = s * 8 + ib;
+    __global const uint* ap = (__global const uint*)aq + 8 * b;
+    __global const float* ascb = asc + (size_t)b * M;
+    // half-token pipeline: words 0..3 (lo) / 4..7 (hi) of a token's block, one half loaded ahead of its use
+    uint4 an = vload4(0, ap);  // token 0, lo half: in flight while the weights are decoded
+    float sn = ascb[0];
+    uint w[GROWS][8];
+    float dr[GROWS];
+    int s0r[GROWS], s1r[GROWS];
+#pragma unroll
+    for (int r = 0; r < GROWS; ++r) {
+      float dmin;
+      int mn0, mn1;
+      vblock(rp[r] + (size_t)s * BBP, ib, kt, w[r], &dr[r], &dmin, &s0r[r], &s1r[r], &mn0, &mn1);
+    }
+#pragma unroll
+    for (int t = 0; t < TB; ++t) {
+      __global const uint* apt = ap + MT_APO(t);
+      const uint4 al = an;
+      const float st = has ? sn : 0.0f;
+      an = vload4(1, apt);  // this token's hi half
+#if MT_ONESC
+      // (one scale per block: one chain of 8 per row, lo + hi summed in the chain: the same integer)
+      int x[GROWS];
+#pragma unroll
+      for (int r = 0; r < GROWS; ++r) x[r] = dot_4x8packed_ss_int(al.x, w[r][0]);
+#pragma unroll
+      for (int r = 0; r < GROWS; ++r) x[r] += dot_4x8packed_ss_int(al.y, w[r][1]);
+#pragma unroll
+      for (int r = 0; r < GROWS; ++r) x[r] += dot_4x8packed_ss_int(al.z, w[r][2]);
+#pragma unroll
+      for (int r = 0; r < GROWS; ++r) x[r] += dot_4x8packed_ss_int(al.w, w[r][3]);
+#else
+      int lo[GROWS], hi[GROWS];
+#pragma unroll
+      for (int r = 0; r < GROWS; ++r) lo[r] = dot_4x8packed_ss_int(al.x, w[r][0]);
+#pragma unroll
+      for (int r = 0; r < GROWS; ++r) lo[r] += dot_4x8packed_ss_int(al.y, w[r][1]);
+#pragma unroll
+      for (int r = 0; r < GROWS; ++r) lo[r] += dot_4x8packed_ss_int(al.z, w[r][2]);
+#pragma unroll
+      for (int r = 0; r < GROWS; ++r) lo[r] += dot_4x8packed_ss_int(al.w, w[r][3]);
+#endif
+      const uint4 ah = an;
+      if (t + 1 < TB) {  // next token's lo half and scale
+        an = vload4(0, ap + MT_APO(t + 1));
+        sn = ascb[MT_SCO(t + 1)];  // (a runtime index: not merged into one 8-float load, 14 registers fewer)
+      }
+#if MT_ONESC
+#pragma unroll
+      for (int r = 0; r < GROWS; ++r) x[r] += dot_4x8packed_ss_int(ah.x, w[r][4]);
+#pragma unroll
+      for (int r = 0; r < GROWS; ++r) x[r] += dot_4x8packed_ss_int(ah.y, w[r][5]);
+#pragma unroll
+      for (int r = 0; r < GROWS; ++r) x[r] += dot_4x8packed_ss_int(ah.z, w[r][6]);
+#pragma unroll
+      for (int r = 0; r < GROWS; ++r) x[r] += dot_4x8packed_ss_int(ah.w, w[r][7]);
+      // (float)(sc * x) == (float)x * (float)sc exactly: |sc * x| < 2^24 for these types (IQ4_XS: 32 * 32 * 127 *
+      // 127 = 16.5 M), so both are the exact product; the native float multiply replaces an emulated 32-bit one
+#pragma unroll
+      for (int r = 0; r < GROWS; ++r) acc[r][t] += st * dr[r] * ((float)x[r] * (float)s0r[r]);
+#else
+#pragma unroll
+      for (int r = 0; r < GROWS; ++r) hi[r] = dot_4x8packed_ss_int(ah.x, w[r][4]);
+#pragma unroll
+      for (int r = 0; r < GROWS; ++r) hi[r] += dot_4x8packed_ss_int(ah.y, w[r][5]);
+#pragma unroll
+      for (int r = 0; r < GROWS; ++r) hi[r] += dot_4x8packed_ss_int(ah.z, w[r][6]);
+#pragma unroll
+      for (int r = 0; r < GROWS; ++r) hi[r] += dot_4x8packed_ss_int(ah.w, w[r][7]);
+#pragma unroll
+      for (int r = 0; r < GROWS; ++r) acc[r][t] += st * dr[r] * (float)(s0r[r] * lo[r] + s1r[r] * hi[r]);
+#endif
+    }
+  }
+#ifdef Q2F
+#pragma unroll
+  for (int r = 0; r < GROWS; ++r)
+#pragma unroll
+    for (int t = 0; t < MT_TH; ++t) {
+      const float v = sub_group_reduce_add(acc[r][t]), v2 = sub_group_reduce_add(acc[r][t + MT_TH]);
+      const int n = r0 + r;
+      if (lane == 0 && n < N && t < T) {
+        __global float* dst = C + (size_t)t * ldc + c_off + n;
+        *dst = (accumulate ? *dst + v : v) + v2;
+      }
+    }
+#else
+#pragma unroll
+  for (int r = 0; r < GROWS; ++r)
+#pragma unroll
+    for (int t = 0; t < TB; ++t) {
+      const float v = HEAD_OUT(sub_group_reduce_add(acc[r][t]));
+      const int n = r0 + r;
+      if (lane == 0 && n < N && t < T) {
+        __global float* dst = C + (size_t)t * ldc + c_off + n;
+        *dst = accumulate ? *dst + v : v;
+      }
+    }
+#endif
+}
+#undef MT_APO
+#undef MT_SCO
+#endif
+// Matrix x few-tokens product on the padded raw rows (TB tokens share every weight read): used for small
+// batches such as speculative-decoding verification. Same structure as gemv; activations of token t are row t
+// (stride M) of the int8 layout. C[t * ldc + c_off + n] (+)= ... grid (ceil(N/GROWS)*16 rounded to 256), local 256.
+#ifndef TB
+#define TB 2
+#endif
+__attribute__((intel_reqd_sub_group_size(16)))
+__kernel void gemv_mt(__global const uchar* raw, int N, int K, __global const uint* tabs, __global const char* aq,
+                      __global const float* asc, __global const ushort* absum, int M, int T, __global float* C,
+                      int ldc, int c_off, int accumulate) {
+  // Token-outer form (as gemv_mt_v): the GROWS rows are staged and decoded first, then each token's activations
+  // are loaded once for all rows, half a block ahead of their use, without per-token branches (tokens t >= T
+  // read token T - 1, results not stored; lanes past the last superblock read a valid block and get a zero scale).
+  // Same integer sums and float expression per (row, token) as the row-outer form: bit-identical.
+  // (TB 8: GROWS 2 keeps the decoded rows and the 2 x 8 accumulators in registers.)
+  __local uint win_all[16][WIN_CALLS * 16];
+  // (win_all holds 16 sub-groups' windows: the launches use work-groups of 256 or 64. A larger group would share
+  //  windows, a silent race: it returns instead. Audit 2026-11-12 #7; uniform over the group, before any barrier)
+  if (get_num_sub_groups() > 16) return;
+  __local uint* win = win_all[get_sub_group_id() & 15];
+#ifdef GRID_OFF
+  __local uint lgrid[GRID_N];
+  for (int i = get_local_id(0); i < GRID_N; i += get_local_size(0)) lgrid[i] = tabs[GRID_OFF + i];
+  const uint* grid = lgrid;
+#else
+  const uint* grid = tabs;
+#endif
+#ifdef AUX_OFF
+  __local uint laux[AUX_N];
+  for (int i = get_local_id(0); i < AUX_N; i += get_local_size(0)) laux[i] = tabs[AUX_OFF + i];
+  const uint* aux = laux;
+#else
+  const uint* aux = tabs;
+#endif
+  barrier(CLK_LOCAL_MEM_FENCE);
+  const int lane = get_sub_group_local_id(), r0 = (get_global_id(0) / 16) * GROWS;
+  const int nsb = K / 256, K4 = K / 4;
+  float acc[GROWS][TB];
+#pragma unroll
+  for (int r = 0; r < GROWS; ++r)
+#pragma unroll
+    for (int t = 0; t < TB; ++t) acc[r][t] = 0.0f;
+  for (int sp = 0; sp < nsb; sp += 2) {
+    const bool has = sp + lane / 8 < nsb;
+    const int b = has ? sp * 8 + lane : sp * 8 + lane % 8;
+    __global const uint* ap = (__global const uint*)aq + 8 * b;
+    __global const float* ascb = asc + (size_t)b * M;
+#if QT == Q2_K || QT == Q4_K || QT == Q5_K
+    __global const short* ab0 = (__global const short*)absum + (size_t)(2 * b) * M;
+    __global const short* ab1 = ab0 + M;
+#endif
+    uint4 an = vload4(0, ap);
+    float sn = ascb[0];
+    uint w[GROWS][8];
+    int s0r[GROWS], s1r[GROWS], m0r[GROWS], m1r[GROWS];
+    float dr[GROWS], dmr[GROWS];
+#pragma unroll
+    for (int r = 0; r < GROWS; ++r) {
+      const int n = min(r0 + r, N - 1);
+      __global const uint* src = (__global const uint*)(raw + ((size_t)n * nsb + sp) * BBP);
+#pragma unroll
+      for (int c = 0; c < WIN_CALLS; ++c) win[c * 16 + lane] = intel_sub_group_block_read(src + c * 16);
+      sub_group_barrier(CLK_LOCAL_MEM_FENCE);
+      decode32(IQ3_AT((const uchar*)win + (lane / 8) * BBP, lane / 8, lane % 8), grid, aux, w[r], &s0r[r], &s1r[r], &m0r[r], &m1r[r],
+               &dr[r], &dmr[r]);
+      sub_group_barrier(CLK_LOCAL_MEM_FENCE);
+    }
+#pragma unroll
+    for (int t = 0; t < TB; ++t) {
+      const int tc = min(t, T - 1);
+      __global const uint* apt = ap + (size_t)tc * K4;
+      const uint4 al = an;
+      const float st = has ? sn : 0.0f;
+#if QT == Q2_K || QT == Q4_K || QT == Q5_K
+      const int b0 = ab0[tc], b1 = ab1[tc];
+#endif
+      an = vload4(1, apt);
+      int lo[GROWS], hi[GROWS];
+#pragma unroll
+      for (int r = 0; r < GROWS; ++r) lo[r] = dot_4x8packed_ss_int(al.x, w[r][0]);
+#pragma unroll
+      for (int r = 0; r < GROWS; ++r) lo[r] += dot_4x8packed_ss_int(al.y, w[r][1]);
+#pragma unroll
+      for (int r = 0; r < GROWS; ++r) lo[r] += dot_4x8packed_ss_int(al.z, w[r][2]);
+#pragma unroll
+      for (int r = 0; r < GROWS; ++r) lo[r] += dot_4x8packed_ss_int(al.w, w[r][3]);
+      const uint4 ah = an;
+      if (t + 1 < TB) {
+        an = vload4(0, ap + (size_t)min(t + 1, T - 1) * K4);
+        sn = ascb[min(t + 1, T - 1)];
+      }
+#pragma unroll
+      for (int r = 0; r < GROWS; ++r) hi[r] = dot_4x8packed_ss_int(ah.x, w[r][4]);
+#pragma unroll
+      for (int r = 0; r < GROWS; ++r) hi[r] += dot_4x8packed_ss_int(ah.y, w[r][5]);
+#pragma unroll
+      for (int r = 0; r < GROWS; ++r) hi[r] += dot_4x8packed_ss_int(ah.z, w[r][6]);
+#pragma unroll
+      for (int r = 0; r < GROWS; ++r) hi[r] += dot_4x8packed_ss_int(ah.w, w[r][7]);
+#pragma unroll
+      for (int r = 0; r < GROWS; ++r) {
+#if QT == Q2_K || QT == Q4_K || QT == Q5_K
+        acc[r][t] += st * (dr[r] * (float)(s0r[r] * lo[r] + s1r[r] * hi[r]) - dmr[r] * (float)(m0r[r] * b0 + m1r[r] * b1));
+#else
+        acc[r][t] += st * dr[r] * (float)(s0r[r] * lo[r] + s1r[r] * hi[r]);
+#endif
+      }
+    }
+  }
+#pragma unroll
+  for (int r = 0; r < GROWS; ++r)
+#pragma unroll
+    for (int t = 0; t < TB; ++t) {
+      const float v = HEAD_OUT(sub_group_reduce_add(acc[r][t]));
+      const int n = r0 + r;
+      if (lane == 0 && n < N && t < T) {
+        __global float* dst = C + (size_t)t * ldc + c_off + n;
+        *dst = accumulate ? *dst + v : v;
+      }
+    }
+}
+

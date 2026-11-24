@@ -1,0 +1,18 @@
+inferzero
+Copyright the inferzero authors. Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes software from other projects:
+
+- third_party/nlohmann/json.hpp: JSON for Modern C++, by Niels Lohmann, MIT license (third_party/nlohmann/LICENSE.MIT).
+- third_party/minja/minja.hpp: minja, a Jinja template engine for C++, MIT license (third_party/minja/LICENSE).
+- src/iq_tables.h (the IQ quantization formats' codebook grids) and src/unicode_tables.h: extracted from ggml, MIT
+  license, Copyright (c) 2023-2026 The ggml authors.
+
+Ideas from other projects (no code or text taken):
+
+- zero/kernels/gemm_xw8.cl's 32 x 48 tile through local memory (XW_NC 3, 2026-11-22) follows the strategy of the
+  int8 GEMM in oneDNN (Intel, Apache License 2.0) on Alchemist GPUs, as its verbose output describes it.
+- zero/engine_dspark.h (Inkling 2's DSpark drafter, 2026-11-24) follows the drafter's graph as ollama's
+  mlxrunner/model/inkling2/draft.go and model.go compute it (ollama, MIT license, Copyright (c) Ollama): the taps of
+  the target's layer visits, the fused context keys, the 8-row block and the Markov head. vLLM's and SGLang's DSpark
+  drafters (Apache License 2.0) were read as cross-checks.

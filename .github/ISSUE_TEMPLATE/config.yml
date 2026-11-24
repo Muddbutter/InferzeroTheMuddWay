@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: How to contribute
+    url: https://github.com/rizagp/inferzero/blob/main/CONTRIBUTING.md
+    about: Where the speed is still missing, how to measure your card, and how to send code

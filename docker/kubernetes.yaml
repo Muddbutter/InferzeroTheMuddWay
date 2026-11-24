@@ -1,0 +1,75 @@
+# inferzero's server on Kubernetes (not tested yet: please report on GitHub how it runs). Needs:
+# - Intel's GPU device plugin on the cluster (github.com/intel/intel-device-plugins-for-kubernetes), which gives the
+#   nodes with an Arc GPU the resource gpu.intel.com/i915 (gpu.intel.com/xe for cards on the xe kernel driver: change
+#   the resource name below to match `kubectl describe node`);
+# - the image from docker/Dockerfile in a registry the cluster can pull from:
+#     docker build -t <registry>/inferzero:latest docker && docker push <registry>/inferzero:latest
+#   then put that name in `image:` below.
+# Apply: kubectl apply -f docker/kubernetes.yaml; reach it: kubectl port-forward svc/inferzero 8090:8090, then
+# http://127.0.0.1:8090/. The Service is ClusterIP: the server has no password of its own, so expose it further only
+# behind something that has one.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: inferzero-cache
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 60Gi              # the models AND a MoE model's expert file, written next to it on its first load,
+                                 # plus ~1 GB of compiled kernels: the 4B ~4 GB, the 27B ~14 GB (dense: no expert
+                                 # file), the 35B ~18 + ~16 GB, Flash Next IQ3_S ~84 + ~56 GB (ask 160Gi for it)
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inferzero
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate               # (one GPU, one cache volume: the old pod goes before the new one starts)
+  selector:
+    matchLabels: {app: inferzero}
+  template:
+    metadata:
+      labels: {app: inferzero}
+    spec:
+      terminationGracePeriodSeconds: 60   # (a stop sends SIGTERM, SIGKILL after this. serverz handles SIGTERM while
+                                          #  it builds an expert file or a package (zero/expert_store.h, since
+                                          #  2026-11-19): a stop during a MoE model's first load removes its .tmp)
+      containers:
+        - name: inferzero
+          image: inferzero:latest  # your registry's name for the image (a :latest tag is pulled at every start)
+          env:
+            - {name: MODEL, value: "4b"}       # a catalog key (4b, 9b, 27b, 35b, flash, g12, g31, e4b) or a .gguf path
+            - {name: GPUS, value: "1"}         # GPUs to split the model over: ask for as many below
+            - {name: SERVER_ARGS, value: ""}   # more serverz options, e.g. "--ctx 32768"
+            - {name: OPTIONS, value: ""}       # speed and accuracy options (docs/options.md), e.g. "copy_draft,xcpu=off"
+            - {name: HF_HOME, value: /cache/huggingface}
+            - {name: ARC_DATA_DIR, value: /cache/inferzero}   # compiled kernels, expert files, settings
+          ports:
+            - {containerPort: 8090, name: http}
+          resources:
+            limits:
+              gpu.intel.com/i915: 1
+          volumeMounts:
+            - {name: cache, mountPath: /cache}
+          startupProbe:          # (the first start downloads the model and compiles the kernels: up to 3 hours
+            httpGet: {path: /health, port: http}   #  here; Flash Next's 141 GB may need more on a slow link)
+            periodSeconds: 10
+            failureThreshold: 1080
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 10
+      volumes:
+        - name: cache
+          persistentVolumeClaim: {claimName: inferzero-cache}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: inferzero
+spec:
+  selector: {app: inferzero}
+  ports:
+    - {port: 8090, targetPort: http, name: http}

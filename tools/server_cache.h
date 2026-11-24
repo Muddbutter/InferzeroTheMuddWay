@@ -1,0 +1,508 @@
+// The server's saved state: system-prompt prefix cache on disk and saved conversations (sessions).
+// A part of class Server (tools/server.cpp), included inside the class body at the place it was cut from:
+// not a header of its own. Split out of tools/server.cpp unchanged on 2026-10-24 (QUEUE item 11).
+
+ public:
+  bool save_held() {
+    std::unique_lock<std::mutex> lock(mu_, std::defer_lock);
+    acquire(lock);  // (counted as a request's: take_turns lets it in between two steps)
+    bool any = false;
+    struct Back {  // (the slot bound before: a request between two steps finds the engine as it left it)
+      Server& s;
+      int k;
+      ~Back() {
+        try { s.use_slot(k); } catch (const std::exception&) {}
+      }
+    } back{*this, cur_slot_};
+    for (int k = 0; k < (int)slots_.size(); ++k) {  // (--slots: each slot's; a request takes its own back with use_slot)
+      if (slots_.size() > 1 && slots_[k].busy) continue;  // (a running request's: mid-answer)
+      use_slot(k);
+      if (!sess_cap_ || cur_saved_ || cached_.size() < 1024) continue;
+      save_current();
+      any = (!saved_.empty() && written(saved_.back())) || any;
+    }
+    return any;
+  }
+
+ private:
+  void sessions(const HttpRequest& rq, HttpResponse& rs) {
+    if (rq.path == "/sessions/save") {
+      Json r = Json::object();
+      r.set("saved", save_held());
+      return rs.send(200, "application/json", r.dump());
+    }
+    std::unique_lock<std::mutex> lock(mu_, std::defer_lock);
+    acquire(lock);
+    uint64_t total = 0;
+    for (auto& s : saved_) total += s.bytes;
+    Json r = Json::object();
+    if (rq.method == "DELETE") {
+      r.set("deleted", (int)saved_.size());
+      r.set("freed_bytes", (double)total);
+      zlog::eprintf("session cache: cleared %zu saved conversations (%.1f GiB)\n", saved_.size(), total / 1073741824.0);
+      while (!saved_.empty()) forget(saved_.size() - 1);
+      cur_saved_ = false;
+      for (auto& x : slots_) x.cur_saved = false;
+      total = 0;
+    }
+    r.set("dir", sess_dir_);
+    r.set("conversations", (int)saved_.size());
+    r.set("bytes", (double)total);
+    r.set("cap_bytes", (double)sess_cap_);
+    rs.send(200, "application/json", r.dump());
+  }
+
+  // ---- system-prompt cache: the state after a client's system prompt, on disk
+  // Saved when a system prompt is processed for the first time (positions [0, sys_cut): its KV cache and the
+  // recurrent states there; 27B: ~0.3 GB for Pi's ~4K tokens) and loaded when a request starts with it while the
+  // engine holds something else: after a server start, a model switch or another conversation. Kept per project
+  // folder (Pi writes it into its system prompt): "<folder>-<folder hash>-<prompt hash>-<n>.arcp", the folder's 2
+  // latest versions, so one project's files never push out another's; other clients' prompts
+  // "<prompt hash>-<n>.arcp", the 8 used last. All models together stay under --prefix-cache-gb (least recently used
+  // go first). Files: [magic, n, tokens[n], engine state].
+  std::string prefix_dir_;
+  uint64_t prefix_cap_ = 0;
+  static constexpr int32_t kPrefixMagic = 0x50535241;  // "ARSP"
+  static uint64_t fnv(const void* p, size_t n, uint64_t h = 1469598103934665603ull) {
+    for (size_t i = 0; i < n; ++i) h = (h ^ ((const uint8_t*)p)[i]) * 1099511628211ull;
+    return h;
+  }
+  // Pi's project folder: its system prompt carries a section "<cwd>\nC:/path/to/project\n</cwd>"
+  static std::string prompt_folder(const Json& messages) {
+    const Json& m = messages[0];
+    if (m["role"].str() != "system" && m["role"].str() != "developer") return "";
+    std::string text;
+    const Json& c = m["content"];
+    if (c.is_string()) text = c.as_string();
+    else if (c.is_array())
+      for (size_t i = 0; i < c.size(); ++i) text += c[i]["text"].str();
+    const size_t a = text.find("<cwd>\n");
+    if (a == std::string::npos) return "";
+    const size_t b = text.find("\n</cwd>", a + 6);
+    if (b == std::string::npos || b - (a + 6) > 1024) return "";
+    return text.substr(a + 6, b - (a + 6));
+  }
+  // the file-name group of a folder: "<last path component>-<hash of the folder>-" ("" without a folder)
+  static std::string folder_group(const std::string& folder) {
+    if (folder.empty()) return "";
+    std::string low = folder;
+    for (auto& ch : low) ch = ch == '\\' ? '/' : (char)tolower((unsigned char)ch);  // (Windows paths: one spelling)
+    while (low.size() > 1 && low.back() == '/') low.pop_back();
+    std::string name = low.substr(low.find_last_of('/') + 1), slug;
+    for (char ch : name)
+      if (slug.size() < 32) slug += (isalnum((unsigned char)ch) || ch == '.' || ch == '_') ? ch : '_';
+    char b[24];
+    snprintf(b, sizeof b, "-%08x-", (unsigned)fnv(low.data(), low.size()));
+    return (slug.empty() ? "folder" : slug) + b;
+  }
+  // group + "<prompt hash>-<n>.arcp" (files from before the per-folder names have no group)
+  std::string prefix_file(const std::vector<int>& P, size_t n, const std::string& group) const {
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; ++i) h = (h ^ (uint32_t)P[i]) * 1099511628211ull;
+    char b[40];
+    snprintf(b, sizeof b, "%016llx-%zu.arcp", (unsigned long long)h, n);
+    return prefix_dir_ + "/" + group + b;
+  }
+  void load_prefix(const std::vector<int>& P, size_t n, const std::string& folder) {
+    if (prefix_dir_.empty() || n < 256 || n >= P.size() || common_prefix(P, cached_) >= n) return;
+    prefix_written();  // a write of it still going on
+    const std::string group = folder_group(folder), file = prefix_file(P, n, group);
+    std::error_code ec;
+    if (!std::filesystem::exists(file, ec)) {  // saved before the per-folder names: adopt it
+      const std::string old = prefix_file(P, n, "");
+      if (group.empty() || !std::filesystem::exists(old, ec)) return;
+      std::filesystem::rename(old, file, ec);
+      if (ec) return;
+    }
+    FILE* f = fopen(file.c_str(), "rb");
+    if (!f) return;
+    const auto t0 = clk::now();
+    int32_t h[2] = {0, 0};
+    std::vector<int> toks;
+    bool other = false;
+    const bool ok = with_file(f, [&] {
+      bool k = fread(h, 4, 2, f) == 2 && h[0] == kPrefixMagic && h[1] == (int32_t)n;
+      if (k) {
+        toks.resize(n);
+        k = fread(toks.data(), 4, n, f) == n;
+      }
+      if (k && !std::equal(toks.begin(), toks.end(), P.begin())) return !(other = true);  // (another prompt, same hash)
+      return k && eng_.load_state(f);
+    });
+    fclose(f);
+    if (other) return;  // (leave it)
+    if (!ok) {  // another model's layout or a damaged file; the engine may have been reset
+      std::filesystem::remove(file, ec);
+      cached_.clear();
+      last_gen_cut_ = 0;
+      LOG_WRN("system-prompt cache: could not read %s (damaged, or from another version): deleted; the system prompt is processed again and saved anew\n", file.c_str());
+      return;
+    }
+    std::filesystem::last_write_time(file, std::filesystem::file_time_type::clock::now(), ec);  // recently used
+    if (!rings_) eng_.snapshot_host();  // new conversations resume here again
+    cached_ = toks;
+    last_gen_cut_ = 0;
+    cur_saved_ = false;
+    zlog::eprintf("system-prompt cache: loaded %zu tokens%s%s in %.2f s\n", n, folder.empty() ? "" : " for ",
+            folder.c_str(), ms_since(t0) / 1000);
+  }
+  // after a write: the folder's 2 latest versions (or the 8 latest folder-less prompts), then all models' files
+  // under the size cap, least recently used first (never the file just written)
+  static void prune_prefix(const std::string& dir, const std::string& group, const std::string& keep, uint64_t cap) {
+    namespace fs = std::filesystem;
+    std::error_code e;
+    auto is_plain = [](const std::string& name) {  // "<16 hex>-<n>.arcp"
+      if (name.size() < 23 || name[16] != '-') return false;
+      for (size_t i = 0; i < name.size() - 5; ++i)
+        if (i != 16 && !(i < 16 ? isxdigit((unsigned char)name[i]) : isdigit((unsigned char)name[i]))) return false;
+      return true;
+    };
+    std::vector<std::pair<fs::file_time_type, fs::path>> mine;
+    // (increment(ec): a range-for's ++ throws on an error even when the iterator was opened with an error_code)
+    std::error_code ei;
+    for (fs::directory_iterator it(dir, ei), end; !ei && it != end; it.increment(ei)) {
+      const fs::directory_entry& de = *it;
+      if (de.path().extension() != ".arcp") continue;
+      const std::string name = de.path().filename().string();
+      if (group.empty() ? is_plain(name) : name.rfind(group, 0) == 0) mine.push_back({de.last_write_time(e), de.path()});
+    }
+    std::sort(mine.begin(), mine.end(), [](auto& a, auto& b) { return a.first > b.first; });
+    for (size_t i = group.empty() ? 8 : 2; i < mine.size(); ++i) fs::remove(mine[i].second, e);
+    if (!cap) return;
+    std::vector<std::tuple<fs::file_time_type, fs::path, uint64_t>> all;  // every model's folder
+    uint64_t total = 0;
+    ei.clear();
+    for (fs::recursive_directory_iterator it(fs::path(dir).parent_path(), ei), end; !ei && it != end; it.increment(ei))
+      if (const fs::directory_entry& de = *it; de.path().extension() == ".arcp") {
+        const uint64_t sz = de.file_size(e);
+        total += sz;
+        all.push_back({de.last_write_time(e), de.path(), sz});
+      }
+    std::sort(all.begin(), all.end(), [](auto& a, auto& b) { return std::get<0>(a) < std::get<0>(b); });
+    for (auto& [t, p, sz] : all) {
+      if (total <= cap) break;
+      if (p == fs::path(keep)) continue;
+      fs::remove(p, e);
+      total -= sz;
+    }
+  }
+  // The state is copied to host memory and written to disk in the background while the request goes on (with less
+  // than 2 GiB of RAM left over: written to disk first).
+  // a background write: its thread is joined when the last owner lets go, however that happens (a std::thread still
+  // joinable when it is destroyed ends the process: an allocation that threw between starting the thread and
+  // storing it would have done that)
+  // fn's result; f closed first if fn throws (an allocation in load_state / save_state / read_header), and the
+  // half-written file `tmp` (when given) removed: the caller closes it as before otherwise
+  template <typename F> static bool with_file(FILE* f, F&& fn, const std::string& tmp = std::string()) {
+    try {
+      return fn();
+    } catch (...) {
+      fclose(f);
+      if (!tmp.empty()) {
+        std::error_code e;
+        std::filesystem::remove(tmp, e);
+      }
+      throw;
+    }
+  }
+  template <typename F> static std::shared_ptr<std::thread> start_writer(F&& f) {
+    return std::shared_ptr<std::thread>(new std::thread(std::forward<F>(f)), [](std::thread* t) {
+      if (t->joinable()) t->join();
+      delete t;
+    });
+  }
+  std::shared_ptr<std::thread> prefix_writer_;
+  void prefix_written() {
+    if (prefix_writer_ && prefix_writer_->joinable()) prefix_writer_->join();
+  }
+  void save_prefix(const std::vector<int>& P, size_t n, const std::string& folder) {
+    if (eng_.hp.inkling && eng_.saved_size(0) == 0) return;  // (Inkling 2: no saved state yet, engine_sessions.h)
+    if (prefix_dir_.empty() || n < 256 || eng_.pos != (int)n) return;
+    prefix_written();
+    const std::string group = folder_group(folder), file = prefix_file(P, n, group);
+    std::error_code ec;
+    if (std::filesystem::exists(file, ec)) return;
+    const auto t0 = clk::now();
+    const int32_t h[2] = {kPrefixMagic, (int32_t)n};
+    auto finish = [dir = prefix_dir_, group, cap = prefix_cap_, folder, file, n, t0](bool ok) {
+      std::error_code e;
+      if (ok) std::filesystem::rename(file + ".tmp", file, e);
+      if (!ok || e) {
+        std::filesystem::remove(file + ".tmp", e);
+        LOG_WRN("system-prompt cache: could not write %s (disk full or the folder not writable?): not saved; the next start processes the system prompt again\n", file.c_str());
+        return;
+      }
+      try {  // (runs on the writer thread: an exception there would end the server)
+        prune_prefix(dir, group, file, cap);
+      } catch (const std::exception& x) {
+        zlog::eprintf("system-prompt cache: pruning %s: %s\n", dir.c_str(), x.what());
+      }
+      zlog::eprintf("system-prompt cache: saved %zu tokens%s%s (%.0f MB) in %.2f s\n", n, folder.empty() ? "" : " for ",
+              folder.c_str(), std::filesystem::file_size(file, e) / 1048576.0, ms_since(t0) / 1000);
+    };
+    // (the host snapshot taken at n equals the current state: written once, taken again after loading)
+    const uint64_t bytes = 8 + 4 * n + eng_.saved_size((int)n);
+    if (plat::ram_available() > bytes + (2ull << 30)) {
+      auto pieces = std::make_shared<std::vector<std::vector<uint8_t>>>();
+      pieces->emplace_back((const uint8_t*)h, (const uint8_t*)(h + 2));
+      pieces->emplace_back((const uint8_t*)P.data(), (const uint8_t*)(P.data() + n));
+      const bool ok = eng_.save_state([&](const void* p, size_t k) {
+        pieces->emplace_back((const uint8_t*)p, (const uint8_t*)p + k);
+        return true;
+      }, (int)n, false);
+      if (!ok) return;
+      prefix_writer_ = start_writer([pieces, file, finish] {
+        FILE* f = fopen((file + ".tmp").c_str(), "wb");
+        bool w = f != nullptr;
+        for (const auto& pc : *pieces)
+          if (w) w = fwrite(pc.data(), 1, pc.size(), f) == pc.size();
+        if (f) w = fclose(f) == 0 && w;
+        finish(w);
+      });
+      return;
+    }
+    FILE* f = fopen((file + ".tmp").c_str(), "wb");
+    if (!f) return;
+    bool ok = with_file(f, [&] { return fwrite(h, 4, 2, f) == 2 && fwrite(P.data(), 4, n, f) == n && eng_.save_state(f, (int)n, false); },
+                        file + ".tmp");
+    ok = fclose(f) == 0 && ok;
+    finish(ok);
+  }
+
+ public:
+  void open_prefix_cache(const std::string& dir, double cap_gb) {
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    std::error_code ei;  // writes the server did not finish
+    for (std::filesystem::directory_iterator it(dir, ei), end; !ei && it != end; it.increment(ei))
+      if (it->path().extension() == ".tmp") std::filesystem::remove(it->path(), ec);
+    prefix_dir_ = dir;
+    prefix_cap_ = (uint64_t)(cap_gb * 1073741824.0);
+  }
+  void open_sessions(const std::string& dir, double cap_gb) {
+    sess_cap_ = (uint64_t)(cap_gb * 1073741824.0);
+    if (!sess_cap_) return;
+    sess_dir_ = dir;
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    std::error_code ei;
+    for (std::filesystem::directory_iterator it(dir, ei), end; !ei && it != end; it.increment(ei)) {
+      const std::filesystem::directory_entry& de = *it;
+      if (de.path().extension() == ".tmp") {  // a write the server did not finish (it was stopped)
+        std::error_code ec2;
+        std::filesystem::remove(de.path(), ec2);
+        continue;
+      }
+      if (de.path().extension() != ".arcs") continue;
+      FILE* f = fopen(de.path().string().c_str(), "rb");
+      if (!f) continue;
+      SavedConv s;
+      if (with_file(f, [&] { return read_header(f, s); })) {
+        s.file = de.path().string();
+        s.bytes = std::filesystem::file_size(de.path(), ec);
+        s.used = (uint64_t)std::filesystem::last_write_time(de.path(), ec).time_since_epoch().count();
+        saved_.push_back(std::move(s));
+      }
+      fclose(f);
+    }
+    std::sort(saved_.begin(), saved_.end(), [](const SavedConv& a, const SavedConv& b) { return a.used < b.used; });
+    for (auto& s : saved_) s.used = ++use_clock_;
+    uint64_t total = 0;
+    for (auto& s : saved_) total += s.bytes;
+    const uint64_t others = prune_other_sessions(sess_dir_, total, sess_cap_);
+    zlog::eprintf("session cache: %s, %zu saved conversations (%.1f GiB; all models %.1f of %.1f GiB)\n", dir.c_str(),
+            saved_.size(), total / 1073741824.0, (total + others) / 1073741824.0, cap_gb);
+  }
+
+ private:
+  // --session-cache-gb holds for all models together: each model file has a folder of its own next to this one
+  // (<sessions>/<model>-<size>[-layout]), and their saved conversations go first, oldest first, until this model's
+  // `mine` bytes and theirs fit under `cap` (this model's own are trimmed after, least recently used first). Only
+  // finished ".arcs" files are removed. Another server running with another model at the same time finds a removed
+  // file unreadable and forgets it (its prompt is processed again). Returns the other models' bytes left.
+  static uint64_t prune_other_sessions(const std::string& dir, uint64_t mine, uint64_t cap) {
+    namespace fs = std::filesystem;
+    if (!cap || dir.empty()) return 0;
+    std::error_code e, ei;
+    const fs::path self = fs::path(dir).lexically_normal();
+    std::vector<std::tuple<fs::file_time_type, fs::path, uint64_t>> all;
+    uint64_t total = 0;
+    // (this model's folder: by file identity, not by name; NTFS ignores case, a model renamed in case only reuses it)
+    auto is_self = [&](const fs::path& p) {
+      std::error_code q;
+      const bool same = fs::equivalent(p, self, q);
+      return q ? p.lexically_normal() == self : same;
+    };
+    // (a saved conversation of this server's: its first 4 bytes are "ARSV"; another program's .arcs is left alone,
+    //  for a --session-dir set to a folder with other things next to it)
+    auto is_conv = [](const fs::path& p) {
+      FILE* f = plat::fopen_path(p, "rb");
+      if (!f) return false;
+      int32_t m = 0;
+      const bool ok = fread(&m, 4, 1, f) == 1 && m == kConvMagic;
+      fclose(f);
+      return ok;
+    };
+    for (fs::directory_iterator d(self.parent_path(), ei), end; !ei && d != end; d.increment(ei)) {
+      if (!d->is_directory(e) || is_self(d->path())) continue;
+      std::error_code ej;
+      for (fs::directory_iterator it(d->path(), ej), end2; !ej && it != end2; it.increment(ej))
+        if (it->path().extension() == ".arcs") {
+          const uint64_t sz = it->file_size(e);
+          if (e || !is_conv(it->path())) continue;
+          total += sz;
+          all.push_back({it->last_write_time(e), it->path(), sz});
+        }
+    }
+    std::sort(all.begin(), all.end(), [](auto& a, auto& b) { return std::get<0>(a) < std::get<0>(b); });
+    size_t n = 0;
+    uint64_t freed = 0;
+    for (auto& [t, p, sz] : all) {
+      if (mine + total <= cap) break;
+      if (!fs::remove(p, e) || e) continue;
+      total -= sz;
+      freed += sz;
+      ++n;
+    }
+    if (n)
+      zlog::eprintf("session cache: removed %zu saved conversations of other models (%.1f GiB) to stay under %.1f GiB\n",
+              n, freed / 1073741824.0, cap / 1073741824.0);
+    return total;
+  }
+  static constexpr int32_t kConvMagic = 0x56535241;  // "ARSV"
+  // (positions checked against this context: resume points -1 (none) to ctx, gen_cut / floor 0 to ctx; a damaged
+  //  file is left out rather than steering prepare_prefix to a wrong snapshot)
+  bool read_header(FILE* f, SavedConv& s) const {
+    int32_t h[3];
+    if (fread(h, 4, 3, f) != 3 || h[0] != kConvMagic || h[1] != 1 || h[2] < 0 || h[2] > (1 << 24)) return false;
+    s.tokens.resize(h[2]);
+    int32_t g[3];
+    if (fread(s.tokens.data(), 4, h[2], f) != (size_t)h[2] || fread(g, 4, 3, f) != 3 || g[2] < 0 || g[2] > 16) return false;
+    const int ctx = eng_.ctx;
+    if (g[0] < 0 || g[0] > ctx || g[1] < 0 || g[1] > ctx) return false;
+    s.gen_cut = g[0];
+    s.floor = g[1];
+    s.resume.resize(g[2]);
+    if (fread(s.resume.data(), 4, g[2], f) != (size_t)g[2]) return false;
+    for (int r : s.resume)
+      if (r < -1 || r > ctx) return false;
+    return true;
+  }
+  // Saves the held conversation (replacing saved states it supersedes), then trims the cache. With enough free RAM
+  // (2 GiB left over) the state is copied to host memory and written to disk in the background while the next
+  // request is served; otherwise it is written to disk first.
+  void save_current() {
+    // (Inkling 2: no saved state yet: nothing written, and its prompt-end snapshot (slot 1, its turn start) kept)
+    if (eng_.hp.inkling && eng_.saved_size(0) == 0) return;
+    const auto t0 = clk::now();
+    // the snapshot at the end of the last prompt is a few tokens after the one at its assistant turn start: not worth
+    // its space (Qwen3.8 27B: 157 MB); the request being served diverges before both anyway
+    eng_.drop_snapshot(1);
+    const std::string file = sess_dir_ + "/" + std::to_string((uint64_t)time(nullptr)) + "-" + std::to_string(++use_clock_) + ".arcs";
+    const std::vector<int> res = current_resume();
+    // resumable from the last prompt's assistant turn on (Gemma keeps the sliding-window K/V from n_swa before it)
+    const int floor = eng_.saved_floor(last_gen_cut_);
+    std::vector<int32_t> head = {kConvMagic, 1, (int32_t)cached_.size()};
+    head.insert(head.end(), cached_.begin(), cached_.end());
+    head.insert(head.end(), {last_gen_cut_, floor, (int32_t)res.size()});
+    head.insert(head.end(), res.begin(), res.end());
+    const uint64_t bytes = head.size() * 4 + eng_.saved_size(last_gen_cut_);
+    const bool bg = plat::ram_available() > bytes + (2ull << 30);
+    auto failed = std::make_shared<std::atomic<bool>>(false);
+    std::shared_ptr<std::thread> writer;
+    bool ok;
+    std::error_code ec;
+    if (bg) {
+      auto pieces = std::make_shared<std::vector<std::vector<uint8_t>>>();
+      pieces->emplace_back((const uint8_t*)head.data(), (const uint8_t*)(head.data() + head.size()));
+      ok = eng_.save_state([&](const void* p, size_t n) {
+        pieces->emplace_back((const uint8_t*)p, (const uint8_t*)p + n);
+        return true;
+      }, last_gen_cut_);
+      if (ok)
+        writer = start_writer([pieces, file, failed] {
+          FILE* f = fopen((file + ".tmp").c_str(), "wb");
+          bool w = f != nullptr;
+          for (const auto& pc : *pieces)
+            if (w) w = fwrite(pc.data(), 1, pc.size(), f) == pc.size();
+          if (f) w = fclose(f) == 0 && w;
+          std::error_code e;
+          if (w) std::filesystem::rename(file + ".tmp", file, e);
+          if (!w || e) {
+            std::filesystem::remove(file + ".tmp", e);
+            *failed = true;
+            LOG_WRN("session cache: could not write %s (disk full or the folder not writable?)\n", file.c_str());
+          }
+        });
+    } else {
+      FILE* f = fopen((file + ".tmp").c_str(), "wb");
+      ok = f && with_file(f, [&] { return fwrite(head.data(), 4, head.size(), f) == head.size() && eng_.save_state(f, last_gen_cut_); },
+                          file + ".tmp");
+      if (f) ok = fclose(f) == 0 && ok;
+      if (ok) std::filesystem::rename(file + ".tmp", file, ec);
+      ok = ok && !ec;
+      if (!ok) std::filesystem::remove(file + ".tmp", ec);
+    }
+    if (!ok) {
+      LOG_WRN("session cache: the conversation (%zu tokens) was not saved (see the line before); it is processed again when it comes back\n", cached_.size());
+      return;
+    }
+    // older states of the same conversation: everything they could resume, this one resumes too
+    for (size_t i = 0; i < saved_.size();)
+      if ((int)common_prefix(saved_[i].tokens, cached_) >= saved_[i].gen_cut) forget(i);
+      else ++i;
+    saved_.push_back(SavedConv{file, cached_, res, last_gen_cut_, floor, bytes, use_clock_, writer, failed});
+    uint64_t total = 0;
+    for (auto& c : saved_) total += c.bytes;
+    try {  // the other models' first (a file system error leaves them)
+      prune_other_sessions(sess_dir_, total, sess_cap_);
+    } catch (const std::exception& x) {
+      zlog::eprintf("session cache: pruning other models: %s\n", x.what());
+    }
+    while (total > sess_cap_ && saved_.size() > 1) {  // least recently used first (never the one just saved)
+      auto lru = std::min_element(saved_.begin(), saved_.end() - 1, [](auto& a, auto& b) { return a.used < b.used; });
+      total -= lru->bytes;
+      forget(lru - saved_.begin());
+    }
+    cur_saved_ = true;
+    zlog::eprintf("session cache: saved a conversation of %zu tokens (%.0f MB) in %.2f s%s\n", cached_.size(),
+            bytes / 1048576.0, ms_since(t0) / 1000, bg ? " (to memory; written to disk in the background)" : "");
+  }
+  // Before a request: keep the held conversation if the request does not continue it, and bring back a saved one
+  // that shares more with the request.
+  void switch_conversation(const std::vector<int>& P) {
+    if (!sess_cap_ || P.empty()) return;
+    const size_t lc = std::min(common_prefix(P, cached_), P.size() - 1);
+    const bool other = (int)lc < last_gen_cut_;
+    if (other && !cur_saved_ && cached_.size() >= 1024) save_current();
+    const int u_cur = usable(P, cached_, current_resume(), current_floor());
+    int bi = -1, bu = u_cur + 512;  // loading must save at least ~512 tokens of prompt processing
+    for (size_t i = 0; i < saved_.size(); ++i) {
+      // (longer than this context, e.g. saved before --slots shared it out: kept for a later larger context, not loaded)
+      if ((int)saved_[i].tokens.size() > eng_.ctx) continue;
+      const int u = usable(P, saved_[i].tokens, saved_[i].resume, saved_[i].floor);
+      if (u > bu) { bi = (int)i; bu = u; }
+    }
+    if (bi < 0) return;
+    SavedConv& s = saved_[bi];
+    const auto t0 = clk::now();
+    const bool done = written(s);  // a background write of this conversation finishes first
+    FILE* f = done ? fopen(s.file.c_str(), "rb") : nullptr;
+    SavedConv tmp;
+    const bool ok = f && with_file(f, [&] { return read_header(f, tmp) && eng_.load_state(f); });
+    if (f) fclose(f);
+    if (!ok) {  // unreadable or from another layout: forget it; the engine was reset
+      LOG_WRN("session cache: could not read %s (damaged, or from another version): forgotten; the conversation is processed again\n", s.file.c_str());
+      forget(bi);
+      cached_.clear();
+      last_gen_cut_ = 0;
+      cur_saved_ = false;
+      return;
+    }
+    cached_ = s.tokens;
+    last_gen_cut_ = s.gen_cut;
+    s.used = ++use_clock_;
+    cur_saved_ = true;
+    zlog::eprintf("session cache: loaded a conversation of %zu tokens (%.0f MB) in %.2f s, %d prompt tokens reusable\n",
+            s.tokens.size(), s.bytes / 1048576.0, ms_since(t0) / 1000, bu);
+  }

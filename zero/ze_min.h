@@ -1,0 +1,213 @@
+// inferzero: minimal Level Zero (oneAPI L0) declarations + a dynamic loader for ze_loader.dll (installed with the
+// Intel graphics driver). Only what inferzero uses; the layouts follow ze_api.h (Level Zero spec 1.x).
+#pragma once
+#include <cstdint>
+#include <cstddef>
+#include <cstdio>
+#include <cstdlib>
+#include "../src/platform.h"  // (windows.h on Windows; the libraries' loading, plat::dl_*)
+#include "../src/gpu_fail.h"  // (gpu_fatal, the hang marker: docs/gpu-failsafe.md)
+
+typedef uint32_t ze_result_t;
+#define ZE_RESULT_SUCCESS 0u
+#define ZE_RESULT_NOT_READY 1u  // (a synchronize whose timeout passed first)
+#define ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY 0x70000003u  // (0x70000002 is out of host memory; was named wrong here)
+typedef struct _ze_driver_handle_t* ze_driver_handle_t;
+typedef struct _ze_device_handle_t* ze_device_handle_t;
+typedef struct _ze_context_handle_t* ze_context_handle_t;
+typedef struct _ze_command_list_handle_t* ze_command_list_handle_t;
+typedef struct _ze_module_handle_t* ze_module_handle_t;
+typedef struct _ze_module_build_log_handle_t* ze_module_build_log_handle_t;
+typedef struct _ze_kernel_handle_t* ze_kernel_handle_t;
+typedef struct _ze_event_handle_t* ze_event_handle_t;
+typedef struct _ze_event_pool_handle_t* ze_event_pool_handle_t;
+typedef uint32_t ze_structure_type_t;
+
+// structure types (ze_structure_type_t)
+#define ZE_STYPE_DEVICE_PROPERTIES 0x3u
+#define ZE_STYPE_DEVICE_MEMORY_PROPERTIES 0x7u
+#define ZE_STYPE_COMMAND_QUEUE_GROUP_PROPERTIES 0x6u
+#define ZE_STYPE_CONTEXT_DESC 0xdu
+#define ZE_STYPE_COMMAND_QUEUE_DESC 0xeu
+#define ZE_STYPE_EVENT_POOL_DESC 0x10u
+#define ZE_STYPE_EVENT_DESC 0x11u
+#define ZE_STYPE_DEVICE_MEM_ALLOC_DESC 0x15u
+#define ZE_STYPE_HOST_MEM_ALLOC_DESC 0x16u
+#define ZE_STYPE_MODULE_DESC 0x1bu
+#define ZE_STYPE_KERNEL_DESC 0x1du
+
+struct ze_device_properties_t {
+  ze_structure_type_t stype;
+  void* pNext;
+  uint32_t type, vendorId, deviceId, flags, subdeviceId, coreClockRate;
+  uint64_t maxMemAllocSize;
+  uint32_t maxHardwareContexts, maxCommandQueuePriority, numThreadsPerEU, physicalEUSimdWidth, numEUsPerSubslice,
+      numSubslicesPerSlice, numSlices;
+  uint64_t timerResolution;
+  uint32_t timestampValidBits, kernelTimestampValidBits;
+  uint8_t uuid[16];
+  char name[256];
+};
+#define ZE_STYPE_DEVICE_COMPUTE_PROPERTIES 0x4u
+#define ZE_SUBGROUPSIZE_COUNT 8
+struct ze_device_compute_properties_t {
+  ze_structure_type_t stype;
+  void* pNext;
+  uint32_t maxTotalGroupSize, maxGroupSizeX, maxGroupSizeY, maxGroupSizeZ, maxGroupCountX, maxGroupCountY, maxGroupCountZ,
+      maxSharedLocalMemory, numSubGroupSizes, subGroupSizes[ZE_SUBGROUPSIZE_COUNT];
+};
+struct ze_device_memory_properties_t {
+  ze_structure_type_t stype;
+  void* pNext;
+  uint32_t flags, maxClockRate, maxBusWidth;
+  uint64_t totalSize;
+  char name[256];
+};
+struct ze_command_queue_group_properties_t {
+  ze_structure_type_t stype;
+  void* pNext;
+  uint32_t flags;  // 1: compute, 2: copy
+  size_t maxMemoryFillPatternSize;
+  uint32_t numQueues;
+};
+#define ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COMPUTE 0x1u
+#define ZE_COMMAND_QUEUE_GROUP_PROPERTY_FLAG_COPY 0x2u
+struct ze_context_desc_t { ze_structure_type_t stype; const void* pNext; uint32_t flags; };
+struct ze_command_queue_desc_t {
+  ze_structure_type_t stype;
+  const void* pNext;
+  uint32_t ordinal, index, flags, mode, priority;  // flags: 2 = in order; mode: 0 default, 1 synchronous, 2 asynchronous
+};
+struct ze_host_mem_alloc_desc_t { ze_structure_type_t stype; const void* pNext; uint32_t flags; };
+struct ze_device_mem_alloc_desc_t { ze_structure_type_t stype; const void* pNext; uint32_t flags, ordinal; };
+struct ze_module_constants_t { uint32_t numConstants; const uint32_t* pConstantIds; const void** pConstantValues; };
+struct ze_module_desc_t {
+  ze_structure_type_t stype;
+  const void* pNext;
+  uint32_t format;  // 0 SPIR-V, 1 native (the device binary the OpenCL compiler produces)
+  size_t inputSize;
+  const uint8_t* pInputModule;
+  const char* pBuildFlags;
+  const ze_module_constants_t* pConstants;
+};
+struct ze_kernel_desc_t { ze_structure_type_t stype; const void* pNext; uint32_t flags; const char* pKernelName; };
+struct ze_kernel_properties_t {  // (stype 0x1e)
+  ze_structure_type_t stype;
+  void* pNext;
+  uint32_t numKernelArgs, requiredGroupSize[3], requiredNumSubGroups, requiredSubgroupSize, maxSubgroupSize,
+      maxNumSubgroups, localMemSize, privateMemSize, spillMemSize;
+  uint8_t uuid[32];
+};
+struct ze_group_count_t { uint32_t groupCountX, groupCountY, groupCountZ; };
+struct ze_event_pool_desc_t { ze_structure_type_t stype; const void* pNext; uint32_t flags, count; };
+struct ze_event_desc_t { ze_structure_type_t stype; const void* pNext; uint32_t index, signal, wait; };
+struct ze_kernel_timestamp_data_t { uint64_t kernelStart, kernelEnd; };
+struct ze_kernel_timestamp_result_t { ze_kernel_timestamp_data_t global, context; };
+
+#define ZE_FUNCS(X)                                                                                              \
+  X(ze_result_t, zeInit, (uint32_t))                                                                             \
+  X(ze_result_t, zeDriverGet, (uint32_t*, ze_driver_handle_t*))                                                  \
+  X(ze_result_t, zeDeviceGet, (ze_driver_handle_t, uint32_t*, ze_device_handle_t*))                              \
+  X(ze_result_t, zeDeviceGetProperties, (ze_device_handle_t, ze_device_properties_t*))                           \
+  X(ze_result_t, zeDeviceGetComputeProperties, (ze_device_handle_t, ze_device_compute_properties_t*))             \
+  X(ze_result_t, zeDeviceGetMemoryProperties, (ze_device_handle_t, uint32_t*, ze_device_memory_properties_t*))    \
+  X(ze_result_t, zeDeviceGetCommandQueueGroupProperties,                                                         \
+    (ze_device_handle_t, uint32_t*, ze_command_queue_group_properties_t*))                                       \
+  X(ze_result_t, zeContextCreate, (ze_driver_handle_t, const ze_context_desc_t*, ze_context_handle_t*))          \
+  X(ze_result_t, zeContextDestroy, (ze_context_handle_t))                                                        \
+  X(ze_result_t, zeCommandListCreateImmediate,                                                                   \
+    (ze_context_handle_t, ze_device_handle_t, const ze_command_queue_desc_t*, ze_command_list_handle_t*))        \
+  X(ze_result_t, zeCommandListDestroy, (ze_command_list_handle_t))                                               \
+  X(ze_result_t, zeCommandListHostSynchronize, (ze_command_list_handle_t, uint64_t))                             \
+  X(ze_result_t, zeCommandListAppendLaunchKernel,                                                                \
+    (ze_command_list_handle_t, ze_kernel_handle_t, const ze_group_count_t*, ze_event_handle_t, uint32_t,          \
+     ze_event_handle_t*))                                                                                        \
+  X(ze_result_t, zeCommandListAppendMemoryCopy,                                                                  \
+    (ze_command_list_handle_t, void*, const void*, size_t, ze_event_handle_t, uint32_t, ze_event_handle_t*))     \
+  X(ze_result_t, zeCommandListAppendBarrier, (ze_command_list_handle_t, ze_event_handle_t, uint32_t, ze_event_handle_t*)) \
+  X(ze_result_t, zeCommandListAppendMemoryFill,                                                                  \
+    (ze_command_list_handle_t, void*, const void*, size_t, size_t, ze_event_handle_t, uint32_t, ze_event_handle_t*)) \
+  X(ze_result_t, zeKernelSuggestGroupSize, (ze_kernel_handle_t, uint32_t, uint32_t, uint32_t, uint32_t*, uint32_t*, uint32_t*)) \
+  X(ze_result_t, zeMemAllocHost, (ze_context_handle_t, const ze_host_mem_alloc_desc_t*, size_t, size_t, void**))  \
+  X(ze_result_t, zeMemAllocDevice,                                                                               \
+    (ze_context_handle_t, const ze_device_mem_alloc_desc_t*, size_t, size_t, ze_device_handle_t, void**))        \
+  X(ze_result_t, zeMemAllocShared,                                                                               \
+    (ze_context_handle_t, const ze_device_mem_alloc_desc_t*, const ze_host_mem_alloc_desc_t*, size_t, size_t,     \
+     ze_device_handle_t, void**))                                                                                \
+  X(ze_result_t, zeMemFree, (ze_context_handle_t, void*))                                                        \
+  X(ze_result_t, zeModuleCreate,                                                                                 \
+    (ze_context_handle_t, ze_device_handle_t, const ze_module_desc_t*, ze_module_handle_t*,                      \
+     ze_module_build_log_handle_t*))                                                                             \
+  X(ze_result_t, zeModuleDestroy, (ze_module_handle_t))                                                          \
+  X(ze_result_t, zeModuleBuildLogGetString, (ze_module_build_log_handle_t, size_t*, char*))                      \
+  X(ze_result_t, zeModuleBuildLogDestroy, (ze_module_build_log_handle_t))                                        \
+  X(ze_result_t, zeKernelCreate, (ze_module_handle_t, const ze_kernel_desc_t*, ze_kernel_handle_t*))             \
+  X(ze_result_t, zeKernelGetProperties, (ze_kernel_handle_t, ze_kernel_properties_t*))                           \
+  X(ze_result_t, zeKernelSetIndirectAccess, (ze_kernel_handle_t, uint32_t))                                      \
+  X(ze_result_t, zeKernelDestroy, (ze_kernel_handle_t))                                                          \
+  X(ze_result_t, zeKernelSetGroupSize, (ze_kernel_handle_t, uint32_t, uint32_t, uint32_t))                       \
+  X(ze_result_t, zeKernelSetArgumentValue, (ze_kernel_handle_t, uint32_t, size_t, const void*))                  \
+  X(ze_result_t, zeEventPoolCreate,                                                                              \
+    (ze_context_handle_t, const ze_event_pool_desc_t*, uint32_t, ze_device_handle_t*, ze_event_pool_handle_t*))  \
+  X(ze_result_t, zeEventCreate, (ze_event_pool_handle_t, const ze_event_desc_t*, ze_event_handle_t*))            \
+  X(ze_result_t, zeEventDestroy, (ze_event_handle_t))                                                            \
+  X(ze_result_t, zeEventPoolDestroy, (ze_event_pool_handle_t))                                                   \
+  X(ze_result_t, zeEventHostSynchronize, (ze_event_handle_t, uint64_t))                                          \
+  X(ze_result_t, zeEventHostReset, (ze_event_handle_t))                                                          \
+  X(ze_result_t, zeEventHostSignal, (ze_event_handle_t))                                                         \
+  X(ze_result_t, zeEventQueryKernelTimestamp, (ze_event_handle_t, ze_kernel_timestamp_result_t*))
+
+#define ZE_DECL(ret, name, args) typedef ret(__stdcall* PFN_##name) args; inline PFN_##name name = nullptr;
+ZE_FUNCS(ZE_DECL)
+#undef ZE_DECL
+// (optional: null when the loader lacks it; a split model asks it whether its GPUs reach each other's memory,
+//  zero/mgpu/engine_tp.h TpEngine::choose_sums)
+typedef ze_result_t(__stdcall* PFN_zeDeviceCanAccessPeer)(ze_device_handle_t, ze_device_handle_t, uint8_t*);
+inline PFN_zeDeviceCanAccessPeer zeDeviceCanAccessPeer = nullptr;
+// (optional too: the direct sums' reader makes another GPU's copies into its memory visible to its kernels)
+typedef ze_result_t(__stdcall* PFN_zeCommandListAppendMemoryRangesBarrier)(ze_command_list_handle_t, uint32_t, const size_t*,
+                                                                           const void**, ze_event_handle_t, uint32_t,
+                                                                           ze_event_handle_t*);
+inline PFN_zeCommandListAppendMemoryRangesBarrier zeCommandListAppendMemoryRangesBarrier = nullptr;
+
+inline bool ze_load() {
+  void* m = plat::dl_open("ze_loader.dll", "libze_loader.so.1");
+  if (!m) return false;
+#define ZE_LOAD(ret, name, args) \
+  name = (PFN_##name)plat::dl_sym(m, #name); \
+  if (!name) { zlog::eprintf("the Level Zero loader: %s missing\n", #name); return false; }
+  ZE_FUNCS(ZE_LOAD)
+#undef ZE_LOAD
+  zeDeviceCanAccessPeer = (PFN_zeDeviceCanAccessPeer)plat::dl_sym(m, "zeDeviceCanAccessPeer");
+  zeCommandListAppendMemoryRangesBarrier =
+      (PFN_zeCommandListAppendMemoryRangesBarrier)plat::dl_sym(m, "zeCommandListAppendMemoryRangesBarrier");
+  return true;
+}
+
+inline void (*ze_fail_hook)() = nullptr;  // (diagnostics printed before exiting on an error)
+// a Level Zero error in words, for the log (docs/logging.md): only the codes whose meaning is sure
+inline const char* ze_result_text(uint32_t r) {
+  switch (r) {
+    case 0x70000001u: return " (device lost: the GPU was reset, by a driver timeout or a fault; the process must restart)";
+    case 0x70000002u: case 0x70000003u: return " (out of memory: other programs, or this one, use the GPU memory)";
+    case 0x78000001u: return " (not initialized: the Level Zero driver did not start)";
+    default: return "";
+  }
+}
+// A Level Zero call that failed mid-work ends the process (src/gpu_fail.h): a lost device with code 4 and the hang
+// marker, without the diagnostics that would ask the GPU again; any other failure with code 5 after them.
+// (not exit(): after a lost device the driver's cleanup can hang the process)
+[[noreturn]] inline void ze_fail(uint32_t r, const char* file, int line, const char* expr) {
+  char d[512];
+  snprintf(d, sizeof d, "Level Zero error 0x%x%s at %s:%d: %s", r, ze_result_text(r), file, line, expr);
+  if (r == 0x70000001u) gpufail::gpu_fatal(gpufail::Lost, d);
+  LOG_ERR("%s\n", d);
+  if (ze_fail_hook) ze_fail_hook();
+  fflush(stderr);
+  _Exit(gpufail::Other);
+}
+#define ZE_CHECK(x)                                                  \
+  do {                                                               \
+    const ze_result_t r_ = (x);                                      \
+    if (r_ != ZE_RESULT_SUCCESS) ze_fail(r_, __FILE__, __LINE__, #x); \
+  } while (0)

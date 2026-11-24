@@ -1,0 +1,857 @@
+// A part of class Engine (zero/engine.h), included inside the class body at the place it was cut from (the
+// class is the same text), not a header of its own: the kernels the forward passes use (build_kernels) and the Qwen weights (load_weights).
+
+  void build_kernels() {
+    const std::string dir = opt.kernel_dir;
+    gemm_src_ = read_file(dir + "/gemm.cl");
+    ops_.load(dir, KernelParts::kOps);
+    dec_.load(dir, KernelParts::kDecode);
+    if (hp.moe) moe_src_ = read_file(dir + "/moe.cl");
+    auto p = [&](const char* n) { return kernel("ops", "", n); };
+    // (h8f_defs_: H8's float copy of the activations, zero/engine_h8.h; empty otherwise)
+    k_rmsnorm_ = kernel("ops", h8f_defs_, "rmsnorm_quant");
+    if (hp.inkling) {  // (Inkling 2: its own kernels, built as used, zero/engine_inkling.h; quant_rows' k_swiglu_)
+      k_swiglu_ = kernel("ops", h8f_defs_, "swiglu_quant");
+      auto tabs = build_iq_tables();
+      if (!tabs_) tabs_ = buf(tabs.size() * 4, tabs.data());
+      return;
+    }
+    if (hp.ds41) {  // (DeepSeek-V4.1: its shared expert's SwiGLU clamped; none of the Qwen attention / DeltaNet kernels)
+      k_swiglu_ = kernel("ops", h8f_defs_ + ds_swi_defs(), "swiglu_quant");
+      auto tabs = build_iq_tables();
+      if (!tabs_) tabs_ = buf(tabs.size() * 4, tabs.data());  // (once: a second build_kernels, H8 off, reuses it)
+      return;
+    }
+    k_swiglu_ = kernel("ops", h8f_defs_, "swiglu_quant");
+    if (getenv("ARC_CT")) conv_ct_ = std::max(1, atoi(getenv("ARC_CT")));
+    {
+      const char* g = getenv("ARC_CONV_GRF");
+      const bool big = g != nullptr && std::string(g) == "256";
+      const std::string co = (big ? std::string("-cl-intel-256-GRF-per-thread ") : std::string()) + "-DCT=" +
+                             std::to_string(conv_ct_);
+      k_gdn_conv_ = kernel("ops", co, "gdn_conv");
+      k_gdn_conv1_ = kernel("ops", co + " -DCONV_UPD", "gdn_conv");
+    }
+    k_conv_upd_ = p("conv_state_update");
+    k_gnorm_ = hp.hc ? kernel("ops", "-DGATE_SIGMOID", "gated_norm_quant") : kernel("ops", h8f_defs_, "gated_norm_quant");
+    k_attn_prep_ = kernel("ops", sb_opt(256), "attn_prep");
+    k_attn_gate_ = kernel("ops", h8f_defs_, "attn_gate_quant");
+    k_gdn_gates_ = p("gdn_gates");
+    const std::string big = "-cl-intel-256-GRF-per-thread -DGQ=" + std::to_string(gq());
+    k_attn_ = kernel("ops", big, "attn_fa");
+    // (ARC_GDN_PF=2..8, opt-in: gdn_recur keeps that many tokens' operands in flight, bit-identical; kernels/ops.cl)
+    const int gdn_pf = getenv("ARC_GDN_PF") ? std::clamp(atoi(getenv("ARC_GDN_PF")), 1, 8) : 1;
+    // (ARC_GDN_L1PF=D: token t+D's operands prefetched into L1, bit-identical; 2 by default on discrete cards, off on
+    //  iGPUs: zero/xe2/engine_xe2.h xe2_gdn_l1pf; only where the driver has cl_intel_subgroup_buffer_prefetch)
+    const int gdn_l1 = xe2_gdn_l1pf();
+    // (ARC_GDN_FUSE2=1, opt-in: token t's second pass and t + 1's first in one sweep, bit-identical; not with ARC_GDN_PF)
+    static const bool gdn_f2 = getenv("ARC_GDN_FUSE2") && atoi(getenv("ARC_GDN_FUSE2")) != 0;
+    const std::string gpf = (gdn_pf > 1 ? " -DGDN_PF=" + std::to_string(gdn_pf) : std::string()) +
+                            (gdn_l1 > 1 ? " -DGDN_L1PF=" + std::to_string(gdn_l1) : std::string()) +
+                            (gdn_f2 && gdn_pf <= 1 ? " -DGDN_FUSE2" : "");
+    k_gdn_recur_ = kernel("ops", big + gpf, "gdn_recur");
+    k_gdn_recur_g_ = kernel("ops", big + gpf + " -DFUSE_GATES", "gdn_recur");
+    const std::string att = "-cl-intel-256-GRF-per-thread -DHPG=" + std::to_string(hp.n_head / hp.n_head_kv) +
+                            " -DHS=" + std::to_string(attn_hs()) + " -DTPW=" + std::to_string(attn_tpw()) + sb_opt(256) +
+                            (hp.qwen3 ? " -DHD=" + std::to_string(hp.head_dim) : std::string());
+    k_attn_q8_ = kernel("ops", att, "attn_q8");
+    attn_q8_defs_ = att;  // (attnx_init builds the XMX form with the same options: zero/xe2/engine_xe2.h)
+    k_attn_comb_ = kernel("ops", "", "attn_combine");
+    k_mtp_concat_ = kernel("ops", "", "mtp_concat");
+    auto tabs = build_iq_tables();
+    // (once: build_kernels runs again when H8 turns off after its checks (engine.h), and a second buffer leaked the
+    //  first until the engine ended; the tables are the same; self audit 2026-11-19)
+    if (!tabs_) tabs_ = buf(tabs.size() * 4, tabs.data());
+  }
+
+  cl_mem buf(size_t bytes, const void* host = nullptr) {
+    gpu_bytes += bytes;
+    if (opt.dry) return nullptr;
+    mems_.push_back(cl_.buffer(CL_MEM_READ_WRITE, bytes, host));
+    return mems_.back();
+  }
+  // releases a buffer of buf() before the engine ends (an encoder growing its buffers; its from() views go with it)
+  void free_buf(cl_mem& m) {
+    if (!m) return;
+    // (its views made by from() go with it: a later buffer at the same address must not find them)
+    for (auto v = views_.begin(); v != views_.end();) {
+      if (v->first.first != m) { ++v; continue; }
+      auto vi = std::find(mems_.begin(), mems_.end(), v->second);
+      if (vi != mems_.end()) mems_.erase(vi);
+      clReleaseMemObject(v->second);
+      v = views_.erase(v);
+    }
+    auto it = std::find(mems_.begin(), mems_.end(), m);
+    if (it != mems_.end()) mems_.erase(it);
+    gpu_bytes -= std::min<size_t>(gpu_bytes, m->size);
+    clReleaseMemObject(m);
+    m = nullptr;
+  }
+  // Raw GGUF rows uploaded with each superblock zero-padded to a multiple of 8 bytes (zero/kernels/decode.cl BBP),
+  // written in parallel straight into a host-visible buffer (zero-copy on an integrated GPU).
+  // Zero bytes after the last superblock: gemv reads two superblocks per step (rounded up to 64-byte block reads),
+  // so with an odd superblock count its last row reads up to one superblock + 63 bytes past the data (lanes whose
+  // block is past the row contribute 0 x those bytes, which must be finite: zeros). 1024 covers every type.
+  static constexpr size_t kRawSlack = 1024;
+  // ARC_IQ3S_TILE=1 (2026-11-17, opt-in): a dense IQ3_S matrix's rows in pairs of superblocks repacked as planes (each
+  // pair's 224 bytes: qs, signs, qh, scales + d; zero/kernels/decode.cl decode32's IQ3T branch), which the one-token
+  // GEMV reads straight into registers (bench\gemv_iq3p.ps1: the laptop's 27B IQ3_S matrices 66-68 -> 70-77 GB/s).
+  // The same bytes, so the same results. Only where every row has an even number of superblocks (tile_ok: K a
+  // multiple of 512), so a pair never crosses a row; never the experts, whose kernels keep the plain layout.
+  static bool iq3t_env() {
+    static const bool on = getenv("ARC_IQ3S_TILE") && atoi(getenv("ARC_IQ3S_TILE")) != 0;
+    return on;
+  }
+  // (one pair of padded IQ3_S superblocks, in place: superblock h's 32-block b is lane L = 8 h + b)
+  static void iq3s_tile_pair(uint8_t* pr) {
+    uint8_t in[224], o[224] = {};
+    memcpy(in, pr, 224);
+    for (int L = 0; L < 16; ++L) {
+      const uint8_t* p = in + (L / 8) * 112;
+      const int ib = L % 8;
+      memcpy(o + 4 * L, p + 8 * ib, 4);
+      memcpy(o + 64 + 4 * L, p + 8 * ib + 4, 4);
+      memcpy(o + 128 + 4 * L, p + 72 + 4 * ib, 4);
+      o[192 + L] = p[64 + ib];
+    }
+    for (int h = 0; h < 2; ++h) {
+      memcpy(o + 208 + 4 * h, in + h * 112 + 104, 4);
+      memcpy(o + 216 + 2 * h, in + h * 112 + 108, 2);
+    }
+    memcpy(pr, o, 224);
+  }
+  cl_mem upload_padded(uint32_t type, const uint8_t* data, size_t nbytes, bool tile_ok = false, bool* tiled = nullptr) {
+    const size_t bb = gguf_sb_bytes(type), bp = raw_padded_sb_bytes(type), nsb = nbytes / bb;
+    const bool tile = tile_ok && type == GGML_IQ3_S && bp == 112 && nsb % 2 == 0 && iq3t_env();
+    if (tiled) *tiled = tile;
+    const size_t total = nsb * bp + kRawSlack;
+    // (in host memory while plan_tight's share of the weights lasts: the first matrices loaded; the same bytes and
+    //  kernels, so the logits are bit-identical)
+    const bool host = host_left_ >= total;
+    if (host) {
+      host_left_ -= total;
+      host_bytes_ += total;
+    }
+    if (opt.dry) {
+      if (!host) gpu_bytes += total;
+      return nullptr;
+    }
+    loadp::add((double)nbytes);
+    cl_int err;
+    cl_mem m;
+    uint8_t* dst;
+    if (host) {
+      void* p = zrt::host_alloc(total);
+      host_ptrs_.push_back(p);
+      m = zrt::wrap(p, total);
+      mems_.push_back(m);
+      dst = (uint8_t*)p;
+    } else {
+      m = clCreateBuffer(cl_.ctx, CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR, total, nullptr, &err);
+      CL_CHECK(err);
+      mems_.push_back(m);
+      gpu_bytes += total;
+      dst = (uint8_t*)clEnqueueMapBuffer(cl_.queue, m, CL_TRUE, CL_MAP_WRITE, 0, total, 0, nullptr, nullptr, &err);
+      CL_CHECK(err);
+    }
+    const int64_t chunks = (int64_t)((nsb + 4095) / 4096);
+#pragma omp parallel for schedule(static)
+    for (int64_t ch = 0; ch < chunks; ++ch) {
+      const size_t s0 = (size_t)ch * 4096, s1 = std::min(nsb, s0 + 4096);
+      if (bb == bp && !gpu_regrouped(type)) {
+        memcpy(dst + s0 * bp, data + s0 * bb, (s1 - s0) * bb);
+      } else {
+        for (size_t i = s0; i < s1; ++i) gpu_raw_sb(type, data + i * bb, dst + i * bp);
+      }
+      // (chunks of 4096 superblocks: the pairs stay inside one)
+      if (tile)
+        for (size_t i = s0; i + 1 < s1; i += 2) iq3s_tile_pair(dst + i * bp);
+    }
+    memset(dst + nsb * bp, 0, kRawSlack);
+    if (!host) CL_CHECK(clEnqueueUnmapMemObject(cl_.queue, m, dst, 0, nullptr, nullptr));
+    else host_src_note(m, type, data, nbytes, nsb);  // (ARC_HOST_CPU: the CPU's GEMV of it, zero/xe2/engine_hostcpu.h)
+    return m;
+  }
+
+  void fill(cl_mem b, size_t bytes) {
+    if (!b) return;  // (a dry load)
+    const uint32_t zero = 0;
+    CL_CHECK(clEnqueueFillBuffer(cl_.queue, b, &zero, 4, 0, bytes, 0, nullptr, nullptr));
+  }
+
+  // Uploads a matrix: raw rows always, plus its prompt-processing form when resident.
+  // (view: the raw rows already on the GPU, a sub-buffer of a stacked upload)
+  // ARC_W8_PARTIAL_GB=x (B60 prefill plan 13.6, opt-in until a discrete card measures it): when the weights are
+  // decoded just in time (raw + W8 above --budget), the layer matrices loaded first, up to x GB of decoded W8, keep
+  // that copy resident, so a prompt chunk decodes only the rest. The same values as decoded just in time (one decoder),
+  // so the logits are the same bit for bit. Not with a split model or MoE (their own plans); the head stays raw.
+  // ARC_W8_PARTIAL_GB=auto (2026-11-15, opt-in until a discrete card measures it): the same, sized by what is left once
+  // the model, its buffers and its context are on the GPU (w8_part_auto, after alloc_buffers): a Pro B70's 27B kept
+  // 13.3 GiB of its 32 GB busy at a 4K context, and 16 GB of resident W8 took its 4K prompt 2,217 -> 2,358 tok/s
+  // (joshdev-de, issue #27). A dry load (--ctx auto's sizing) takes none, so the context is what it was.
+  double w8_part_left_ = -1, w8_part_bytes_ = 0;
+  int w8_part_n_ = 0;
+  // (on by default on discrete cards since 2026-11-15: a Pro B70's 27B 4K prompt 2,490 -> 2,694 tok/s at runz's
+  //  4K context, 15.7 GiB resident, and 2,477 -> 2,578 at the server's 262K, 7.4 GiB; h8_decode 159 -> 64 / 116 ms;
+  //  logits bit-identical, the same --ctx auto context (joshdev-de, issue #27, e431da2). ARC_W8_PARTIAL_GB=0: off;
+  //  a number: that many GB, as before; iGPUs: off unless a number is given)
+  static bool w8_part_auto_env() {
+    static const bool v = !getenv("ARC_W8_PARTIAL_GB") || std::string(getenv("ARC_W8_PARTIAL_GB")) == "auto";
+    return v;
+  }
+  bool w8_part_take(int role, size_t bytes) {
+    if (w8_part_left_ < 0) {
+      const char* e = getenv("ARC_W8_PARTIAL_GB");
+      w8_part_left_ = e && !w8_part_auto_env() && !tp_on() && !hp.moe ? std::max(0.0, atof(e)) * 1073741824.0 : 0.0;
+    }
+    if (role >= kRoles - 1 || (double)bytes > w8_part_left_) return false;
+    w8_part_left_ -= (double)bytes;
+    w8_part_bytes_ += (double)bytes;
+    ++w8_part_n_;
+    return true;
+  }
+  // ARC_W8_PARTIAL_GB=auto: the layer matrices decoded just in time get a resident W8 copy, in load order, while the
+  // GPU share less driver_slack(), what is allocated, the server's state snapshots, the room kept for encoders and
+  // 0.5 GiB more leaves room. The copy is made by the same decode_w8 as the just-in-time one: bit-identical.
+  // Discrete cards only: on an iGPU the GPU's memory is the RAM Windows runs in, and a large resident copy costs more
+  // than it saves (a Core Ultra 9 285H, Arc 140T, 64 GB: the 27B kept 26.2 GiB resident, 39.5 GiB in all, and its 4K
+  // prompt fell from 340-357 to 176 tok/s; PascalSoftwares, issue #5, 2026-11-15). A number still works there.
+  void w8_part_auto() {
+    // (p140_: the 140T preset takes only weights decoded just in time, p140_take; on a discrete A-series card, where it is
+    //  the default, they stay so, as measured on the 140T)
+    // (w8_budget_gb <= 0: an engine that asked for no resident W8, as the server's Qwen3-ASR (server_whisper_asr.h),
+    //  loaded next to the chat model, whose memory gpu_bytes here does not see; runz --budget 0 likewise. Audit
+    //  2026-11-16)
+    if (!w8_part_auto_env() || opt.dry || w8_resident || tp_on() || hp.moe || p140_ || opt.w8_budget_gb <= 0) return;
+    const double GiB = 1073741824.0;
+    // (an iGPU with 16-lane XMX and a GPU share of 64 GiB or more, 2026-11-17: at most 16 GiB resident. Panther Lake's
+    //  B390 with 128 GB of RAM (a 114.5 GiB share), the 27B's 4K prompt 540-552 -> 583-592 tok/s with 16 GB (gee456,
+    //  issue #1). The 140T's 64 GB machine (a ~32 GiB share) stays out, as do iGPUs without XMX)
+    const bool big_igpu = zrt::integrated() && cl_.xmx && !cl_.sg8 && xmx_ && (double)device_mem() >= 64.0 * GiB;
+    if (zrt::integrated() && !big_igpu) {
+      if (getenv("ARC_W8_PARTIAL_GB"))  // (asked for: say why not; the default is quiet)
+        zlog::eprintf("inferzero: ARC_W8_PARTIAL_GB=auto is for discrete cards: on this iGPU the weights stay just in time "
+                      "(a number of GB, e.g. ARC_W8_PARTIAL_GB=4, still keeps that much resident)\n");
+      return;
+    }
+    // (the server keeps 3 state snapshots (kSnaps, tools/server.cpp), snapshot_bytes() counts 2: the third, allocated
+    //  at the first chat, is counted here too, not in snapshot_bytes(), which the --ctx auto plans and the expert cache
+    //  use as before. Audit 2026-11-16: ~150 MiB of the 27B's 0.5 GiB margin)
+    double room = (double)device_mem() - driver_slack() - (double)gpu_bytes - 0.5 * GiB -
+                  (double)snapshot_bytes() * 1.5 * std::max(opt.slots, 1) - (double)opt.stream_reserve;
+    if (big_igpu) room = std::min(room, 16.0 * GiB);  // (what was measured; the rest stays the system's RAM)
+    const double room0 = room;
+    for (Layer& L : layers_)
+      for (GpuWeight* w : {&L.qkv, &L.z, &L.ssm_out, &L.ab, &L.wq, &L.wk, &L.wv, &L.wo, &L.gate, &L.up, &L.down}) {
+        if (!w->raw || w->wq || w->type == GGML_Q8_0 || !is_w8_type(w->type) || w->role >= kRoles - 1) continue;
+        const size_t qb = w8_bytes_q(w->N, w->K), hb = w8_bytes_h(w->N, w->K);
+        if ((double)(qb + hb) > room) continue;
+        w->wq = buf(qb);
+        w->wh = buf(hb);
+        decode_w8(*w, w->wq, w->wh);
+        h8_res_rot_.erase(w);  // (a fresh, unrotated copy: H8 rotates it at its first use, engine_h8.h)
+        room -= (double)(qb + hb);
+        w8_part_bytes_ += (double)(qb + hb);
+        ++w8_part_n_;
+      }
+    if (w8_part_n_ == 0)
+      zlog::eprintf("inferzero: ARC_W8_PARTIAL_GB=auto: no room for resident W8 (%.2f GiB left after the context)\n", room0 / GiB);
+  }
+  GpuWeight make_weight(uint32_t type, const uint8_t* data, size_t nbytes, int N, int K, int role = kRoles - 1,
+                        const cl_mem* view = nullptr) {
+    // (QUEUE Q2, 2026-11-21 to 2026-11-23: Q4_1, Q5_0 and Q8_1 were decoded here on the CPU and stored as Q8_0, 1.7x
+    //  Q4_1's bytes; #88's B580 ran out of memory partly from that copy. Since 2026-11-23 they run on the GPU in their
+    //  own form, decode.cl decode32)
+    GpuWeight w;
+    w.role = role;
+    w.type = type;
+    w.N = N;
+    w.K = K;
+    w.raw = view ? *view : upload_padded(type, data, nbytes, K % 512 == 0, &w.iq3t);  // (a view: its stack's flag, set there)
+    // Q8_0 (per-32 float scales) is fastest in its own repacked kernel; everything else goes through W8. The
+    // repacked copy is kept only with resident weights of a dense model; otherwise (MoE: ~1.5 GB of Q8_0 matrices
+    // stored twice, or just-in-time models) prompt chunks decode the raw rows into the same form (decode_w8, PER32).
+    if (type == GGML_Q8_0 && (!w8_resident || hp.moe)) {
+      w.gemm_qtype = (int)type;
+      stage_need_q_[w.role] = std::max(stage_need_q_[w.role], w8_bytes_q(N, K));
+      stage_need_h_[w.role] = std::max(stage_need_h_[w.role], w8_bytes_h(N, K));
+      return w;
+    }
+    if (type == GGML_Q8_0) {
+      RepackedWeight r;
+      repack_rows(type, data, K, 0, N, r);
+      w.wq = buf(r.wq.size() * 4, r.wq.data());
+      w.wh = buf(r.wh.size() * 4, r.wh.data());
+      w.gemm_qtype = (int)type;
+      return w;
+    }
+    if (!is_w8_type(type)) throw std::runtime_error(std::string("unsupported weight type ") + ggml_type_name(type));
+    // per-32-scale types (Q4_0, IQ4_NL, Q2_0) decode into the native Q8_0 GEMM form (per-32 f32 scales; there is no
+    // such W8 variant)
+    w.gemm_qtype = w8_variant(type) == 4 ? (int)GGML_Q8_0 : 100 + w8_variant(type);
+    if (w8_requant(type) && w8_mins_on()) {  // (the values, scales and mins as the file has them: variant 102 / 103)
+      w.w8_mins = true;
+      w.gemm_qtype = 100 + w8_variant_mins(type);
+    }
+    const size_t qb = w8_bytes_q(N, K), hb = w8_bytes_h(N, K);
+    if (w8_resident || w8_part_take(role, qb + hb)) {
+      w.wq = buf(qb);
+      w.wh = buf(hb);
+      if (!opt.dry) decode_w8(w, w.wq, w.wh);
+      if (p140_res_) {  // (the long chunks' just-in-time decode: zero/xe2/engine_xe2.h)
+        stage_need_q_[w.role] = std::max(stage_need_q_[w.role], qb);
+        stage_need_h_[w.role] = std::max(stage_need_h_[w.role], hb);
+      }
+    } else {
+      stage_need_q_[w.role] = std::max(stage_need_q_[w.role], qb);
+      stage_need_h_[w.role] = std::max(stage_need_h_[w.role], hb);
+    }
+    return w;
+  }
+  // (11-16, 2026-11-21, QUEUE K1: the shared expert, the router, a / b and the indexer had the last slot together, so in a layer-major
+  //  prompt they took it from each other and were decoded again for every chunk: Flash Next, 4 chunks of 512, 1,124
+  //  decode_w8 launches for 398 in one chunk. Their own slots: once per segment. Not H8's roles, engine_h8.h)
+  static int weight_role(const std::string& name) {
+    static const char* roles[] = {"attn_qkv.", "attn_gate.", "ssm_out.", "attn_q.", "attn_k.", "attn_v.",
+                                  "attn_output.", "ffn_gate.", "ffn_up.", "ffn_down.", "nextn.eh_proj.",
+                                  "ffn_gate_shexp.", "ffn_up_shexp.", "ffn_down_shexp.", "ffn_gate_inp.", "ssm_alpha.",
+                                  "indexer."};
+    static_assert(sizeof(roles) / sizeof(roles[0]) < kRoles, "the last role is the shared slot");
+    for (int r = 0; r < (int)(sizeof(roles) / sizeof(roles[0])); ++r)
+      if (name.find(roles[r]) != std::string::npos) return r;
+    return kRoles - 1;
+  }
+  // a matrix the loaders read as rows: two dimensions or more, sizes an int holds, bytes present (a damaged or hostile
+  // GGUF: an error here, not a read past the tensor or at address 0)
+  static const GgufTensor& mat(const GgufTensor& t) {
+    if (t.dims.size() < 2 || t.dims[0] == 0 || t.dims[1] == 0 || t.dims[0] > (uint64_t)INT32_MAX ||
+        t.dims[1] > (uint64_t)INT32_MAX || t.dims[0] * t.dims[1] > (uint64_t)INT32_MAX || (!t.data && t.nbytes))
+      throw std::runtime_error("unexpected tensor shape: " + t.name);
+    return t;
+  }
+  // (a tensor's bytes as make_weight stores it on the GPU, for the memory plans: Q4_1, Q5_0 and Q8_1 become Q8_0, 34
+  //  bytes per 32 values, 1.7x Q4_1's 20. The plans counted the file's bytes: xtronema's B580 (#88), a 27B with Q4_1
+  //  tensors, was planned with too few weights in host memory, overfilled the card, and the driver's eviction to
+  //  system RAM ran a 15.4 GiB PC out of memory. Other types: the file's bytes, as before)
+  static double stored_bytes(const GgufTensor& t) {
+    // (since 2026-11-23 every quantized type is stored in its own bytes: Q4_1 / Q5_0 / Q8_1 no longer become Q8_0.
+    //  Kept as the plans' one place for a type whose stored form differs from the file's)
+    return (double)t.nbytes;
+  }
+  // (one log line per type that has no GPU kernel and is requantized at load; the float types say nothing, as before;
+  //  none is left since 2026-11-23)
+  static void note_requant(uint32_t) {}
+  GpuWeight load_w(const std::string& name) {
+    const GgufTensor& t = mat(T(name));
+    const int K = (int)t.dims[0], N = (int)t.dims[1];
+    if (float_type(t.type)) {
+      note_requant(t.type);
+      // (in row blocks: the same bytes as the whole matrix at once, without N x K floats in RAM)
+      const auto q8 = requant_rows_q8_0(t.type, t.data, t.nbytes / (size_t)N, N, K);
+      return make_weight(GGML_Q8_0, q8.data(), q8.size(), N, K, weight_role(name));
+    }
+    return make_weight(t.type, t.data, t.nbytes, N, K, weight_role(name));
+  }
+  // DeltaNet input projections (qkv, z = attn_gate, ab = alpha + beta). When qkv and z have the same quantized type
+  // they are uploaded as one stack of rows (with ab, already Q8_0, when they are Q8_0 too): a single token runs one GEMV
+  // over all of them (Layer::qz); the matrices are views of it, stored once.
+  // ("float": requantized to Q8_0 at load. The float types, and since 2026-11-21 the ones with no GPU kernel, Q5_0
+  //  and Q8_1, decoded on the CPU: QUEUE Q2. Since 2026-11-23 Q4_1, Q5_0 and Q8_1 run on the GPU itself, decode.cl
+  //  decode32, #88)
+  static bool float_type(uint32_t t) {
+    return t == GGML_F32 || t == GGML_F16 || t == GGML_BF16;
+  }
+  // a float matrix as the Q8_0 rows load_w would make of it (kept in `keep`), so that it can be stacked with others
+  const GgufTensor& as_q8(const GgufTensor& t, GgufTensor& out, std::vector<uint8_t>& keep) {
+    mat(t);
+    note_requant(t.type);
+    keep = requant_rows_q8_0(t.type, t.data, t.nbytes / (size_t)t.dims[1], (int)t.dims[1], (int)t.dims[0]);
+    out = t;
+    out.type = GGML_Q8_0;
+    out.data = keep.data();
+    out.nbytes = keep.size();
+    return out;
+  }
+  void load_gdn_in(Layer& L, const std::string& p) {
+    if (hp.hc && fn_ab32() && !tp_on()) {
+      const GgufTensor &alpha = T(p + "ssm_alpha.weight"), &beta = T(p + "ssm_beta.weight");
+      const int E = hp.n_embd, N = hp.ssm_nv;
+      if (alpha.nelements() != (uint64_t)N * E || beta.nelements() != (uint64_t)N * E)
+        throw std::runtime_error("unexpected DeltaNet gate projection shape");
+      std::vector<float> values((size_t)2 * N * E);
+      dequant_row(alpha.type, alpha.data, N * E, values.data());
+      dequant_row(beta.type, beta.data, N * E, values.data() + (size_t)N * E);
+      L.ab_f32 = buf(values.size() * sizeof(float), values.data());
+    }
+    GgufTensor q8q, q8z;
+    std::vector<uint8_t> kq, kz;
+    const GgufTensor *pq = &T(p + "attn_qkv.weight"), *pz = &T(p + "attn_gate.weight");
+    // (float qkv / z (a BF16 GGUF: Xiaomi-OCR-0): the same Q8_0 rows load_w makes, stacked as quantized ones are)
+    if (float_type(pq->type) && float_type(pz->type) && !getenv("ARC_NO_QZ_FLT")) {
+      pq = &as_q8(*pq, q8q, kq);
+      pz = &as_q8(*pz, q8z, kz);
+    }
+    const GgufTensor &tq = *pq, &tz = *pz;
+    const int E = hp.n_embd, C = (int)tq.dims[1], Di = (int)tz.dims[1], nab = 2 * hp.ssm_nv;
+    const bool quant = tq.type != GGML_F32 && tq.type != GGML_F16 && tq.type != GGML_BF16;
+    if (!quant || tq.type != tz.type || tq.dims[0] != E || tz.dims[0] != E || E % 256 || C % 64 || Di % 64 ||
+        C != hp.conv_dim() || Di != hp.ssm_d_inner) {
+      L.qkv = load_w(p + "attn_qkv.weight");
+      L.z = load_w(p + "attn_gate.weight");
+      L.ab = load_q8_concat(p + "ssm_alpha.weight", p + "ssm_beta.weight");
+      return;
+    }
+    const uint32_t type = tq.type;
+    std::vector<uint8_t> ab;
+    {
+      const GgufTensor &ta = T(p + "ssm_alpha.weight"), &tb = T(p + "ssm_beta.weight");
+      if (mat(ta).nelements() < (uint64_t)nab / 2 * E || mat(tb).nelements() < (uint64_t)nab / 2 * E)
+        throw std::runtime_error("unexpected tensor shape: " + ta.name);
+      std::vector<float> v((size_t)tp_rows(nab) * E, 0.0f);  // (a split model: padded rows of zeros, see gdn_ab)
+      dequant_row(ta.type, ta.data, (int64_t)nab / 2 * E, v.data());
+      dequant_row(tb.type, tb.data, (int64_t)nab / 2 * E, v.data() + (size_t)nab / 2 * E);
+      ab = quantize_rows_q8_0(v.data(), tp_rows(nab), E);
+    }
+    L.qz_ab = !(hp.hc && fn_ab32() && !tp_on()) && type == GGML_Q8_0 && nab % 16 == 0 && !getenv("ARC_NO_QZAB16");
+    std::vector<uint8_t> cat(tq.nbytes + tz.nbytes + (L.qz_ab ? ab.size() : 0));
+    memcpy(cat.data(), tq.data, tq.nbytes);
+    memcpy(cat.data() + tq.nbytes, tz.data, tz.nbytes);
+    if (L.qz_ab) memcpy(cat.data() + tq.nbytes + tz.nbytes, ab.data(), ab.size());
+    L.qz.type = type;
+    L.qz.N = C + Di + (L.qz_ab ? nab : 0);
+    L.qz.K = E;
+    L.qz.role = kRoles - 1;
+    L.qz.raw = upload_padded(type, cat.data(), cat.size(), E % 512 == 0, &L.qz.iq3t);
+    has_qz_ = true;
+    const size_t sbr = (size_t)E / 256 * raw_padded_sb_bytes(type);
+    auto view = [&](int row0, int N) -> cl_mem {
+      if (!L.qz.raw) return nullptr;  // (dry load)
+      cl_buffer_region reg{(size_t)row0 * sbr, (size_t)N * sbr + kRawSlack};  // (the slack upload_padded leaves: the
+                                                                               //  GEMV reads up to BBP + 63 past a row)
+      cl_int err;
+      cl_mem m = clCreateSubBuffer(L.qz.raw, CL_MEM_READ_ONLY, CL_BUFFER_CREATE_TYPE_REGION, &reg, &err);
+      CL_CHECK(err);
+      mems_.push_back(m);
+      return m;
+    };
+    const cl_mem vq = view(0, C), vz = view(C, Di);
+    L.qkv = make_weight(type, tq.data, tq.nbytes, C, E, weight_role(p + "attn_qkv.weight"), &vq);
+    L.z = make_weight(type, tz.data, tz.nbytes, Di, E, weight_role(p + "attn_gate.weight"), &vz);
+    L.qkv.iq3t = L.z.iq3t = L.qz.iq3t;  // (views of the stack: its layout; rows start at whole pairs)
+    if (L.qz_ab) {
+      const cl_mem va = view(C + Di, nab);
+      L.ab = make_weight(GGML_Q8_0, ab.data(), ab.size(), nab, E, weight_role(p + "ssm_alpha.weight"), &va);  // (nab % 64 == 0: not padded)
+    } else {
+      L.ab = make_weight(GGML_Q8_0, ab.data(), ab.size(), tp_rows(nab), E, weight_role(p + "ssm_alpha.weight"));
+    }
+  }
+  // Two matrices with the same K stacked by rows, requantized to Q8_0 (the tiny DeltaNet gate projections).
+  // Matrices of one quantized type and row length as one stack of rows, their GGUF blocks copied as they are (the
+  // values unchanged; a row's result does not depend on the others): one GEMV / GEMM instead of one per matrix.
+  // BF16 / F16 / F32 matrices (Qwen3-ASR's BF16 file) are requantized to Q8_0 row by row, as a single one is.
+  GpuWeight load_w_stack(std::initializer_list<std::string> names) {
+    const GgufTensor& t0 = T(*names.begin());
+    const bool flt = float_type(t0.type);
+    if (flt) note_requant(t0.type);
+    const int K = (int)t0.dims[0];
+    std::vector<uint8_t> cat;
+    int N = 0;
+    for (const std::string& n : names) {
+      const GgufTensor& t = T(n);
+      if (t.type != t0.type || t.dims[0] != t0.dims[0])
+        throw std::runtime_error("load_w_stack: matrices of different shapes or types: " + n);
+      if (flt) {
+        const auto q = requant_rows_q8_0(t.type, t.data, t.nbytes / (size_t)t.dims[1], (int)t.dims[1], K);
+        cat.insert(cat.end(), q.begin(), q.end());
+      } else {
+        cat.insert(cat.end(), t.data, t.data + t.nbytes);
+      }
+      N += (int)t.dims[1];
+    }
+    if (flt) return make_weight(GGML_Q8_0, cat.data(), cat.size(), N, K, weight_role(*names.begin()));
+    return make_weight(t0.type, cat.data(), cat.size(), N, K, weight_role(*names.begin()));
+  }
+  GpuWeight load_q8_concat(const std::string& a, const std::string& b) {
+    const GgufTensor &ta = mat(T(a)), &tb = mat(T(b));
+    if (tb.dims[0] != ta.dims[0]) throw std::runtime_error("unexpected tensor shape: " + b);
+    const int K = (int)ta.dims[0], Na = (int)ta.dims[1], Nb = (int)tb.dims[1], Np = tp_rows(Na + Nb);
+    std::vector<float> v((size_t)Np * K, 0.0f);  // (a split model: rows of zeros up to the GEMM's 16, see gdn_ab)
+    dequant_row(ta.type, ta.data, Na * K, v.data());
+    dequant_row(tb.type, tb.data, Nb * K, v.data() + (size_t)Na * K);
+    auto q8 = quantize_rows_q8_0(v.data(), Np, K);
+    return make_weight(GGML_Q8_0, q8.data(), q8.size(), Np, K, weight_role(a));
+  }
+  // a weight matrix of the size the model's dimensions give (N rows, rows of K; -1: any): one wider than the buffer
+  // its product writes, or longer rows than the activations hold, would go past them on the GPU (a broken or
+  // mismatched GGUF); refused when it is loaded
+  static void expect(const GpuWeight& w, int N, int K, const std::string& name) {
+    if ((N >= 0 && w.N != N) || (K >= 0 && w.K != K && w.K != padded_k(K)))
+      throw std::runtime_error("unexpected tensor shape: " + name + " is " + std::to_string(w.N) + " x " + std::to_string(w.K) +
+                               ", the model's dimensions give " + std::to_string(N) + " x " + std::to_string(K));
+  }
+  // a vector of n values (a norm's weights; the kernels read n of them)
+  cl_mem load_vec(const std::string& name, int n) {
+    if (f_.get(name).nelements() != (uint64_t)n)
+      throw std::runtime_error("unexpected tensor shape: " + name + " (" + std::to_string(n) + " values expected)");
+    return load_f32(name);
+  }
+  cl_mem load_f32(const std::string& name) {
+    const GgufTensor& t = T(name);
+    if ((!t.data && t.nbytes) || t.nelements() > (uint64_t)INT32_MAX) throw std::runtime_error("unexpected tensor shape: " + name);
+    std::vector<float> v(t.nelements());
+    dequant_row(t.type, t.data, (int)v.size(), v.data());
+    return buf(v.size() * 4, v.data());
+  }
+  // A matrix with its rows padded to Np rows of zeros and, for a type of small blocks (32 / 64: Q8_0, IQ4_NL, Q2_0)
+  // whose K is not whole superblocks, its columns to padded_k(K) (zero blocks): Flash Next's 640-wide shared expert as 768 (the extra outputs are 0).
+  GpuWeight load_w_pad(const std::string& name, int Np) {
+    const GgufTensor& t = mat(f_.get(name));
+    const int K = (int)t.dims[0], N = (int)t.dims[1];
+    // (more rows than the model's dimension: the padded copy below has room for Np rows only)
+    if (N > Np) throw std::runtime_error("unexpected tensor shape: " + name + " has " + std::to_string(N) + " rows, the model " + std::to_string(Np));
+    if (K % 256 == 0 && N == Np) return load_w(name);
+    if (float_type(t.type)) {  // (as load_w: requantized to Q8_0, padded
+      const int Kp = padded_k(K);                                            //  with zeros to Np rows of Kp values)
+      std::vector<float> v((size_t)Np * Kp, 0.0f);
+      std::vector<float> row(K);
+      for (int r = 0; r < N; ++r) {
+        dequant_row(t.type, t.data + (size_t)r * (t.nbytes / N), K, row.data());
+        std::copy(row.begin(), row.end(), v.begin() + (size_t)r * Kp);
+      }
+      auto q8 = quantize_rows_q8_0(v.data(), Np, Kp);
+      return make_weight(GGML_Q8_0, q8.data(), q8.size(), Np, Kp, weight_role(name));
+    }
+    int blk = 0, bytes = 0;
+    ggml_block_info(t.type, blk, bytes);
+    if (K % 256 && (blk >= 256 || K % blk)) throw std::runtime_error("unsupported row length: " + name);
+    const int Kp = padded_k(K);
+    const size_t prb = (size_t)Kp / blk * bytes;
+    std::vector<uint8_t> v((size_t)Np * prb, 0);
+    if (K % 256) pad_small_block_rows(t.type, t.data, N, K, v.data());
+    else memcpy(v.data(), t.data, (size_t)N * prb);
+    return make_weight(t.type, v.data(), v.size(), Np, Kp, weight_role(name));
+  }
+  // Flash Next mixer: the low-rank down rows [hc_lr][HCE] and the inject rows [hc_n][HCE] stacked (padded to 16 rows)
+  // as one Q8_0 matrix: the GEMM gives both from the same normed input.
+  GpuWeight load_hc_down(const std::string& down, const std::string& inject) {
+    const int K = hp.hce(), LR = hp.hc_lr, NI = inject.empty() ? 0 : hp.hc_n, N = (LR + NI + 15) / 16 * 16;
+    std::vector<float> v((size_t)N * K, 0.0f);
+    const GgufTensor& td = f_.get(down);
+    if ((int)td.dims[0] != K || (int)td.dims[1] != LR) throw std::runtime_error("unexpected tensor shape: " + down);
+    dequant_row(td.type, td.data, (int64_t)LR * K, v.data());
+    if (NI) {
+      const GgufTensor& ti = f_.get(inject);
+      if ((int)ti.dims[0] != K || (int)ti.dims[1] != NI) throw std::runtime_error("unexpected tensor shape: " + inject);
+      dequant_row(ti.type, ti.data, (int64_t)NI * K, v.data() + (size_t)LR * K);
+    }
+    if (hc_bf16()) return hc_exact_weight(v, N, K);
+    auto q8 = quantize_rows_q8_0(v.data(), N, K);
+    return make_weight(GGML_Q8_0, q8.data(), q8.size(), N, K);
+  }
+  // Flash Next's precise mode, ARC_FN_PRECISE=1 (QUEUE 2, 2026-10-24; 363 tokens of README text against the f32
+  // reference, KL prompt / decode): the mixer rows as the file's BF16 values, exact (hc_down1 / hc_up1 / hc_gemm_f32
+  // -DHC_BF16, f32 inputs in prompts too: with Q8_0 rows every block's residual was ~0.5 % off), the router and shared
+  // gate rows BF16 too (gemv_bf16), every matmul input on two int8 passes, the experts included: 0.0143 / 0.0147 ->
+  // 0.0117 / 0.0096, 4K prompt 180 -> 87 tok/s, generation 6.1 -> 5.4. The BF16 rows alone, on one pass: 0.0137 / 0.0154
+  // at 139 tok/s (the int8 inputs dominate). What is left is mostly the int8 attention (q / K / V per row: simulated
+  // in the f32 reference, +0.11 % at layer 3 as in the engine; per-32 scales +0.06 %): float attention with the QSA
+  // masks is the next step.
+  // (Flash Next's default since 2026-11-22, the user's choice once its PLE block and Q4_K prompt rows were made exact:
+  //  KL on 480 tokens of markdown 0.0415 (the fast mode) -> 0.0033, prose 0.0109 -> 0.0073, at about 60 % of the fast
+  //  mode's prompt speed. ARC_FN_PRECISE=0 / serverz --fast: the fast mode; a model with AR4_128 experts keeps it on
+  //  for its own engine, fn_precise_hold_)
+  bool fn_precise() const {
+    static const bool env = !getenv("ARC_FN_PRECISE") || atoi(getenv("ARC_FN_PRECISE")) != 0;
+    return (opt.fn_precise >= 0 ? opt.fn_precise != 0 : env) || fn_precise_hold_.on;  // (EngineOptions::fn_precise: a variant's)
+  }
+  // (each of precise mode's parts alone, for measuring which one carries the default mode's error (the plan's F1,
+  //  2026-11-18). The HC mixers' rows as the file has them (BF16) are the default since 2026-11-19 (the user's
+  //  choice): the default mode's KL against f32 0.0153 / 0.0283 / 0.0105 -> 0.0046 / 0.0083 / 0.0091 (160 code tokens,
+  //  token by token, 3,584 of prose), at -16 % prompt and -6 % generation on the laptop (0.73 GiB more read a token,
+  //  out of the expert cache). ARC_FN_HCBF16=0: the Q8_0 rows of before. ARC_FN_AB32=1 DeltaNet's alpha / beta in f32)
+  bool hc_bf16() const { return fn_precise() || hc_bf16_env(); }
+  // (precise mode, 2026-11-22: prompt chunks' Q2_K / Q4_K / Q5_K matrices decoded with their mins (gemm.cl 102 / 103),
+  //  not requantized to signed int8 (~1/16 of a quantization step off): the values the token-by-token GEMVs use, so a
+  //  prompt row is computed as a generated one. ARC_W8_MINS=0: requantized, as before)
+  bool w8_mins_on() const {
+    static const bool off = getenv("ARC_W8_MINS") && atoi(getenv("ARC_W8_MINS")) == 0;
+    return hp.hc && fn_precise() && !off;
+  }
+  // ARC_FN_KV16=1 (a test, 2026-11-21, the user for manoreken2's stray words, #4): only precise mode's attention part,
+  // the K / V cache in f16 and the scores in f32, the default mode otherwise (one pass, the default experts and H8):
+  // whether the int8 keys carry the cross-language words
+  bool fn_kv16() const {
+    static const bool env = getenv("ARC_FN_KV16") && atoi(getenv("ARC_FN_KV16")) != 0;
+    return env;
+  }
+  bool fn_ab32() const {
+    static const bool env = getenv("ARC_FN_AB32") && atoi(getenv("ARC_FN_AB32")) != 0;
+    return fn_precise() || env;
+  }
+  // Q8 and F32 GGUF rows need not be exactly representable as BF16 after dequantization.
+  // Preserve them in F32; BF16 source values retain the compact existing path.
+  static bool hc_bf16_exact(const std::vector<float>& v) {
+    for (float x : v) {
+      uint32_t bits;
+      memcpy(&bits, &x, sizeof bits);
+      if (bits & 0xffffu) return false;
+    }
+    return true;
+  }
+  GpuWeight hc_exact_weight(const std::vector<float>& v, int N, int K) {
+    if (hc_bf16_exact(v)) return bf16_weight(v, N, K);
+    GpuWeight w;
+    w.type = GGML_F32;
+    w.N = N;
+    w.K = K;
+    w.raw = buf(v.size() * sizeof(float) + kRawSlack, nullptr);
+    if (w.raw) CL_CHECK(clEnqueueWriteBuffer(cl_.queue, w.raw, CL_TRUE, 0, v.size() * sizeof(float), v.data(), 0, nullptr, nullptr));
+    return w;
+  }
+  static std::string hc_weight_defs(const GpuWeight& w) {
+    return w.type == GGML_F32 ? " -DHC_F32" : w.type == GGML_BF16 ? " -DHC_BF16" : "";
+  }
+  // rows of f32 values that came from BF16 (exact) stored back as BF16, for the -DHC_BF16 kernels
+  GpuWeight bf16_weight(const std::vector<float>& v, int N, int K) {
+    std::vector<uint16_t> bf(v.size());
+    for (size_t i = 0; i < v.size(); ++i) {
+      uint32_t u;
+      memcpy(&u, &v[i], 4);
+      bf[i] = (uint16_t)(u >> 16);
+    }
+    GpuWeight w;
+    w.type = GGML_BF16;
+    w.N = N;
+    w.K = K;
+    w.raw = buf(bf.size() * 2 + kRawSlack, nullptr);
+    if (w.raw) CL_CHECK(clEnqueueWriteBuffer(cl_.queue, w.raw, CL_TRUE, 0, bf.size() * 2, bf.data(), 0, nullptr, nullptr));
+    return w;
+  }
+  // a matrix [N][K] as the file's values, exact (BF16 rows as BF16, else f32), for hc_gemm_f32: Flash Next's PLE key
+  // and value in precise mode (2026-11-22: as Q8_0 rows the value was 0.45 % off the reference, the key 0.15 %)
+  GpuWeight load_exact(const std::string& name) {
+    const GgufTensor& t = f_.get(name);
+    const int K = (int)t.dims[0], N = (int)t.dims[1];
+    if (K % 256) throw std::runtime_error("exact rows need K a multiple of 256: " + name);
+    std::vector<float> v((size_t)N * K);
+    dequant_row(t.type, t.data, (int64_t)N * K, v.data());
+    return hc_exact_weight(v, N, K);
+  }
+  int hc_lr_pad() const { return padded_k(hp.hc_lr); }
+  // Flash Next mixer up projection [HCE][hc_lr], its K padded with zeros to a multiple of 256
+  GpuWeight load_hc_up(const std::string& name) {
+    const GgufTensor& t = f_.get(name);
+    const int K = hp.hc_lr, N = hp.hce(), KP = hc_lr_pad();
+    if ((int)t.dims[0] != K || (int)t.dims[1] != N) throw std::runtime_error("unexpected tensor shape: " + name);
+    std::vector<float> a((size_t)N * K), v((size_t)N * KP, 0.0f);
+    dequant_row(t.type, t.data, (int64_t)N * K, a.data());
+    for (int n = 0; n < N; ++n) memcpy(&v[(size_t)n * KP], &a[(size_t)n * K], (size_t)K * 4);
+    if (hc_bf16()) return hc_exact_weight(v, N, KP);
+    auto q8 = quantize_rows_q8_0(v.data(), N, KP);
+    return make_weight(GGML_Q8_0, q8.data(), q8.size(), N, KP);
+  }
+
+  // Qwen3.8 Flash Next's MTP head in a file of its own (QUEUE F34, GitHub #7): --mtp-model FILE, else an mtp-*.gguf next
+  // to the model of the same architecture whose blocks are this model's plus its nextn block (llama.cpp's form: the
+  // base model's head, e.g. mtp-Qwen3.8-Flash-Next-Q4_0.gguf). Its blk.N.* tensors join f_'s list, so the loaders read
+  // them as the model's own; its output / token_embd are not taken (the model's are used: drafts are verified anyway).
+  // Runs before load_hparams (no pointer into f_'s tensor list is kept yet). Without --mtp: nothing.
+  void adopt_mtp_file() {
+    const std::string a = f_.get_str("general.architecture");
+    // (--draft dflash without a DFlash2 folder still drafts with the block, as init() decides after this)
+    // (qwen35: a fine-tune shipped without its nextn block takes its base model's, e.g. the Qwen3.8 27B
+    //  GGUF's block: --mtp-model <base model .gguf>; drafts are verified, so the output stays the model's own)
+    if ((a != "qwen4exp" && a != "qwen35") || !opt.mtp || (!opt.mtp_block && !opt.dflash.empty())) return;
+    const int64_t nb = f_.get_int(a + ".block_count", 0);
+    if (nb <= 0 || f_.get_int(a + ".nextn_predict_layers", 0) > 0) return;  // (a block of its own)
+    const std::string mp = "blk." + std::to_string(nb) + ".";
+    auto fits = [&](const std::string& p) {
+      try {
+        auto g = std::make_unique<GgufFile>(p);
+        if (g->get_str("general.architecture") != a || g->get_int(a + ".block_count", 0) != nb + 1 ||
+            g->get_int(a + ".nextn_predict_layers", 0) != 1 ||
+            g->get_int(a + ".embedding_length", -1) != f_.get_int(a + ".embedding_length", -2) ||
+            g->get_int(a + ".expert_count", -1) != f_.get_int(a + ".expert_count", -1) ||  // (dense: both absent)
+            !g->find(mp + "nextn.eh_proj.weight"))
+          return false;
+        // (and the same heads, head sizes and vocabulary: a head from another model of the same width would load
+        //  and draft nothing useful, or index past this model's embedding; 2026-11-21, with PR #68)
+        for (const char* k : {".attention.head_count", ".attention.head_count_kv", ".attention.key_length",
+                              ".attention.value_length", ".feed_forward_length"})
+          if (g->get_int(a + k, -1) != f_.get_int(a + k, -1)) return false;
+        const GgufTensor* te = g->find("token_embd.weight");
+        const GgufTensor* tm = f_.find("token_embd.weight");
+        if (te && tm && te->dims != tm->dims) return false;
+        mtp_file_ = std::move(g);
+        return true;
+      } catch (const std::exception&) {
+        return false;
+      }
+    };
+    const bool given = !opt.mtp_model.empty() && fits(opt.mtp_model);
+    if (!opt.mtp_model.empty() && !given) {
+      const std::string why = "--mtp-model " + opt.mtp_model + ": not an MTP head of this model (" + a + ", " +
+                              std::to_string(nb) + " blocks + 1)";
+      if (!opt.mtp_model_soft) throw std::runtime_error(why);
+      zlog::eprintf("inferzero: %s; an mtp-*.gguf next to the model is taken instead, if any\n", why.c_str());
+    }
+    if (!given) {
+      namespace fs = std::filesystem;
+      std::error_code ec;
+      const fs::path dir = fs::path(path_).parent_path();
+      for (const auto& e : fs::directory_iterator(dir.empty() ? fs::path(".") : dir, ec)) {
+        const std::string n = e.path().filename().string();
+        if (n.rfind("mtp-", 0) == 0 && e.path().extension() == ".gguf" && fits(e.path().string())) break;
+      }
+    }
+    if (!mtp_file_) return;
+    const int n = f_.adopt(*mtp_file_, mp);
+    mtp_ext_ = true;
+    zlog::eprintf("inferzero: MTP head %s (%d tensors)\n", mtp_file_->path.c_str(), n);
+  }
+
+  void load_weights() {
+    // The output head first: the GPU reads a large buffer allocated late in the load (after gigabytes of other
+    // weights) at about half the speed (Gemma 4 12B's 826 MB head: 14 ms per token first, 21-28 ms last).
+    // (a layer split's stage, opt.pp_begin / pp_end: its layers only, in layers_ from 0 with each layer's own il; the
+    //  head and the MTP block on the last stage only; Qwen's dense and standard MoE models (2026-11-22: each stage its
+    //  own expert cache for its layers, open_experts), not Gemma, DeepSeek or Flash Next yet)
+    const int lb = std::max(0, opt.pp_begin), le = opt.pp_end < 0 ? hp.n_layer : std::min(opt.pp_end, hp.n_layer);
+    if ((lb > 0 || le < hp.n_layer) && (hp.gemma || hp.ds41 || hp.hc || (hp.moe && !hp.moe_std) || hp.ple_layer >= 0 || lb >= le))
+      throw std::runtime_error("--split layer: Qwen's dense and standard MoE models only for now (not Gemma, DeepSeek or "
+                               "Flash Next) and a non-empty range of layers");
+    if (pp_last()) load_head();
+    if (hp.gemma) return load_weights_gemma4();
+    if (hp.ds41) return load_weights_ds41();
+    if (hp.inkling) return load_weights_inkling();
+    layers_.resize(le - lb);
+    for (int il = lb; il < le; ++il) {
+      Layer& L = layers_[il - lb];
+      L.il = il;
+      const std::string p = "blk." + std::to_string(il) + ".";
+      if (hp.hc) {
+        for (int b = 0; b < 2; ++b) {
+          const std::string hp_ = p + (b ? "hc_ffn" : "hc_attn");
+          L.hc_norm[b] = load_f32(hp_ + "_norm.weight");
+          L.hc_down[b] = load_hc_down(hp_ + "_down.weight", hp_ + "_inject.weight");
+          L.hc_up[b] = load_hc_up(hp_ + "_up.weight");
+        }
+        if (il == hp.ple_layer) {
+          // (precise mode: the file's BF16 rows, exact, for hc_gemm_f32 on f32 inputs; else Q8_0 for the int8 GEMMs)
+          L.ple_key = fn_precise() ? load_exact(p + "ple_key.weight") : load_w(p + "ple_key.weight");
+          L.ple_value = fn_precise() ? load_exact(p + "ple_value.weight") : load_w(p + "ple_value.weight");
+          L.ple_nk = load_f32(p + "ple_norm_key.weight");
+          L.ple_nq = load_f32(p + "ple_norm_query.weight");
+          L.ple_nc = load_f32(p + "ple_norm_conv.weight");
+          L.ple_cw = load_f32(p + "ple_conv1d.weight");
+          if (L.ple_key.N != hp.hce() || L.ple_key.K != hp.n_embd || L.ple_value.N != hp.n_embd)
+            throw std::runtime_error("unexpected PLE block shape");
+        }
+      } else {
+        L.attn_norm = load_vec(p + "attn_norm.weight", hp.n_embd);
+        L.post_norm = load_vec(p + (hp.qwen3 ? "ffn_norm.weight" : "post_attention_norm.weight"), hp.n_embd);
+      }
+      if (hp.recurrent(il)) {
+        load_gdn_in(L, p);
+        L.ssm_out = load_w(p + "ssm_out.weight");
+        expect(L.ssm_out, hp.n_embd, -1, p + "ssm_out.weight");
+        L.dt_bias = load_f32(p + "ssm_dt.bias");
+        L.ssm_a = load_f32(p + "ssm_a");
+        L.conv_w = load_f32(p + "ssm_conv1d.weight");
+        L.ssm_norm = load_f32(p + "ssm_norm.weight");
+        L.conv_state = buf(conv_bytes());
+        L.S = buf((size_t)hp.ssm_nv * hp.ssm_d_state * hp.ssm_d_state * 4);
+        if (opt.mtp && !hp.gemma) {
+          const size_t g0 = gpu_bytes, rows = 1 + kMaxDrafts;
+          L.S_next = buf((size_t)hp.ssm_nv * hp.ssm_d_state * hp.ssm_d_state * 4);
+          L.conv_pre = buf(conv_bytes());
+          L.xin = buf(rows * hp.conv_dim() * 4);
+          L.qkvin = buf(rows * hp.conv_dim() * 4);
+          L.abin = buf(rows * 2 * hp.ssm_nv * 4);
+          mem_mtp_ += gpu_bytes - g0;  // (the state of a verification pass, for rejected drafts)
+        }
+      } else {
+        load_attn(L, p);
+      }
+      if (hp.moe) {
+        load_moe(L, p);
+      } else if ((hp.qwen3 || (float_type(f_.get(p + "ffn_gate.weight").type) && !getenv("ARC_NO_GU_FLT"))) &&
+                 f_.get(p + "ffn_gate.weight").type == f_.get(p + "ffn_up.weight").type) {
+        L.gate = load_w_stack({p + "ffn_gate.weight", p + "ffn_up.weight"});  // (rows [gate | up], L.up empty: layer_ffn)
+        L.down = load_w(p + "ffn_down.weight");
+        expect(L.gate, 2 * hp.n_ff, hp.n_embd, p + "ffn_gate.weight + ffn_up.weight");
+      } else {
+        L.gate = load_w(p + "ffn_gate.weight");
+        L.up = load_w(p + "ffn_up.weight");
+        L.down = load_w(p + "ffn_down.weight");
+        expect(L.gate, hp.n_ff, hp.n_embd, p + "ffn_gate.weight");
+        expect(L.up, hp.n_ff, hp.n_embd, p + "ffn_up.weight");
+      }
+      if (!hp.moe) expect(L.down, hp.n_embd, hp.n_ff, p + "ffn_down.weight");
+      clFinish(cl_.queue);
+    }
+    // MTP (nextn) block: eh_proj + one gated-attention layer + FFN, sharing the output head
+    const std::string mp = "blk." + std::to_string(hp.n_layer) + ".";
+    const size_t g_mtp = gpu_bytes;
+    struct MtpBytes { Engine& e; size_t g0; ~MtpBytes() { e.mem_mtp_ += e.gpu_bytes - g0; } } mtp_bytes{*this, g_mtp};
+    if (opt.mtp && opt.mtp_block && pp_last() && f_.find(mp + "nextn.eh_proj.weight")) {
+      has_mtp = mtp_block_ = true;
+      mtp_.il = hp.n_layer;
+      if (hp.hc) {  // (Flash Next, QUEUE F34: a layer as its others, with the mixers; no PLE)
+        for (int b = 0; b < 2; ++b) {
+          const std::string hp_ = mp + (b ? "hc_ffn" : "hc_attn");
+          mtp_.hc_norm[b] = load_f32(hp_ + "_norm.weight");
+          mtp_.hc_down[b] = load_hc_down(hp_ + "_down.weight", hp_ + "_inject.weight");
+          mtp_.hc_up[b] = load_hc_up(hp_ + "_up.weight");
+        }
+      } else {
+        mtp_.attn_norm = load_f32(mp + "attn_norm.weight");
+        mtp_.post_norm = load_f32(mp + "post_attention_norm.weight");
+      }
+      load_attn(mtp_, mp);
+      if (hp.moe) {
+        const uint64_t sb0 = stream_bytes_;
+        load_moe(mtp_, mp);
+        if (mtp_ext_ && stream_) {  // (not in the model's expert file: all of them on the GPU)
+          stream_bytes_ = sb0;
+          if (!opt.dry) pin_mtp_experts(mtp_);
+          else gpu_bytes += pin_bytes(mtp_.il);
+        }
+      } else {
+        mtp_.gate = load_w(mp + "ffn_gate.weight");
+        mtp_.up = load_w(mp + "ffn_up.weight");
+        mtp_.down = load_w(mp + "ffn_down.weight");
+      }
+      eh_proj_ = load_w(mp + "nextn.eh_proj.weight");
+      enorm_ = load_f32(mp + "nextn.enorm.weight");
+      hnorm_ = load_f32(mp + "nextn.hnorm.weight");  // (Flash Next: one row of weights per stream, [hc][E])
+      if (hp.hc) {
+        mtp_hc_norm_ = load_f32(mp + "nextn.hc_head_norm.weight");
+        mtp_hc_down_ = load_hc_down(mp + "nextn.hc_head_down.weight", "");
+        mtp_hc_up_ = load_hc_up(mp + "nextn.hc_head_up.weight");
+      } else {
+        shnorm_ = load_f32(mp + "nextn.shared_head_norm.weight");
+      }
+      clFinish(cl_.queue);
+    }
+    // DFlash2 (with or without the MTP block: with both, mtp_draft picks one per step; Flash Next: the features are the
+    // means of the residual streams, the PLE / QSA state rolled back in verify_done)
+    if (!opt.dflash.empty()) load_dflash(opt.dflash);
+    // (--mtp with a DFlash2 drafter, an auto-found one too, on a file without the MTP block: the drafter drafts alone.
+    //  The start-up line said "DFlash2 and the MTP block" and the stats showed 0 MTP steps; cjm801, #81, 2026-11-23)
+    if (opt.mtp && !opt.dflash.empty() && opt.mtp_block && pp_last() && !mtp_block_ && !opt.dry)
+      LOG_INF("--mtp: this model file has no MTP block, so the DFlash2 drafter is used instead of MTP (--no-dflash: plain "
+              "decoding)\n");
+    // (--mtp on a file without the MTP block and no drafter: said, not plain decoding in silence. Unsloth's
+    //  Qwen3.6-35B-A3B-UD-Q4_K_M.gguf has none: a B390 owner saw --mtp run at plain speed with no MTP line, issue #75)
+    if (opt.mtp && opt.mtp_block && pp_last() && !has_mtp && !opt.dry && !opt.copy_draft) {
+      static std::once_flag said;
+      std::call_once(said, [] {
+        LOG_WRN("--mtp: this model file has no MTP block (no blk.N.nextn tensors) and no drafter: plain decoding. A "
+                "GGUF with the block drafts (for Qwen, an \"-MTP-GGUF\" repository's file), or --mtp-model a head\n");
+      });
+    }
+  }
+
+  // MoE FFN: the router and the shared-expert gate requantized together to Q8_0 (one GEMM gives both), the shared
+  // expert's Q8_0 matrices, and the routed experts' 2-bit codes and bf16 scales as they are in the file.

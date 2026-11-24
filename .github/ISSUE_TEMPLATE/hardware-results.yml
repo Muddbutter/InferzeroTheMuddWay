@@ -1,0 +1,48 @@
+name: Hardware results
+description: Benchmark numbers from your GPU (every card and setup we have not measured is the most useful report)
+title: "[Results] <GPU> on <OS>"
+labels: ["hardware results"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you. Windows: `run-tests.cmd quick` in the package folder writes a zip to the Desktop (user names taken out of the paths); attach it below. Linux: `bench/website_bench.sh`. One model by hand: `bin\runz.exe <model.gguf> --bench-pp 4096 --n 128 --prof`.
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU(s)
+      description: e.g. Arc Pro B60, Arc B580 12 GB, Arc A770 16 GB, Core Ultra 9 285H (Arc 140T); the number of cards
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: System
+      description: OS and version, GPU driver (or compute-runtime) version, CPU, RAM, PCIe generation and lanes of each card's slot
+    validations:
+      required: true
+  - type: input
+    id: release
+    attributes:
+      label: inferzero release or commit
+      description: e.g. 2026.11.18.05 (the package's folder name) or a git commit
+    validations:
+      required: true
+  - type: input
+    id: models
+    attributes:
+      label: Models
+      description: the GGUF files you ran
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: the zip from run-tests, or the whole runz output (it starts with the lines about the GPU and the paths it takes)
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: other engines' numbers on the same files, power or temperature limits, what you would like to see faster
