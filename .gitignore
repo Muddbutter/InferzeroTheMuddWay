@@ -52,3 +52,4 @@ dist/
 
 # benchmark outputs (bench\run_tests.ps1, website_bench.ps1)
 bench/results/
+README.md
